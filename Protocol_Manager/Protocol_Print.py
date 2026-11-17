@@ -291,6 +291,7 @@ def print_archived_protocol(protokol_id: int):
         _status('Не удалось определить спецификацию протокола')
         return
 
+
     spc_df = load_specification(spc_val)
     if spc_df.empty:
         _status(f'Спецификация "{spc_val}" не найдена в БД')
