@@ -1,11 +1,12 @@
-"""Обработчик NL-запросов: pending → launch → protocol → LLM(stats).
+"""Обработчик NL-запросов: pending → launch → graph → protocol → LLM(stats).
 
 Приоритет:
   1. Активный pending (ждали «да/нет» или ID протокола).
-  2. Явные launch-команды ('запусти/открой статистику/протоколы').
-  3. Детерминированный protocol-парсер (protocol_parser.parse).
-  4. Если распарсили мутацию → выполняем; dry_run → pending.
-  5. Иначе — LLM-статистика (старый путь).
+  2. Явные launch-команды ('запусти/открой статистику/протоколы/графики').
+  3. Детерминированный graph-парсер (graph_parser.parse).
+  4. Детерминированный protocol-парсер (protocol_parser.parse).
+  5. Если распарсили мутацию → выполняем; dry_run → pending.
+  6. Иначе — LLM-статистика (старый путь).
 """
 import re
 
@@ -16,9 +17,12 @@ from .context import (get_ctx, set_pending, clear_pending,
 from .launcher import (
     is_statistics_running, launch_statistics,
     is_protocol_running,   launch_protocol,
+    is_graph_running,      launch_graph,
 )
 from . import protocol_parser
 from . import protocol_tools
+from . import graph_parser
+from . import graph_tools
 
 
 _STATS_LAUNCH_KW = (
@@ -30,6 +34,11 @@ _PROTO_LAUNCH_KW = (
     'запусти протокол', 'открой протокол', 'открыть протокол',
     'запусти модуль протокол', 'открой модуль протокол',
     'открыть протоколы',
+)
+_GRAPH_LAUNCH_KW = (
+    'запусти график', 'открой график', 'открыть график',
+    'запусти модуль график', 'открой модуль график',
+    'открыть графики', 'запустить графики', 'open graph', 'launch graph',
 )
 _STATS_QUERY_KW = (
     'стат', 'stat', 'мск', 'msk', 'слот', 'slot',
@@ -73,10 +82,20 @@ def _ensure_module_opened(dpg_, key):
         elif res.get('status') == 'error':
             _log(dpg_, f'Не удалось открыть протоколы: {res.get("error")}',
                  color=(255, 150, 150))
+        return
+    if key == 'graph':
+        if is_graph_running():
+            return
+        res = launch_graph(dpg_)
+        if res.get('status') == 'launched':
+            _log(dpg_, 'Открываю модуль графиков...')
+        elif res.get('status') == 'error':
+            _log(dpg_, f'Не удалось открыть графики: {res.get("error")}',
+                 color=(255, 150, 150))
 
 
 def _exec_tool(name, params, dpg_):
-    """Выполнить tool с обработкой dry_run → pending."""
+    """Выполнить protocol-tool с обработкой dry_run → pending."""
     res = protocol_tools.execute(name, params, dpg_)
 
     # dry_run мутации → ставим pending, ждём подтверждения
@@ -93,6 +112,15 @@ def _exec_tool(name, params, dpg_):
     _log(dpg_, protocol_tools.format_result(name, res),
          color=(255, 150, 150) if isinstance(res, dict) and res.get('error')
          else (150, 255, 150))
+
+
+def _exec_graph_tool(name, params, dpg_):
+    """Выполнить graph-tool."""
+    res = graph_tools.execute(name, params, dpg_)
+    _log(dpg_, graph_tools.format_result(name, res),
+         color=(255, 150, 150) if isinstance(res, dict) and res.get('error')
+         else (150, 255, 150))
+
 
 def _clear_input(dpg_):
     try:
@@ -112,6 +140,7 @@ def run_nl_query(sender, data, dpg_):
         return run_nl_query_impl(sender, data, dpg_)
     finally:
         _clear_input(dpg_)
+
 
 def run_nl_query_impl(sender, data, dpg_):
     try:
@@ -139,6 +168,21 @@ def run_nl_query_impl(sender, data, dpg_):
                 return
 
     # -------- 2. Explicit launch --------
+    if _is_any(q, _GRAPH_LAUNCH_KW):
+        # «Открой графики МСК 456» — сразу с параметрами
+        gparsed = graph_parser.parse(q)
+        if gparsed:
+            _exec_graph_tool(gparsed['intent'], gparsed['params'], dpg_)
+            return
+        if is_graph_running():
+            _log(dpg_, 'Модуль графиков уже открыт.')
+        else:
+            res = launch_graph(dpg_)
+            _log(dpg_, f"Графики: {res.get('status')}",
+                 color=(255, 150, 150) if res.get('status') == 'error'
+                 else (150, 255, 150))
+        return
+
     if _is_any(q, _PROTO_LAUNCH_KW):
         # «Открой протоколы на МСК 456» — сразу с фильтром
         if 'мск' in q.lower() or 'msk' in q.lower():
@@ -167,15 +211,24 @@ def run_nl_query_impl(sender, data, dpg_):
                      color=(255, 150, 150))
         return
 
-    # -------- 3. Deterministic protocol parse --------
+    # -------- 3. Deterministic graph parse --------
+    gparsed = graph_parser.parse(q)
+    if gparsed:
+        _exec_graph_tool(gparsed['intent'], gparsed['params'], dpg_)
+        return
+
+    # -------- 4. Deterministic protocol parse --------
     parsed = protocol_parser.parse(q)
     if parsed:
         _exec_tool(parsed['intent'], parsed['params'], dpg_)
         return
 
-    # -------- 4. Protocol fallback: не пускаем в stats-LLM --------
+    # -------- 5. Protocol / graph fallback: не пускаем в stats-LLM --------
     q_low = q.lower()
     has_stats = _is_any(q, _STATS_QUERY_KW)
+    has_graph = any(k in q_low for k in (
+        'граф', 'график', 'plot', 'тчх', 'плотн', 'распредел',
+    ))
     has_protocol = (
             'протокол' in q_low
             or 'заказ' in q_low
@@ -190,6 +243,17 @@ def run_nl_query_impl(sender, data, dpg_):
                          q_low) is not None
     )
 
+    if has_graph and not has_stats:
+        _log(dpg_,
+             'Не удалось разобрать запрос к графикам. Примеры:\n'
+             '  «открой графики МСК 456»\n'
+             '  «графики номеров JN4450-JN4460 параметр F»\n'
+             '  «все графики МСК 456 на одном поле»\n'
+             '  «плотность распределения МСК 456»\n'
+             '  «pdf графики номеров JN4450-JN4500»',
+             color=(255, 220, 150))
+        return
+
     if has_protocol and not has_stats:
         _log(dpg_,
              'Не удалось разобрать запрос к протоколам. Уточните: '
@@ -198,7 +262,7 @@ def run_nl_query_impl(sender, data, dpg_):
              color=(255, 220, 150))
         return
 
-    # -------- 5. Stats (LLM) --------
+    # -------- 6. Stats (LLM) --------
     if has_stats:
         _ensure_module_opened(dpg_, 'stats')
 
