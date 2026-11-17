@@ -1,4 +1,7 @@
-"""Патч protocol_tools — п.2 latest + п.3 latest_protocol."""
+"""Патч protocol_tools — п.2 latest, п.3 latest_protocol, п.4 rebind _TOOLS.
+
+Подключается из controller.install при импорте модуля.
+"""
 from __future__ import annotations
 
 
@@ -13,7 +16,7 @@ def install_protocol_tools_patches():
     def _tool_search_protocols(params, ctx, dpg_):
         params = dict(params or {})
 
-        # soft MSK (п.1) — на случай прямого вызова tools
+        # soft MSK (п.1)
         if (params.get('msk')
                 and not params.get('msk_partial')
                 and not params.get('msk_exact_only')):
@@ -79,6 +82,8 @@ def install_protocol_tools_patches():
         p['limit'] = 1
         return _tool_search_protocols(p, ctx, dpg_)
 
+    # п.4: явный rebind — даже если в protocol_tools.py есть второй def,
+    # execute() ходит только через _TOOLS.
     pt._tool_search_protocols = _tool_search_protocols
     pt._tool_latest_protocol = _tool_latest_protocol
     if hasattr(pt, '_TOOLS') and isinstance(pt._TOOLS, dict):
