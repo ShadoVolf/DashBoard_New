@@ -1,4 +1,4 @@
-"""Патч protocol_tools — п.2: flag latest (sort by dataR, head(1))."""
+"""Патч protocol_tools — п.2 latest + п.3 latest_protocol."""
 from __future__ import annotations
 
 
@@ -72,8 +72,17 @@ def install_protocol_tools_patches():
 
         return res
 
+    def _tool_latest_protocol(params, ctx, dpg_):
+        """п.3: последний протокол по фильтрам (МСК, тип, …)."""
+        p = dict(params or {})
+        p['latest'] = True
+        p['limit'] = 1
+        return _tool_search_protocols(p, ctx, dpg_)
+
     pt._tool_search_protocols = _tool_search_protocols
+    pt._tool_latest_protocol = _tool_latest_protocol
     if hasattr(pt, '_TOOLS') and isinstance(pt._TOOLS, dict):
         pt._TOOLS['search_protocols'] = _tool_search_protocols
+        pt._TOOLS['latest_protocol'] = _tool_latest_protocol
 
     pt._assistant_patches_installed = True
