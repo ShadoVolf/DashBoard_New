@@ -24,6 +24,12 @@ from . import protocol_tools
 from . import graph_parser
 from . import graph_tools
 
+try:
+    from .protocol_tools_patch import install_protocol_tools_patches
+    install_protocol_tools_patches()
+except Exception as _e:
+    print(f'[Assistant] protocol_tools_patch: {_e}')
+
 
 _STATS_LAUNCH_KW = (
     'запусти стат', 'запустить стат', 'открой стат', 'открыть стат',
