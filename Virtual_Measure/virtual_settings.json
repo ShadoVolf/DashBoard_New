@@ -1,0 +1,28 @@
+{
+  "variance": {
+    "max_delta_percent": 0.7999999523162842,
+    "max_delta_absolute": 0.15000000596046448,
+    "use_absolute": false,
+    "preserve_status": true,
+    "max_attempts": 64
+  },
+  "stats": {
+    "histogram_bins": 20,
+    "last_param": ""
+  },
+  "last_used": {
+    "rtype": "Etalon",
+    "spc": "Etalon",
+    "msk": "826-96*",
+    "measure_id": "275410",
+    "only_good": false,
+    "machine_type": "Saunders",
+    "machine_sn": "87560"
+  },
+  "nn": {
+    "mlp_enabled": false,
+    "autoenc_enabled": true,
+    "autoenc_threshold": 0.6500000357627869,
+    "autoenc_block": false
+  }
+}

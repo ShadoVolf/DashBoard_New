@@ -1,0 +1,34 @@
+{
+  "device": {
+    "resource": "auto",
+    "baudrate": 9600,
+    "gate_time": 0.10000000149011612,
+    "timeout_ms": 5000,
+    "poll_interval": 0.05000000074505806
+  },
+  "measurement": {
+    "epsilon": 1.899999976158142,
+    "epsilon_window": 15,
+    "min_duration": 10.0,
+    "max_duration": 3600.0,
+    "min_frequency": 1000.0,
+    "signal_stable_time": 0.5
+  },
+  "acceptance": {
+    "max_ppm": 100.0,
+    "min_ppm": -180.0,
+    "max_monotonicity_ppm": 1.0,
+    "outlier_threshold_ppm": 1.0
+  },
+  "database": {
+    "host": "mes1",
+    "user": "xampp",
+    "password": "43FPa!29S8HQeAW",
+    "database": "coordinator",
+    "url": "mysql+mysqlconnector://xampp:43FPa!29S8HQeAW@MES1:3306/coordinator"
+  },
+  "pdf": {
+    "output_dir": "Измерения/Измерения_частоты_стекло",
+    "font_path": "C:/Windows/Fonts/DejaVuSans.ttf"
+  }
+}

@@ -1,0 +1,18 @@
+/build/
+/dist/
+/Протоколы/
+Resonator Stat/Resonator Stat.exe
+*.exe
+*.pyc
+*.toc
+*.toc
+*.pdf
+*.toc
+*.pdf
+*.log
+*.exe
+*.exe
+/Протоколы
+*.xlsx
+*.toc
+/Resonator Stat
