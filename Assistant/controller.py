@@ -94,7 +94,20 @@ def _ensure_module_opened(dpg_, key):
                  color=(255, 150, 150))
 
 
+def _apply_soft_msk(name, params):
+    """п.1 protocol_tools_CHANGES: msk → msk_partial, если не exact-only."""
+    params = dict(params or {})
+    if name in ('search_protocols', 'latest_protocol'):
+        if (params.get('msk')
+                and not params.get('msk_partial')
+                and not params.get('msk_exact_only')):
+            params['msk_partial'] = params['msk']
+            params['msk'] = None
+    return params
+
+
 def _exec_tool(name, params, dpg_):
+    params = _apply_soft_msk(name, params)
     res = protocol_tools.execute(name, params, dpg_)
     if isinstance(res, dict) and res.get('action') == 'dry_run':
         set_pending('confirm_' + name.split('_')[0], {
