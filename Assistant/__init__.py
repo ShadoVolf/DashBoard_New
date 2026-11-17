@@ -1,4 +1,4 @@
-"""Assistant — LLM-ассистент с поддержкой модулей Статистика и Протоколы.
+"""Assistant — LLM-ассистент с поддержкой модулей Статистика, Протоколы и Графики.
 
 Публичный API:
     create_assistant_window, show_assistant_window,
@@ -6,6 +6,7 @@
     run_llm_report, stop_llm_report,
     launch_statistics, is_statistics_running,
     launch_protocol,   is_protocol_running,
+    launch_module,     is_module_running,   # в т.ч. key='graph'
 """
 from .constants import (
     USER_WINDOW_H, MARGIN, WIDTH_FRAC, HEIGHT_FRAC, MIN_WIDTH,
@@ -13,6 +14,7 @@ from .constants import (
 from .launcher import (
     is_statistics_running, launch_statistics,
     is_protocol_running,   launch_protocol,
+    is_graph_running,      launch_graph,
     launch_module, is_module_running,
 )
 from .window import create_assistant_window, show_assistant_window
@@ -25,6 +27,7 @@ __all__ = [
     'USER_WINDOW_H', 'MARGIN', 'WIDTH_FRAC', 'HEIGHT_FRAC', 'MIN_WIDTH',
     'is_statistics_running', 'launch_statistics',
     'is_protocol_running',   'launch_protocol',
+    'is_graph_running',      'launch_graph',
     'launch_module', 'is_module_running',
     'create_assistant_window', 'show_assistant_window',
     'run_nl_query', 'check_llm', 'clear_assistant_log',
