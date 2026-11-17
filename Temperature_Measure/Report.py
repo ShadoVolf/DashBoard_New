@@ -2399,3 +2399,507 @@ def create_psi_protocol(data_df, status_df, view_data, tu_data,
         topMargin=8 * mm, bottomMargin=10 * mm)
     doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
     return path
+
+# ============================================================================
+# ПАСПОРТ (по форме ТУ)
+# ============================================================================
+# Паспорт формируется по тем же параметрам, что и протоколы ПСИ/ОТК.
+# Всегда выводятся:
+#   * Номинальная частота — в единицах спецификации (109,11М → МГц; 20000К → кГц);
+#   * Порядок колебаний   — из таблицы спецификаций (Order / Harmonic / ...);
+#   * Код частоты ftCode   — если колонка присутствует в спецификации;
+#   * Точность настройки   — psidata.F, Гц;
+#   * Тип установки (TGK)  — specification.TGK (fallback: view_data.TGK);
+#   * Макс. изменение частоты — psidata.Fmaxm, ppm;
+#   * Динамическое сопротивление — psidata.R, Ом.
+# Дополнительные строки и распиновка настраиваются через параметры
+# (в будущем могут храниться в таблице `tu` — см. load_passport_config_from_tu).
+# ============================================================================
+
+_FREQ_UNIT_SUFFIXES = [
+    ('МГЦ', 'МГц'), ('MHZ', 'МГц'),
+    ('КГЦ', 'кГц'), ('KHZ', 'кГц'),
+    ('ГЦ', 'Гц'),  ('HZ', 'Гц'),
+    ('М', 'МГц'),  ('M', 'МГц'),
+    ('К', 'кГц'),  ('K', 'кГц'),
+]
+
+
+def _parse_nominal_frequency(nominal_str):
+    """
+    Разбирает номинал частоты из view_data['Nominal'].
+
+    Примеры:
+        "109,11М"  → (109.11, "МГц")
+        "20000К"   → (20000.0, "кГц")
+        "32,768К"  → (32.768, "кГц")
+        "10МГц"    → (10.0, "МГц")
+        "109.11"   → (109.11, "МГц")  — по умолчанию МГц
+
+    Возвращает (значение: float | None, единицы: str).
+    """
+    if not nominal_str:
+        return None, ''
+
+    s = str(nominal_str).strip().replace(',', '.')
+    if not s:
+        return None, ''
+
+    s_upper = s.upper().replace(' ', '')
+    for suffix, units in _FREQ_UNIT_SUFFIXES:
+        if s_upper.endswith(suffix):
+            value_part = s[:len(s) - len(suffix)].strip()
+            try:
+                return float(value_part), units
+            except ValueError:
+                return None, ''
+
+    # Без суффикса — предполагаем МГц (типично для резонаторов)
+    try:
+        return float(s), 'МГц'
+    except ValueError:
+        return None, ''
+
+
+def _get_spec_value(spc_row, *fields):
+    """Достаёт первое непустое значение из spc_row по перечню полей."""
+    if spc_row is None:
+        return None
+    for field in fields:
+        try:
+            v = spc_row.get(field) if hasattr(spc_row, 'get') else None
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        try:
+            if pd.isna(v):
+                continue
+        except (TypeError, ValueError):
+            pass
+        s = str(v).strip()
+        if s.lower() in ('', 'nan', 'none', 'null', 'no', '—', '-'):
+            continue
+        return v
+    return None
+
+
+def _get_first_psidata_value(data_df, field):
+    """Достаёт первое непустое числовое значение из data_df[field]."""
+    if data_df is None or field not in data_df.columns:
+        return None
+    for v in data_df[field].values:
+        if v is None:
+            continue
+        try:
+            if pd.isna(v):
+                continue
+        except (TypeError, ValueError):
+            pass
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return v
+    return None
+
+
+def load_passport_config_from_tu(tu_row):
+    """
+    Загружает конфигурацию паспорта из строки таблицы `tu` (опционально).
+
+    Предполагаемые дополнительные колонки в `tu` (JSON-строки):
+      * PinoutImages       — список путей к изображениям распиновки;
+      * AdditionalLines    — список строк доп. данных;
+      * PowerDissipation   — мощность рассеивания (п. 2.1);
+      * PassportParams     — список параметров (как presentation_params).
+
+    Если колонки отсутствуют — возвращает пустую конфигурацию.
+    """
+    import json
+    cfg = {
+        'pinout_images': None,
+        'additional_lines': None,
+        'power_dissipation': None,
+        'presentation_params': None,
+    }
+    if tu_row is None:
+        return cfg
+
+    mapping = [
+        ('pinout_images',     'PinoutImages'),
+        ('additional_lines',  'AdditionalLines'),
+        ('power_dissipation', 'PowerDissipation'),
+        ('presentation_params', 'PassportParams'),
+    ]
+    for key, field in mapping:
+        try:
+            raw = tu_row.get(field) if hasattr(tu_row, 'get') else None
+        except Exception:
+            raw = None
+        if raw is None:
+            continue
+        if isinstance(raw, (list, dict)):
+            cfg[key] = raw
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                cfg[key] = json.loads(raw)
+            except (ValueError, TypeError):
+                cfg[key] = raw
+    return cfg
+
+
+def create_passport_protocol(
+    data_df, view_data, tu_data, presentation_params, spc_row,
+    measure_id,
+    filename="passport.pdf",
+    measure_protokol_id=None,
+    pinout_images=None,
+    additional_lines=None,
+    power_dissipation=None,
+    power_dissipation_unit='мВт',
+):
+    """
+    Создаёт PDF-паспорт на изделие.
+
+    Параметры
+    ---------
+    data_df : DataFrame
+        Данные измерений (одна строка — одно изделие; для партии берётся
+        первая строка по каждому параметру).
+    view_data : dict
+        Данные об изделии (Spc_Text, TU, Nominal, TGK, MSK, Date, ...).
+    tu_data : dict
+        Данные ТУ (tu_name и т.п.).
+    presentation_params : list
+        Список параметров — как в ПСИ/ОТК (dict с 'param', 'name', 'units').
+    spc_row : pandas.Series | dict
+        Строка спецификации: Order / ftCode / TGK / Power и т.д.
+    measure_id : str
+        ID измерения.
+    filename : str
+        Имя PDF-файла.
+    measure_protokol_id : int | None
+        ID протокола (для QR-кода).
+    pinout_images : list[str] | str | None
+        Пути к изображениям распиновки. Может быть строкой-каталогом —
+        тогда загружаются все картинки из него.
+    additional_lines : list[str] | None
+        Дополнительные строки (могут меняться для разных изделий).
+    power_dissipation : str | float | None
+        Мощность рассеивания (п. 2.1). Если None — берётся из spc_row
+        (Power / P_max / Pmax / PowerDissipation).
+    power_dissipation_unit : str
+        Единицы мощности рассеивания (по умолчанию «мВт»).
+
+    Возвращает
+    ----------
+    str
+        Полный путь к сохранённому PDF-файлу.
+    """
+    page_w, page_h = A4
+    margin = 15 * mm
+    usable_w = page_w - 2 * margin
+
+    spc_text = view_data.get('Spc_Text', '—')
+    tu_text = view_data.get('TU', '—')
+    freq_value, freq_units = _parse_nominal_frequency(
+        view_data.get('Nominal', ''))
+
+    # ---- разрешение pinout_images ----
+    if isinstance(pinout_images, str):
+        if os.path.isdir(pinout_images):
+            exts = ('.png', '.jpg', '.jpeg', '.gif', '.bmp')
+            try:
+                pinout_images = sorted([
+                    os.path.join(pinout_images, f)
+                    for f in os.listdir(pinout_images)
+                    if f.lower().endswith(exts)
+                ])
+            except OSError:
+                pinout_images = None
+        else:
+            pinout_images = [pinout_images]
+
+    # ---- справочные значения из спецификации ----
+    order_val = _get_spec_value(
+        spc_row, 'Order', 'OscOrder', 'Osc_Order', 'OrderOsc',
+        'Harmonic', 'Overtone', 'ПорядокКолебаний', 'НомерГармоники')
+    ft_code = _get_spec_value(
+        spc_row, 'ftCode', 'FtCode', 'FTCode', 'ft_code',
+        'FrequencyCode', 'КодЧастоты')
+    tgk_val = (_get_spec_value(spc_row, 'TGK', 'Tgk', 'tgk',
+                               'ТипУстановки', 'InstallationType')
+               or view_data.get('TGK'))
+
+    # ---- вспомогательные стили ----
+    info_style = ParagraphStyle('PInfo', fontName='Arial',
+                                fontSize=11, leading=14)
+    section_style = ParagraphStyle('PSection', fontName='Arial',
+                                   fontSize=11, leading=14,
+                                   spaceAfter=3, spaceBefore=2)
+    cell_l = ParagraphStyle('PPName', fontName='Arial', fontSize=10,
+                            leading=12, alignment=TA_LEFT, wordWrap='CJK')
+    cell_r = ParagraphStyle('PPVal', fontName='Arial', fontSize=10,
+                            leading=12, alignment=TA_CENTER, wordWrap='CJK')
+
+    story = []
+
+    # ======================= 1. ШАПКА =======================
+    logo_path = os.path.join('Pictures', 'Morion_Logo.png')
+    if os.path.exists(logo_path):
+        logo_img = Image(logo_path, width=15 * mm, height=15 * mm)
+    else:
+        logo_img = Spacer(1, 1)
+    logo_p = Paragraph('<b>АО "Морион"</b>', ParagraphStyle(
+        'PLogo', fontName='Arial', fontSize=14, leading=16, leftIndent=5))
+    left_block = Table([[logo_img, logo_p]], colWidths=[17 * mm, None])
+    left_block.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+
+    qr_data = str(measure_protokol_id) if measure_protokol_id else str(measure_id)
+    try:
+        qr_img = Image(generate_qr_code(qr_data), width=18 * mm, height=18 * mm)
+    except Exception:
+        qr_img = Spacer(1, 1)
+    qr_text = Paragraph(qr_data, ParagraphStyle(
+        'PQRText', fontName='Arial', fontSize=8, alignment=TA_CENTER))
+    qr_block = Table([[qr_img], [qr_text]], colWidths=[20 * mm])
+    qr_block.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+
+    title_p = Paragraph('<b>ПАСПОРТ</b>', ParagraphStyle(
+        'PTitle', fontName='Arial', fontSize=18, leading=22,
+        alignment=TA_CENTER))
+    top = Table([[left_block, title_p, qr_block]],
+                colWidths=[usable_w * 0.30, usable_w * 0.45, usable_w * 0.25])
+    top.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+        ('ALIGN', (1, 0), (1, 0), 'CENTER'),
+        ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
+    ]))
+    story.append(top)
+    story.append(Spacer(1, 5 * mm))
+
+    # ======================= 2. ОБЩИЕ СВЕДЕНИЯ =======================
+    story.append(Paragraph(f"Изделие: <b>{spc_text}</b>", info_style))
+    story.append(Paragraph(f"ТУ: <b>{tu_text}</b>", info_style))
+
+    if 'Numbers' in data_df.columns and len(data_df) > 0:
+        nums = [str(n) for n in data_df['Numbers'].tolist() if str(n).strip()]
+        if nums:
+            story.append(Paragraph(
+                f"Заводской номер: <b>{', '.join(nums)}</b>", info_style))
+    story.append(Spacer(1, 4 * mm))
+
+    # ======================= 3. ОСНОВНЫЕ ТЕХ. ДАННЫЕ =======================
+    story.append(Paragraph("<b>1. Основные технические данные</b>",
+                           section_style))
+
+    param_rows = []
+
+    # 1) Номинальная частота (в единицах спецификации)
+    if freq_value is not None:
+        param_rows.append(("Номинальная частота",
+                           f"{freq_value:g} {freq_units}"))
+
+    # 2) Порядок колебаний (из спецификации)
+    if order_val is not None:
+        param_rows.append(("Порядок колебаний", str(order_val)))
+
+    # 3) Код частоты ftCode (если есть)
+    if ft_code is not None:
+        param_rows.append(("Код частоты", str(ft_code)))
+
+    # 4) Точность настройки F (psidata)
+    f_val = _get_first_psidata_value(data_df, 'F')
+    if f_val is not None:
+        try:
+            f_str = f"{float(f_val):.3f} Гц"
+        except (TypeError, ValueError):
+            f_str = f"{f_val} Гц"
+        param_rows.append(("Точность настройки", f_str))
+
+    # 5) Тип установки TGK (спецификация)
+    if tgk_val is not None:
+        param_rows.append(("Тип установки", str(tgk_val)))
+
+    # 6) Максимальное изменение частоты Fmaxm (psidata)
+    fmaxm_val = _get_first_psidata_value(data_df, 'Fmaxm')
+    if fmaxm_val is not None:
+        try:
+            fm_str = f"{float(fmaxm_val):.2f} ppm"
+        except (TypeError, ValueError):
+            fm_str = f"{fmaxm_val} ppm"
+        param_rows.append(("Максимальное изменение частоты", fm_str))
+
+    # 7) Динамическое сопротивление R (psidata)
+    r_val = _get_first_psidata_value(data_df, 'R')
+    if r_val is not None:
+        try:
+            r_str = f"{float(r_val):.1f} Ом"
+        except (TypeError, ValueError):
+            r_str = f"{r_val} Ом"
+        param_rows.append(("Динамическое сопротивление", r_str))
+
+    # 8) Дополнительные параметры из presentation_params
+    _already = {'F', 'R', 'Fmaxm', 'TGK', 'ftCode', 'Order',
+                'OscOrder', 'Osc_Order', 'Harmonic'}
+    for p in (presentation_params or []):
+        param = p.get('param')
+        if not param or param in _already:
+            continue
+        val = _get_first_psidata_value(data_df, param)
+        if val is None:
+            continue
+        name = p.get('name', param)
+        units = p.get('units', '') or ''
+        unit_str = f" {units}" if units else ""
+        try:
+            formatted = f"{float(val):.3f}{unit_str}"
+        except (TypeError, ValueError):
+            formatted = f"{val}{unit_str}"
+        param_rows.append((name, formatted))
+
+    param_data = [
+        [Paragraph("<b>Параметр</b>", _cs(10)),
+         Paragraph("<b>Значение</b>", _cs(10))]
+    ]
+    for name, value in param_rows:
+        param_data.append([Paragraph(str(name), cell_l),
+                           Paragraph(str(value), cell_r)])
+
+    param_table = Table(param_data,
+                        colWidths=[usable_w * 0.58, usable_w * 0.42])
+    param_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), 'Arial'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (1, -1), 'CENTER'),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#D9E2F3')),
+        ('LEFTPADDING', (0, 0), (-1, -1), 4),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+    ]))
+    story.append(param_table)
+    story.append(Spacer(1, 4 * mm))
+
+    # ======================= 4. МОЩНОСТЬ РАССЕИВАНИЯ (п. 2.1) ==========
+    if power_dissipation is None:
+        power_dissipation = _get_spec_value(
+            spc_row, 'Power', 'P_max', 'Pmax', 'PowerDissipation',
+            'Мощность', 'МощностьРассеивания')
+    if power_dissipation is not None:
+        story.append(Paragraph(
+            f"<b>2.1.</b> Мощность рассеивания, не более: "
+            f"<b>{power_dissipation}</b> {power_dissipation_unit}",
+            ParagraphStyle('PPower', fontName='Arial',
+                           fontSize=10.5, leading=13)))
+        story.append(Spacer(1, 4 * mm))
+
+    # ======================= 5. РАСПИНОВКА =======================
+    if pinout_images:
+        story.append(Paragraph("<b>3. Распиновка</b>", section_style))
+        valid_imgs = []
+        for img_path in pinout_images:
+            if img_path and os.path.exists(img_path):
+                try:
+                    valid_imgs.append(Image(img_path, width=40 * mm,
+                                            height=40 * mm))
+                except Exception as e:
+                    print(f"[Passport] Не удалось загрузить {img_path}: {e}")
+        if valid_imgs:
+            n_per_row = min(3, len(valid_imgs))
+            img_data, current = [], []
+            for img in valid_imgs:
+                current.append(img)
+                if len(current) == n_per_row:
+                    img_data.append(current)
+                    current = []
+            if current:
+                while len(current) < n_per_row:
+                    current.append(Spacer(1, 1))
+                img_data.append(current)
+            img_table = Table(img_data,
+                              colWidths=[usable_w / n_per_row] * n_per_row)
+            img_table.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 2),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+                ('TOPPADDING', (0, 0), (-1, -1), 2),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+            ]))
+            story.append(img_table)
+            story.append(Spacer(1, 4 * mm))
+
+    # ======================= 6. ДОП. СТРОКИ =======================
+    if additional_lines:
+        add_style = ParagraphStyle('PAddLine', fontName='Arial',
+                                   fontSize=10, leading=13)
+        for line in additional_lines:
+            if line:
+                story.append(Paragraph(str(line), add_style))
+                story.append(Spacer(1, 1.5 * mm))
+        story.append(Spacer(1, 2 * mm))
+
+    # ======================= 7. СВИДЕТЕЛЬСТВО О ПРИЕМКЕ ==========
+    story.append(Paragraph("<b>4. Свидетельство о приемке</b>",
+                           section_style))
+    numbers_text = ""
+    if 'Numbers' in data_df.columns and len(data_df) > 0:
+        nums = [str(n) for n in data_df['Numbers'].tolist() if str(n).strip()]
+        if nums:
+            numbers_text = f" за № <b>{', '.join(nums)}</b>"
+
+    story.append(Paragraph(
+        f"Изделие <b>{spc_text}</b>{numbers_text} соответствует "
+        f"требованиям ТУ <b>{tu_text}</b> и признано годным "
+        f"к эксплуатации.",
+        ParagraphStyle('PAccept', fontName='Arial',
+                       fontSize=10, leading=13)))
+    story.append(Spacer(1, 8 * mm))
+
+    # ======================= 8. ПОДПИСИ =======================
+    sig_style = ParagraphStyle('PSig', fontName='Arial',
+                               fontSize=10, leading=13)
+    sig_data = [
+        [Paragraph("Начальник ОТК", sig_style),
+         Paragraph("______________________", sig_style)],
+        [Spacer(1, 1),
+         Paragraph("<font size=7>подпись</font>", sig_style)],
+        [Paragraph("Дата: ____________", sig_style), Spacer(1, 1)],
+    ]
+    sig_tbl = Table(sig_data, colWidths=[usable_w * 0.4, usable_w * 0.6])
+    sig_tbl.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'BOTTOM'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+    ]))
+    story.append(sig_tbl)
+
+    # ======================= 9. BUILD =======================
+    def _footer(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont('Arial', 8)
+        canvas.setFillColor(colors.HexColor('#555555'))
+        canvas.drawRightString(page_w - margin, 8 * mm,
+                               f"Стр. {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+    path = Options.get_measure_protokol_path() + "\\" + filename
+    doc = SimpleDocTemplate(
+        path, pagesize=A4,
+        leftMargin=margin, rightMargin=margin,
+        topMargin=12 * mm, bottomMargin=15 * mm)
+    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+    return path
