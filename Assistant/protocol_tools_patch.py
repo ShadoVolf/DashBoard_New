@@ -1,12 +1,16 @@
-"""Патч protocol_tools — п.2 latest, п.3 latest_protocol, п.4 rebind _TOOLS.
+"""Патч protocol_tools — п.2 latest, п.3 latest_protocol, п.4 rebind _TOOLS,
+печать паспорта.
 
-Подключается из controller.install при импорте модуля.
+Подключается из controller при импорте модуля.
 """
 from __future__ import annotations
+
+import re
 
 
 def install_protocol_tools_patches():
     from . import protocol_tools as pt
+    from . import protocol_parser
 
     if getattr(pt, '_assistant_patches_installed', False):
         return
@@ -82,12 +86,35 @@ def install_protocol_tools_patches():
         p['limit'] = 1
         return _tool_search_protocols(p, ctx, dpg_)
 
-    # п.4: явный rebind — даже если в protocol_tools.py есть второй def,
-    # execute() ходит только через _TOOLS.
+    def _tool_print_passport(params, ctx, dpg_):
+        from Protocol_Manager.Protocol_Passport import print_passport_for_protocol
+        pid = (params or {}).get('protokol_id')
+        if not pid:
+            return {'error': 'Нужен ID протокола'}
+        return print_passport_for_protocol(int(pid))
+
     pt._tool_search_protocols = _tool_search_protocols
     pt._tool_latest_protocol = _tool_latest_protocol
+    pt._tool_print_passport = _tool_print_passport
     if hasattr(pt, '_TOOLS') and isinstance(pt._TOOLS, dict):
         pt._TOOLS['search_protocols'] = _tool_search_protocols
         pt._TOOLS['latest_protocol'] = _tool_latest_protocol
+        pt._TOOLS['print_passport'] = _tool_print_passport
 
+    _orig_parse = protocol_parser.parse
+
+    def _parse_with_passport(q):
+        text = (q or '').strip()
+        low = text.lower()
+        if 'паспорт' in low:
+            pid = (protocol_parser._extract_protokol_id(text)
+                   or protocol_parser._extract_any_id(text)
+                   or protocol_parser._extract_bare_id(text))
+            if not pid:
+                return None
+            return {'intent': 'print_passport',
+                    'params': {'protokol_id': pid}}
+        return _orig_parse(q)
+
+    protocol_parser.parse = _parse_with_passport
     pt._assistant_patches_installed = True
