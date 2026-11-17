@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 
 import pandas as pd
+from sqlalchemy import text
 
 from Temperature_Measure.Report import (
     create_passport_protocol,
@@ -18,7 +19,7 @@ from Temperature_Measure.Report import (
 )
 from Archive_View.Archive_Data import (
     load_specification, load_tu_parameters_for_spec, build_presentation_params,
-    build_archive_print_data, build_archive_status_df,
+    build_archive_print_data,
     build_view_data_from_archive, _prepare_spc_map,
 )
 from Archive_View.Archive_UI import _load_spc_map_for_display
@@ -40,7 +41,12 @@ def _merge_pdfs(paths, out_path):
     w = writer_cls()
     for p in paths:
         if p and os.path.isfile(p):
-            w.append(reader_cls(p))
+            try:
+                w.append(reader_cls(p))
+            except Exception:
+                r = reader_cls(p)
+                for page in r.pages:
+                    w.add_page(page)
     with open(out_path, 'wb') as f:
         w.write(f)
     return out_path
@@ -51,8 +57,8 @@ def print_passport_for_protocol(protokol_id: int):
     engine = _engine()
     with engine.connect() as conn:
         df_head = pd.read_sql(
-            "SELECT * FROM psi_measure_protokol_id "
-            "WHERE Measure_protokol_ID = %(pid)s",
+            text("SELECT * FROM psi_measure_protokol_id "
+                 "WHERE Measure_protokol_ID = :pid"),
             conn, params={'pid': int(protokol_id)})
     if df_head is None or df_head.empty:
         _status('Протокол не найден')
@@ -71,8 +77,8 @@ def print_passport_for_protocol(protokol_id: int):
 
     with engine.connect() as conn:
         df = pd.read_sql(
-            "SELECT * FROM psi_protokol_archive "
-            "WHERE Measure_Protokol_ID = %(pid)s",
+            text("SELECT * FROM psi_protokol_archive "
+                 "WHERE Measure_Protokol_ID = :pid"),
             conn, params={'pid': int(protokol_id)})
     if df is None or df.empty:
         _status('В протоколе нет номеров')
@@ -152,10 +158,9 @@ def print_passport_for_protocol(protokol_id: int):
     if len(paths) > 1:
         merged_name = generate_filename(measure_id).replace(
             '.pdf', f'_passports_{protokol_n}.pdf')
-        # create_passport_protocol сам добавляет каталог протоколов
         base = os.path.dirname(paths[0]) if paths[0] else ''
-        merged = _merge_pdfs(paths, os.path.join(base, os.path.basename(merged_name))) \
-            if base else None
+        merged = (_merge_pdfs(paths, os.path.join(base, os.path.basename(merged_name)))
+                  if base else None)
         if merged:
             out = merged
 
