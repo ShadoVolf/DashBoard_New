@@ -1,4 +1,4 @@
-"""Запуск модулей (статистика, протоколы) в том же процессе.
+"""Запуск модулей (статистика, протоколы, графики) в том же процессе.
 
 Backward-compat: is_statistics_running/launch_statistics сохранены.
 """
@@ -16,6 +16,11 @@ _MODULES = {
         'factory': ('Protocol_Manager.Protocol_Tab',
                     'create_protocol_window'),
         'label':   'модуль протоколов',
+    },
+    'graph': {
+        'tags':    ('resonator_graph_window', 'resonator_graph_controls'),
+        'factory': ('ResonatorGraph.ui', 'create_graph_window'),
+        'label':   'модуль графиков (ResonatorGraph)',
     },
 }
 _LAUNCHED: dict[str, bool] = {}
@@ -44,7 +49,7 @@ def launch_module(key: str, dpg_=None) -> dict:
     try:
         mod_name, fn_name = spec['factory']
         mod = importlib.import_module(mod_name)
-        getattr(mod, fn_name)(dpg_ or dpg)
+        getattr(mod, fn_name)()
         _LAUNCHED[key] = True
         return {'status': 'launched', 'label': spec['label']}
     except Exception as e:
@@ -67,3 +72,11 @@ def is_protocol_running() -> bool:
 
 def launch_protocol(dpg_=None) -> dict:
     return launch_module('protocol', dpg_)
+
+
+def is_graph_running() -> bool:
+    return is_module_running('graph')
+
+
+def launch_graph(dpg_=None) -> dict:
+    return launch_module('graph', dpg_)
