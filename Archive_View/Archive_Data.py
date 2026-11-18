@@ -52,7 +52,49 @@ _PARAM_ALIASES = {
     'Tmax': 'extr_1', 'Tmin': 'extr_2',
     'TurnOver': 'TurnOver_1',
 }
+# Если основная колонка psidata содержит NULL — берём значение из резервной.
+# Ключ — имя параметра как он приходит из спецификации, значение — резервная колонка.
+# Резервная колонка psidata, если основная содержит NULL.
+_PARAM_FALLBACKS = {
+    'Rmax-Rmin': 'RR1',
+    'Rmax_Rmin': 'RR1',
+    'RmaxRmin':  'RR1',
+}
 
+
+def _coalesce_fallback_inplace(mapped, param, primary_col):
+    """Если у param есть fallback-колонка — заполнить NULL в primary_col из неё.
+
+    Меняет mapped in-place; возвращает имя колонки, которую дальше читать.
+    Если primary_col нет, но fallback есть — вернёт fallback.
+    """
+    fb = _PARAM_FALLBACKS.get(param)
+    if not fb:
+        return primary_col
+
+    if fb not in mapped.columns:
+        # fallback-колонки нет — работаем как раньше, но сообщаем один раз
+        key = (str(param), 'no_fallback_col')
+        if key not in _PARAM_RESOLVE_WARNED:
+            _PARAM_RESOLVE_WARNED.add(key)
+            print(f"[Archive] fallback-колонка {fb!r} отсутствует, param={param!r}")
+        return primary_col
+
+    if primary_col is None or primary_col not in mapped.columns:
+        return fb
+
+    if primary_col == fb:
+        return primary_col
+
+    s_primary = mapped[primary_col]
+    s_fb = mapped[fb]
+    if s_primary.isna().any():
+        mapped[primary_col] = s_primary.where(s_primary.notna(), s_fb)
+        key = (str(param), f'coalesced:{fb}')
+        if key not in _PARAM_RESOLVE_WARNED:
+            _PARAM_RESOLVE_WARNED.add(key)
+            print(f"[Archive] {param!r}: NULL в {primary_col!r} заполнены из {fb!r}")
+    return primary_col
 # Fuzzy-match запрещаем для пар имён, которые нормализуются одинаково.
 # Иначе Rb/Rc и Rc/Rbmax могут случайно «сойтись» не туда.
 _PARAM_FUZZY_BLOCK = {
@@ -82,8 +124,76 @@ def _find_col_by_name(mapped: pd.DataFrame, name: str) -> str | None:
         if str(col).strip().casefold() == cf:
             return col
     return None
-
 def resolve_param_column(mapped, param, spc_row=None):
+    """Найти реальную колонку в mapped для параметра из spc_map_table.
+
+    Порядок поиска:
+      1. Точное совпадение имени param.
+      2. Явные алиасы (_PARAM_ALIASES).
+      3. Через psidata_map_table: Parameter -> Field (и обратно).
+      4. Колонки из spc_row: Max / Min / Use (это столбцы в specification;
+         для Rc_Rb совпадает с psidata_map_table.Parameter='Rc_Rbmax').
+      5. Fuzzy (без регистра/пунктуации), если единственное совпадение.
+
+    Дополнительно: если для параметра задан fallback (_PARAM_FALLBACKS),
+    NULL-значения в найденной колонке заполняются из fallback-колонки
+    (in-place в mapped). Это нужно для Rmax-Rmin, где исторические записи
+    хранят значение в psidata.RR1, а psidata.`Rmax-Rmin` = NULL.
+    """
+    if mapped is None or mapped.empty or param is None:
+        return None
+
+    field_map = get_psidata_field_map()            # {Parameter: Field}
+    reverse_map = {f: p for p, f in field_map.items() if p and f}
+
+    candidates = []
+    def _add(x):
+        if x and x not in candidates:
+            candidates.append(x)
+
+    _add(param)
+
+    # (2) алиасы
+    a = _PARAM_ALIASES.get(param)
+    if a:
+        _add(a)
+        _add(field_map.get(a))
+        _add(reverse_map.get(a))
+
+    # (3) прямой Field из psidata_map_table
+    f = field_map.get(param)
+    if f:
+        _add(f)
+        _add(reverse_map.get(f))
+
+    # (4) колонки spec-таблицы: Max/Min/Use
+    if spc_row is not None:
+        for key in ('Max', 'Min', 'Use'):
+            v = spc_row.get(key) if hasattr(spc_row, 'get') else (
+                spc_row[key] if isinstance(spc_row, dict) else None)
+            if isinstance(v, str) and v:
+                _add(v)
+
+    for cand in candidates:
+        hit = _find_col_by_name(mapped, cand)
+        if hit:
+            return _coalesce_fallback_inplace(mapped, param, hit)
+
+    # (5) fuzzy
+    target = _norm_param_name(param)
+    if not target or target in _PARAM_FUZZY_BLOCK:
+        return _coalesce_fallback_inplace(mapped, param, None)
+    hits = [c for c in mapped.columns if _norm_param_name(c) == target]
+    if len(hits) == 1:
+        hit = hits[0]
+        key = (str(param), str(hit))
+        if key not in _PARAM_RESOLVE_WARNED:
+            _PARAM_RESOLVE_WARNED.add(key)
+            print(f"[Archive] resolve_param: {param!r} -> колонка {hit!r} (fuzzy)")
+        return _coalesce_fallback_inplace(mapped, param, hit)
+    return _coalesce_fallback_inplace(mapped, param, None)
+
+def resolve_param_column_4(mapped, param, spc_row=None):
     """Найти реальную колонку в mapped для параметра из spc_map_table.
 
     Порядок поиска:
