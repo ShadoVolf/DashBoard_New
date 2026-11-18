@@ -23,21 +23,15 @@ from Archive_View.Archive_Data import (
     build_view_data_from_archive, _prepare_spc_map,
 )
 from Archive_View.Archive_UI import _load_spc_map_for_display
-from .Protocol_Print import _engine, _nat_sort_key, _status
+from .Protocol_Engine import _engine, _nat_sort_key, _status
 from .Protocol_Data import log_action
 
 
 def _merge_pdfs(paths, out_path):
     writer_cls = reader_cls = None
-    try:
-        from pypdf import PdfWriter, PdfReader
-        writer_cls, reader_cls = PdfWriter, PdfReader
-    except Exception:
-        try:
-            from PyPDF2 import PdfWriter, PdfReader
-            writer_cls, reader_cls = PdfWriter, PdfReader
-        except Exception:
-            return None
+    from pypdf import PdfWriter, PdfReader
+    writer_cls, reader_cls = PdfWriter, PdfReader
+
     w = writer_cls()
     for p in paths:
         if p and os.path.isfile(p):
