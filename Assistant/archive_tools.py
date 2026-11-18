@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 import traceback
 from datetime import datetime
 from typing import Any, Optional
@@ -47,6 +48,209 @@ def _norm(v):
         return None
     s = str(v).strip()
     return None if s in (ALL_MSK, '', 'None') else s
+
+
+# ---------------------------------------------------------------------------
+# Нормализация / резолв имени спецификации
+# (кириллица↔латиница: визуальные и фонетические аналоги,
+#  запятая↔точка, регистр, пробелы)
+# ---------------------------------------------------------------------------
+# Визуальные аналоги (Р≈P, С≈C, …)
+_LOOKALIKE_VISUAL = str.maketrans({
+    'А': 'A', 'а': 'a',
+    'В': 'B', 'в': 'b',
+    'Е': 'E', 'е': 'e', 'Ё': 'E', 'ё': 'e',
+    'К': 'K', 'к': 'k',
+    'М': 'M', 'м': 'm',
+    'Н': 'H', 'н': 'h',
+    'О': 'O', 'о': 'o',
+    'Р': 'P', 'р': 'p',          # выглядит как P
+    'С': 'C', 'с': 'c',
+    'Т': 'T', 'т': 't',
+    'У': 'Y', 'у': 'y',
+    'Х': 'X', 'х': 'x',
+    'І': 'I', 'і': 'i',
+    'Ї': 'I', 'ї': 'i',
+})
+# Фонетическая/привычная транслитерация кодов (РК → RK, не PK)
+_LOOKALIKE_PHONETIC = str.maketrans({
+    'А': 'A', 'а': 'a',
+    'В': 'V', 'в': 'v',
+    'Е': 'E', 'е': 'e', 'Ё': 'E', 'ё': 'e',
+    'К': 'K', 'к': 'k',
+    'М': 'M', 'м': 'm',
+    'Н': 'N', 'н': 'n',
+    'О': 'O', 'о': 'o',
+    'Р': 'R', 'р': 'r',          # «эр» → R
+    'С': 'S', 'с': 's',
+    'Т': 'T', 'т': 't',
+    'У': 'U', 'у': 'u',
+    'Х': 'H', 'х': 'h',
+    'І': 'I', 'і': 'i',
+    'Й': 'J', 'й': 'j',
+})
+
+
+def _one_key(s: str, table: dict) -> str:
+    t = str(s).strip()
+    if not t:
+        return ''
+    t = t.translate(table)
+    t = t.replace(',', '.')
+    t = re.sub(r'\s+', '', t)
+    return t.casefold()
+
+
+def _normalize_spec_key(s: str) -> str:
+    """Основной ключ (фонетический) — для логов и быстрых сравнений."""
+    return _one_key(s or '', _LOOKALIKE_PHONETIC)
+
+
+def _normalize_spec_keys(s: str) -> set[str]:
+    """Набор ключей: фонетический + визуальный + «как есть» casefold."""
+    if s is None:
+        return set()
+    raw = str(s).strip()
+    if not raw:
+        return set()
+    keys = {
+        _one_key(raw, _LOOKALIKE_PHONETIC),
+        _one_key(raw, _LOOKALIKE_VISUAL),
+        re.sub(r'\s+', '', raw.replace(',', '.')).casefold(),
+    }
+    return {k for k in keys if k}
+
+
+def _all_spec_names() -> list[str]:
+    """Уникальные имена спецификаций из справочника + из данных."""
+    names: list[str] = []
+    seen: set[str] = set()
+    try:
+        for t in get_archive_types() or []:
+            for n in get_archive_specs_by_type(t) or []:
+                s = str(n).strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    names.append(s)
+    except Exception as e:
+        print(f'[archive_tools] _all_spec_names types: {e}')
+    try:
+        from sqlalchemy import create_engine, text
+        from Options import get_connection_string
+        from Archive_View.Archive_Data import _main
+        engine = create_engine(str(get_connection_string()))
+        table = _main()
+        df = pd.read_sql(
+            text(f'SELECT DISTINCT Spc FROM `{table}` '
+                 f'WHERE Spc IS NOT NULL AND TRIM(Spc) <> \'\''),
+            engine,
+        )
+        for n in df['Spc'].dropna().tolist():
+            s = str(n).strip()
+            if s and s not in seen:
+                seen.add(s)
+                names.append(s)
+    except Exception as e:
+        print(f'[archive_tools] _all_spec_names psidata: {e}')
+    return names
+
+
+def resolve_spec_name(query: str | None) -> dict:
+    """
+    Найти каноническое имя спецификации по свободному вводу.
+
+    Возвращает:
+      {'spc': str}                      — однозначное совпадение
+      {'spc': None, 'candidates': [...], 'error': str} — не найдено / неоднозначно
+    """
+    q = _norm(query)
+    if not q:
+        return {'spc': None, 'candidates': [], 'error': 'Спецификация не указана'}
+
+    q_keys = _normalize_spec_keys(q)
+    if not q_keys:
+        return {'spc': None, 'candidates': [], 'error': f'Пустой ключ для {q!r}'}
+
+    all_names = _all_spec_names()
+    if not all_names:
+        return {'spc': q, 'candidates': [], 'note': 'Справочник спеков пуст, используем как есть'}
+
+    def _keys(n: str) -> set[str]:
+        return _normalize_spec_keys(n)
+
+    # 1) точное совпадение: пересечение наборов ключей
+    exact = [n for n in all_names if _keys(n) & q_keys]
+    if len(exact) == 1:
+        return {'spc': exact[0], 'matched': 'exact', 'query': q}
+    if len(exact) > 1:
+        # если среди exact есть побайтово равный (без учёта регистра) — его
+        for n in exact:
+            if n.casefold() == q.casefold():
+                return {'spc': n, 'matched': 'exact', 'query': q}
+        return {
+            'spc': None,
+            'candidates': exact[:20],
+            'error': f'Несколько спецификаций совпадают с {q!r}',
+            'hint': 'Уточните имя: ' + ', '.join(exact[:5]),
+        }
+
+    # 2) подстрока по любому ключу
+    partial = []
+    for n in all_names:
+        nk = _keys(n)
+        if any(
+            qk in nk_item or nk_item in qk
+            for qk in q_keys
+            for nk_item in nk
+        ):
+            partial.append(n)
+    partial.sort(
+        key=lambda n: min(
+            abs(len(a) - len(b))
+            for a in _keys(n) for b in q_keys
+        )
+    )
+
+    if len(partial) == 1:
+        return {'spc': partial[0], 'matched': 'partial', 'query': q}
+    if len(partial) > 1:
+        best = partial[0]
+        best_dist = min(abs(len(a) - len(b)) for a in _keys(best) for b in q_keys)
+        close = [
+            n for n in partial
+            if min(abs(len(a) - len(b)) for a in _keys(n) for b in q_keys)
+            <= best_dist + 1
+        ]
+        if len(close) == 1:
+            return {'spc': close[0], 'matched': 'partial', 'query': q}
+        return {
+            'spc': None,
+            'candidates': partial[:20],
+            'error': f'Несколько спецификаций похожи на {q!r}',
+            'hint': 'Уточните: ' + ', '.join(partial[:8]),
+        }
+
+    return {
+        'spc': None,
+        'candidates': [],
+        'error': f'Спецификация {q!r} не найдена',
+        'hint': 'Проверьте буквы (Р/R/P, К/K, М/M) и точку/запятую в номере',
+    }
+
+
+def _resolve_spc_or_error(spc_raw: str | None) -> tuple[str | None, dict | None]:
+    """(canonical_spc, error_dict_or_None). Без spc → (None, None)."""
+    if not spc_raw:
+        return None, None
+    res = resolve_spec_name(spc_raw)
+    if res.get('spc'):
+        return res['spc'], None
+    return None, {
+        'error': res.get('error') or f'Не найдена спецификация {spc_raw!r}',
+        'hint': res.get('hint'),
+        'candidates': res.get('candidates') or [],
+        'query': spc_raw,
+    }
 
 
 def _as_numbers(v):
@@ -122,15 +326,7 @@ def _fill_ui_from_df(df: Optional[pd.DataFrame], status: str = ''):
 
 def _summary_from_df(df: Optional[pd.DataFrame]) -> dict:
     if df is None or df.empty:
-        return {
-            'rows': 0,
-            'measure_ids': 0,
-            'measure_id_list': [],
-            'msks': [],
-            'msk_count': 0,
-            'spc': None,
-            'sample_numbers': [],
-        }
+        return {'rows': 0, 'measure_ids': 0, 'msks': [], 'spc': None}
     mids = (
         sorted(int(x) for x in df['Measure_ID'].dropna().unique())
         if 'Measure_ID' in df.columns else []
@@ -289,7 +485,7 @@ def _tool_list_msk_by_numbers(params, dpg_):
 
 
 def _tool_list_last_msk(params, dpg_):
-    spc = _norm(params.get('spc'))
+    spc_raw = _norm(params.get('spc'))
     last_n = params.get('last_n') or 10
     try:
         last_n = int(last_n)
@@ -300,16 +496,44 @@ def _tool_list_last_msk(params, dpg_):
     date_from = _norm(params.get('date_from'))
     date_to = _norm(params.get('date_to'))
 
-    msks = get_archive_msk_list(spc)
+    spc, spc_err = _resolve_spc_or_error(spc_raw)
+    if spc_err:
+        return spc_err
+
+    # Точный список МСК по каноническому имени; если пусто —
+    # повтор с нормализованным LIKE по всем вариантам ключа.
+    msks = get_archive_msk_list(spc) if spc else get_archive_msk_list(None)
+    if spc and not msks:
+        # fallback: SQL по нормализованному сравнению через загрузку DISTINCT
+        try:
+            from sqlalchemy import create_engine, text
+            from Options import get_connection_string
+            from Archive_View.Archive_Data import _main
+            engine = create_engine(str(get_connection_string()))
+            table = _main()
+            df_spc = pd.read_sql(
+                text(f'SELECT DISTINCT Spc, MSK FROM `{table}` '
+                     f'WHERE Spc IS NOT NULL AND MSK IS NOT NULL'),
+                engine,
+            )
+            keyset = _normalize_spec_keys(spc)
+            mask = df_spc['Spc'].astype(str).map(
+                lambda x: bool(_normalize_spec_keys(x) & keyset)
+            )
+            msks = sorted(df_spc.loc[mask, 'MSK'].astype(str).unique().tolist())
+        except Exception as e:
+            print(f'[archive_tools] list_last_msk fallback msks: {e}')
+
     if not msks:
         return {
             'count': 0, 'msks': [],
-            'note': f'МСК для спецификации {spc!r} не найдены' if spc
+            'spc': spc,
+            'query': spc_raw,
+            'note': f'МСК для спецификации {spc or spc_raw!r} не найдены' if (spc or spc_raw)
                     else 'Список МСК пуст',
         }
 
-    # Сортировка по «свежести»: пытаемся взять max(Date) / max(Measure_ID)
-    # через лёгкий запрос; при ошибке — хвост списка как есть.
+    # Сортировка по «свежести»: max(Date) / max(Measure_ID)
     ranked = []
     try:
         from sqlalchemy import create_engine, text
@@ -320,8 +544,26 @@ def _tool_list_last_msk(params, dpg_):
         cond = ['MSK IS NOT NULL']
         p: dict[str, Any] = {}
         if spc:
-            cond.append('Spc = :spc')
-            p['spc'] = spc
+            # Совпадение по каноническому имени + все Spc с тем же normalize-ключом
+            # через IN по предварительно отобранным именам.
+            keyset = _normalize_spec_keys(spc)
+            try:
+                df_all_spc = pd.read_sql(
+                    text(f'SELECT DISTINCT Spc FROM `{table}` '
+                         f'WHERE Spc IS NOT NULL'),
+                    engine,
+                )
+                aliases = [
+                    str(x) for x in df_all_spc['Spc'].dropna().tolist()
+                    if _normalize_spec_keys(x) & keyset
+                ]
+            except Exception:
+                aliases = [spc]
+            if not aliases:
+                aliases = [spc]
+            # expanding IN
+            cond.append('Spc IN :spcs')
+            p['spcs'] = aliases
         if date_from:
             cond.append('Date >= :dfrom')
             p['dfrom'] = date_from
@@ -334,7 +576,15 @@ def _tool_list_last_msk(params, dpg_):
             f'FROM `{table}` WHERE {where} '
             f'GROUP BY MSK ORDER BY last_date DESC, last_mid DESC '
             f'LIMIT :lim'
-        )
+        ).bindparams()
+        if 'spcs' in p:
+            from sqlalchemy import bindparam
+            sql = text(
+                f'SELECT MSK, MAX(Date) AS last_date, MAX(Measure_ID) AS last_mid '
+                f'FROM `{table}` WHERE {where} '
+                f'GROUP BY MSK ORDER BY last_date DESC, last_mid DESC '
+                f'LIMIT :lim'
+            ).bindparams(bindparam('spcs', expanding=True))
         p['lim'] = last_n
         df_rank = pd.read_sql(sql, engine, params=p)
         ranked = [
@@ -347,32 +597,36 @@ def _tool_list_last_msk(params, dpg_):
         ]
     except Exception as e:
         print(f'[archive_tools] list_last_msk rank: {e}')
+        traceback.print_exc()
         ranked = [{'msk': m, 'last_date': '', 'last_measure_id': 0}
                   for m in msks[-last_n:]]
 
     _ensure_archive_open(dpg_)
+    status = (
+        f'Последние {len(ranked)} МСК'
+        + (f' для {spc}' if spc else '')
+        + (f' (запрос: {spc_raw})' if spc_raw and spc_raw != spc else '')
+        + (f' за {date_from}…{date_to or "…"}' if date_from else '')
+    )
     if dpg.does_item_exist('archive_status_text'):
-        dpg.set_value(
-            'archive_status_text',
-            f'Последние {len(ranked)} МСК'
-            + (f' для {spc}' if spc else '')
-            + (f' за {date_from}…{date_to or "…"}' if date_from else ''),
-        )
+        dpg.set_value('archive_status_text', status)
 
     return {
         'count': len(ranked),
         'spc': spc,
+        'query': spc_raw,
         'last_n': last_n,
         'msks': [r['msk'] for r in ranked],
         'details': ranked,
         'date_from': date_from,
         'date_to': date_to,
+        'note': status,
     }
 
 
 def _tool_load_archive(params, dpg_):
     msk = _norm(params.get('msk'))
-    spc = _norm(params.get('spc'))
+    spc_raw = _norm(params.get('spc'))
     measure_id = params.get('measure_id')
     numbers = _as_numbers(params.get('numbers'))
     date = _norm(params.get('date'))
@@ -386,10 +640,19 @@ def _tool_load_archive(params, dpg_):
         except (TypeError, ValueError):
             return {'error': f'measure_id должен быть int, получено {measure_id!r}'}
 
+    spc, spc_err = _resolve_spc_or_error(spc_raw)
+    if spc_err and not any((msk, measure_id, numbers)):
+        # спецификация была единственным ключом — ошибка резолва критична
+        return spc_err
+    if spc_err:
+        # есть другие фильтры — не валим, но спек игнорируем
+        print(f'[archive_tools] load: spc resolve failed: {spc_err}')
+        spc = None
+
     if not any((msk, spc, measure_id, numbers)):
         return {
             'error': 'Нужна МСК, спецификация, ID замера или номера',
-            'hint': 'Пример: «загрузи архив МСК 456»',
+            'hint': 'Пример: «загрузи архив МСК 456» / «архив спецификация РК507-98.415М-220»',
         }
 
     _ensure_archive_open(dpg_)
@@ -638,6 +901,9 @@ def format_result(name: str, res: dict) -> str:
         msg = f"[ERR] Архив / {name}: {res['error']}"
         if hint:
             msg += f'\n  → {hint}'
+        cands = res.get('candidates') or []
+        if cands:
+            msg += '\n  Варианты: ' + ', '.join(str(c) for c in cands[:10])
         return msg
 
     if name == 'open_archive':
@@ -674,10 +940,16 @@ def format_result(name: str, res: dict) -> str:
                 f"  {d.get('msk')}  date={d.get('last_date') or '-'}  "
                 f"mid={d.get('last_measure_id') or '-'}"
             )
+        spc_part = ''
+        if res.get('spc'):
+            spc_part = f" для {res.get('spc')}"
+            if res.get('query') and res.get('query') != res.get('spc'):
+                spc_part += f" (запрос «{res.get('query')}»)"
+        body = '\n'.join(lines) if lines else '  (пусто)'
         return (
             f"[OK] Последние {res.get('count', 0)} МСК"
-            + (f" для {res.get('spc')}" if res.get('spc') else '')
-            + ':\n' + '\n'.join(lines)
+            + spc_part
+            + ':\n' + body
         )
 
     if name == 'load_archive':

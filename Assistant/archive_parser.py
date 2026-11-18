@@ -20,8 +20,15 @@ _MEASURE_ID_PATTERN = re.compile(
 )
 _SPC_PATTERN = re.compile(
     r'(?:спецификац\w*|спек\w*|spc|spec)[\s:№#]*'
-    r'([A-Za-zА-Яа-я0-9\-_./]+(?:\s+[A-Za-zА-Яа-я0-9\-_./]+)?)',
+    r'([A-Za-zА-Яа-я0-9\-_.,/]+(?:\s*[A-Za-zА-Яа-я0-9\-_.,/]+)*)',
     re.IGNORECASE,
+)
+# Голый код спеки вида РК507-98.415М-220 / RK507-98,415M-220
+_SPC_BARE_PATTERN = re.compile(
+    r'(?<![A-Za-zА-Яа-я0-9])'
+    r'([A-Za-zА-Яа-я]{1,4}\d{2,4}[-–—]\d{1,4}[.,]\d{1,4}[A-Za-zА-Яа-я]?'
+    r'(?:[-–—]\d{1,6})?)'
+    r'(?![A-Za-zА-Яа-я0-9])',
 )
 _DATE_PATTERN = re.compile(
     r'\b(\d{4}-\d{2}-\d{2}|\d{2}[.\-/]\d{2}[.\-/]\d{4})\b',
@@ -124,7 +131,17 @@ def parse(q: str) -> Optional[dict]:
             return {'intent': 'print_archive_protocols', 'params': params}
 
     # ---- последние N МСК по спецификации ----
-    if has_last and (spc or has_arch) and re.search(r'мск|msk', low):
+    # «последние 10 мск для спецификации РК507-98.415М-220»
+    # «последние 5 мск РК507-98,415М-220»
+    if has_last and (
+        spc
+        or (has_arch and re.search(r'мск|msk', low))
+        or (re.search(r'мск|msk', low) and (spc or _SPC_BARE_PATTERN.search(text)))
+    ):
+        if not spc:
+            m_bare = _SPC_BARE_PATTERN.search(text)
+            if m_bare:
+                spc = m_bare.group(1).strip()
         params = {
             'spc': spc,
             'last_n': last_n or 10,
@@ -228,12 +245,20 @@ def _extract_msk(text: str) -> Optional[str]:
 
 def _extract_spc(text: str) -> Optional[str]:
     m = _SPC_PATTERN.search(text)
-    if not m:
-        return None
-    val = m.group(1).strip()
-    # обрезать хвост «МСК …»
-    val = re.split(r'\s+(?:мск|msk|номер)\b', val, flags=re.IGNORECASE)[0]
-    return val.strip() or None
+    if m:
+        val = m.group(1).strip()
+        # обрезать хвост «МСК …» / «последние …»
+        val = re.split(
+            r'\s+(?:мск|msk|номер|последн|за\s+период)\b',
+            val, flags=re.IGNORECASE,
+        )[0]
+        val = val.strip(' .,;:')
+        if val:
+            return val
+    m = _SPC_BARE_PATTERN.search(text)
+    if m:
+        return m.group(1).strip()
+    return None
 
 
 def _extract_measure_id(text: str) -> Optional[int]:
