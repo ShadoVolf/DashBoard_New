@@ -1,4 +1,4 @@
-"""Assistant — LLM-ассистент с поддержкой модулей Статистика, Протоколы и Графики.
+"""Assistant — LLM-ассистент с поддержкой модулей Статистика, Протоколы, Графики и Архив.
 
 Публичный API:
     create_assistant_window, show_assistant_window,
@@ -6,12 +6,14 @@
     run_llm_report, stop_llm_report,
     launch_statistics, is_statistics_running,
     launch_protocol,   is_protocol_running,
-    launch_module,     is_module_running,   # в т.ч. key='graph'
+    launch_graph,      is_graph_running,
+    launch_archive,    is_archive_running,
+    launch_module,     is_module_running,   # key='stats'|'protocol'|'graph'|'archive'
 
 Импорты ленивые (PEP 562): тяжёлые модули (controller, window, launcher)
 подгружаются только при первом обращении к их атрибутам. Это позволяет
-тестам импортировать парсеры (graph_parser, protocol_parser) без побочных
-эффектов и без запуска GUI/БД-цепочек.
+тестам импортировать парсеры (graph_parser, protocol_parser, archive_parser)
+без побочных эффектов и без запуска GUI/БД-цепочек.
 """
 from __future__ import annotations
 
@@ -32,6 +34,8 @@ _ATTR_TO_MODULE = {
     'launch_protocol':       '.launcher',
     'is_graph_running':      '.launcher',
     'launch_graph':          '.launcher',
+    'is_archive_running':    '.launcher',
+    'launch_archive':        '.launcher',
     'launch_module':         '.launcher',
     'is_module_running':     '.launcher',
     # window
@@ -49,6 +53,7 @@ _ATTR_TO_MODULE = {
 _SUBMODULES = frozenset({
     'constants', 'launcher', 'window', 'controller',
     'graph_parser', 'protocol_parser', 'protocol_tools',
+    'archive_parser', 'archive_tools',
 })
 
 __all__ = list(_ATTR_TO_MODULE)
@@ -58,7 +63,7 @@ def __getattr__(name: str):
     mod_path = _ATTR_TO_MODULE.get(name)
     if mod_path is not None:
         value = getattr(import_module(mod_path, __name__), name)
-        globals()[name] = value          # кэшируем, чтобы не дёргать повторно
+        globals()[name] = value
         return value
 
     if name in _SUBMODULES:
