@@ -72,7 +72,7 @@ def print_passport_for_protocol(protokol_id: int):
         v = p_info.get('psi_type')
         if v is not None and not pd.isna(v) and str(v).strip():
             psi_type = str(v).strip()
-    if psi_type not in ('ПСИ', 'ОТК'):
+    if psi_type not in ('ПСИ', 'ОТК', 'Паспорт'):
         psi_type = 'ОТК'
 
     with engine.connect() as conn:
