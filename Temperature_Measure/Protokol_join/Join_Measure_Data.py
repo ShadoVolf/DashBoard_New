@@ -8,7 +8,7 @@ import json
 from collections import defaultdict
 import Options
 from Temperature_Measure import Make_Measure
-
+import re
 # ===== Логирование =====
 import logging
 
@@ -25,7 +25,65 @@ for handler in logging.root.handlers:
     if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stdout:
         handler.setLevel(logging.WARNING)
 
+# ---------------------------------------------------------------------------
+# Нормализация и разбор фильтра номеров (whitelist).
+# Номера сравниваются нормализованно: 'XL0001' == 'XL1' == 'xl1'.
+# ---------------------------------------------------------------------------
+_NUM_RE = re.compile(r'^([A-Za-zА-Яа-я]*)(\d+)$')
+_INTERVAL_RE = re.compile(
+    r'^\s*([A-Za-zА-Яа-я]*)(\d+)\s*-\s*([A-Za-zА-Яа-я]*)(\d+)\s*$'
+)
 
+
+def _normalize_number(n):
+    """'XL0001' → 'XL1', 'lk4737' → 'LK4737', 123 → '123'."""
+    if n is None:
+        return ''
+    s = str(n).strip().upper()
+    m = _NUM_RE.match(s)
+    if m:
+        prefix, num = m.groups()
+        return f"{prefix}{int(num)}"
+    return s
+
+
+def _parse_numbers_filter(text):
+    """Разобрать 'XL0001, XL0005-XL0025' в (set нормализованных строк, warnings).
+
+    Возвращает (None, []) если строка пустая — это значит «фильтр не задан».
+    """
+    if not text or not str(text).strip():
+        return None, []
+
+    result = set()
+    warnings = []
+
+    for item in str(text).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        m = _INTERVAL_RE.match(item)
+        if m:
+            prefix1, num1_str, prefix2, num2_str = m.groups()
+            if prefix1.upper() != prefix2.upper():
+                warnings.append(
+                    f"Интервал {item!r} пропущен: разные префиксы "
+                    f"({prefix1!r} vs {prefix2!r})"
+                )
+                continue
+            prefix = prefix1.upper()
+            n1, n2 = int(num1_str), int(num2_str)
+            if n1 > n2:
+                warnings.append(
+                    f"Интервал {item!r} пропущен: начало > конца"
+                )
+                continue
+            for n in range(n1, n2 + 1):
+                result.add(f"{prefix}{n}")
+        else:
+            result.add(_normalize_number(item))
+
+    return result, warnings
 # ============================================================================
 #  Логирование загрузки/разборки данных — всегда в консоль + в лог-файл
 # ============================================================================
@@ -1594,8 +1652,360 @@ def get_failed_details(full_df):
                 failed_items[number] = params_info
     return failed_items
 
+def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None,
+                                   operator=None, psi_type='ОТК',
+                                   only_good=False, numbers_filter=None):
+    """Основная функция для обработки списка Measure_ID с копированием в новый замер.
 
-def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None, operator=None, psi_type='ОТК'):
+    only_good      — если True, в новый протокол попадут только годные изделия.
+    numbers_filter — set нормализованных номеров (см. _parse_numbers_filter).
+                     None — фильтр не задан (все номера).
+    """
+    engine = create_engine(str(Options.get_connection_string()))
+
+    psi_type = psi_type if psi_type in ('ПСИ', 'ОТК') else 'ОТК'
+
+    _log_load("\n" + "=" * 70)
+    _log_load(
+        f"[process] СТАРТ: measure_ids={measure_ids}, "
+        f"msk={msk}, program_type={program_type}, "
+        f"operator={operator}, psi_type={psi_type}, "
+        f"only_good={only_good}, "
+        f"numbers_filter={'задан' if numbers_filter else 'не задан'} "
+        f"({len(numbers_filter) if numbers_filter else 0} шт.)"
+    )
+    _log_load("=" * 70)
+
+    logging.info(f"   Тип протокола (psi_type): {psi_type}")
+
+    psi_map_sql = "SELECT * FROM psidata_map_table"
+    psi_map = pd.read_sql(psi_map_sql, engine)
+    _log_df("psidata_map_table — маппинг Field ↔ Parameter", psi_map)
+
+    column_mapping = dict(zip(psi_map['Field'], psi_map['Parameter']))
+
+    _log_load(f"[process] Маппинг Field→Parameter "
+              f"({len(column_mapping)} записей):")
+    for f, p in column_mapping.items():
+        _log_load(f"    {f!r:>20} → {p!r}")
+
+    all_results = []
+    all_valid_numbers = []
+    all_merged_dfs = []
+
+    # ▼ Для расчёта rejected: множество нормализованных номеров ВСЕХ годных
+    #   (не только попавших в numbers_filter).
+    all_good_numbers_norm = set()
+
+    logging.info(" Начало обработки Measure_ID...")
+    logging.info(f" Параметры обновления:")
+    logging.info(f"   MSK: {msk}")
+    logging.info(f"   Program_Type: {program_type}")
+    logging.info(f"   Operator: {operator}")
+    logging.info(f"   Только годные: {only_good}")
+    logging.info(
+        f"   Фильтр номеров: "
+        f"{'задан (' + str(len(numbers_filter)) + ' шт.)' if numbers_filter else 'не задан'}"
+    )
+
+    if program_type:
+        try:
+            machine_sql = f"SELECT * FROM machines WHERE Name = '{program_type}'"
+            machine_data = pd.read_sql(machine_sql, engine)
+            if not machine_data.empty:
+                machine_data = machine_data.iloc[0]
+                logging.info(f"   Данные машины '{program_type}':")
+                logging.info(f"     Serial_N: {machine_data.get('Serial_N', 'не указан')}")
+                logging.info(f"     Call_Date: {machine_data.get('Call_Date', 'не указана')}")
+                logging.info(f"     M_Type: {machine_data.get('M_Type', 'не указан')}")
+                logging.info(f"     Type: {machine_data.get('Type', 'не указан')}")
+                if machine_data.get('Type') == 'Transat':
+                    logging.info(f"     MachineType будет установлен как: CNA-300")
+            else:
+                logging.warning(f"   Внимание: машина '{program_type}' не найдена в таблице machines")
+        except Exception as e:
+            logging.exception(f"   Ошибка при получении данных машины: {e}")
+
+    for i, measure_id in enumerate(measure_ids):
+        logging.info(f"\n Обработка Measure_ID: {measure_id} ({i + 1}/{len(measure_ids)})")
+
+        show_progress(0, 1, f"Загрузка данных для Measure_ID {measure_id}")
+
+        psi_sql = f"SELECT * FROM psidata WHERE Measure_ID = {measure_id}"
+        psi_data = pd.read_sql(psi_sql, engine)
+
+        _log_load(f"\n[process] ▶ Measure_ID {measure_id} "
+                  f"({i + 1}/{len(measure_ids)})")
+
+        if psi_data.empty:
+            logging.warning(f" Данные для Measure_ID {measure_id} не найдены")
+            continue
+
+        _log_load(f"[process] psidata: {len(psi_data)} строк × "
+                  f"{len(psi_data.columns)} колонок")
+        _log_load(f"[process] Колонки psidata: {list(psi_data.columns)}")
+        _log_df(f"psidata (Measure_ID={measure_id}, первые 3 строки)",
+                psi_data.head(3), max_rows=3)
+
+        psi_data_renamed = psi_data.rename(columns=column_mapping)
+
+        _log_load("[process] После переименования колонок:")
+        for old in psi_data.columns:
+            if old in column_mapping:
+                _log_load(f"    {old!r} → {column_mapping[old]!r}")
+        _log_load(f"[process] Итоговые колонки: "
+                  f"{list(psi_data_renamed.columns)}")
+
+        show_progress(0.3, 1, f"Обработка спецификаций для Measure_ID {measure_id}")
+
+        unique_spc = psi_data_renamed['Spc'].unique()
+        _log_load(f"[process] Уникальных спецификаций: "
+                  f"{list(unique_spc)}")
+
+        for spc_name in unique_spc:
+            logging.info(f"    Обработка спецификации: {spc_name}")
+
+            spec_sql = f"SELECT * FROM specification WHERE Name = '{spc_name}'"
+            spec_data = pd.read_sql(spec_sql, engine)
+
+            if spec_data.empty:
+                logging.warning(f"   Спецификация {spc_name} не найдена")
+                continue
+
+            _log_df(f"specification: {spc_name!r}", spec_data)
+            spec_row = spec_data.iloc[0]
+
+            _log_load(f"[process]   Ключевые поля спецификации "
+                      f"{spc_name!r}:")
+            for field in ('Name', 'NameR', 'Rmax-Rmin', 'RR1max', 'RR1min',
+                          'Rmax', 'Rmin', 'Fmax', 'Fmin', 'R', 'F',
+                          'C0', 'Cq', 'Status'):
+                if field in spec_data.columns:
+                    _log_load(f"      {field!r} = {spec_row[field]!r}")
+
+            spc_mapped = load_spc_map(spec_data.iloc[0])
+            map_spc_otk = create_spc_map_otk(spc_mapped, spec_data.iloc[0])
+
+            _log_df(f"spc_mapped для {spc_name!r}", spc_mapped)
+            _log_df(f"map_spc_otk для {spc_name!r}", map_spc_otk)
+
+            spc_psi_data = psi_data_renamed[psi_data_renamed['Spc'] == spc_name]
+            _log_load(f"[process]   Данных для {spc_name!r}: "
+                      f"{len(spc_psi_data)} строк")
+
+            result_df, result_df2, stats_df, result_anomal = set_specification_to_data(
+                map_spc_otk, spc_psi_data
+            )
+
+            _log_load(f"[process]   ✓ {spc_name!r}: "
+                      f"годных={int(result_df['Status'].sum())}, "
+                      f"брак={len(result_df) - int(result_df['Status'].sum())}")
+            _log_df(f"stats_df для {spc_name!r}", stats_df)
+
+            result_df['Measure_ID'] = measure_id
+            result_df2['Measure_ID'] = measure_id
+
+            merged = pd.merge(result_df, result_df2,
+                              on=['Numbers', 'Positions', 'Measure_ID'],
+                              suffixes=('', '_val'))
+            norms = map_spc_otk.set_index('Parameter')[['Min', 'Max']]
+            for param in norms.index:
+                merged[f"{param}_Min"] = norms.loc[param, 'Min']
+                merged[f"{param}_Max"] = norms.loc[param, 'Max']
+
+            all_merged_dfs.append(merged)
+
+            # Все годные этой спецификации (для расчёта rejected)
+            valid_items_all = result_df[result_df['Status'] == True][
+                ['Numbers', 'Measure_ID']
+            ]
+            for _, r in valid_items_all.iterrows():
+                all_good_numbers_norm.add(_normalize_number(r['Numbers']))
+
+            # Что попадёт в новый протокол (с учётом numbers_filter)
+            if numbers_filter is not None:
+                valid_items_to_copy = valid_items_all[
+                    valid_items_all['Numbers'].apply(_normalize_number)
+                    .isin(numbers_filter)
+                ]
+                if len(valid_items_to_copy) < len(valid_items_all):
+                    _log_load(
+                        f"[process]   Фильтр номеров: {len(valid_items_to_copy)}"
+                        f" из {len(valid_items_all)} годных попадут в протокол"
+                    )
+            else:
+                valid_items_to_copy = valid_items_all
+
+            all_results.append(valid_items_to_copy)
+            all_valid_numbers.extend(
+                valid_items_to_copy[['Numbers', 'Measure_ID']]
+                .to_dict('records')
+            )
+
+        show_progress(1, 1, f"Завершено для Measure_ID {measure_id}")
+
+    if all_results:
+        final_result = pd.concat(all_results, ignore_index=True)
+        valid_numbers_df = pd.DataFrame(all_valid_numbers)
+    else:
+        final_result = pd.DataFrame(columns=['Numbers', 'Measure_ID'])
+        valid_numbers_df = pd.DataFrame(columns=['Numbers', 'Measure_ID'])
+
+    # ------------------------------------------------------------------
+    # Rejected = все номера минус ВСЕ годные (не только из whitelist).
+    # Это позволяет корректно отделить брак от годных вне whitelist.
+    # ------------------------------------------------------------------
+    all_numbers_in_measures = get_all_numbers_from_measure_ids(engine, measure_ids)
+    rejected_numbers_all = {
+        n for n in all_numbers_in_measures
+        if _normalize_number(n) not in all_good_numbers_norm
+    }
+
+    if only_good:
+        rejected_to_copy = set()
+        _log_load(
+            "[process] Режим «только годные»: бракованные в новый "
+            "протокол не попадут"
+        )
+    elif numbers_filter is not None:
+        rejected_to_copy = {
+            n for n in rejected_numbers_all
+            if _normalize_number(n) in numbers_filter
+        }
+        _log_load(
+            f"[process] Брак из whitelist: {len(rejected_to_copy)} "
+            f"из {len(rejected_numbers_all)} бракованных всего"
+        )
+    else:
+        rejected_to_copy = rejected_numbers_all
+
+    # Предупреждение о номерах, которых нет ни среди годных, ни среди бракованных
+    if numbers_filter:
+        found_norm = {_normalize_number(n) for n in valid_numbers_df['Numbers']} \
+                     if not valid_numbers_df.empty else set()
+        found_norm |= {_normalize_number(n) for n in rejected_to_copy}
+        missing = numbers_filter - found_norm
+        if missing:
+            _log_load(
+                f"[process] ⚠ Номера из whitelist не найдены в данных "
+                f"({len(missing)} шт.): {sorted(missing)[:20]}"
+            )
+
+    if all_merged_dfs:
+        combined = pd.concat(all_merged_dfs, ignore_index=True)
+        failed_details = get_failed_details(combined)
+        if failed_details:
+            logging.info("=== Детальная информация по бракованным изделиям ===")
+            for number, params in failed_details.items():
+                logging.info(f"Номер {number}:")
+                for p in params:
+                    norm_str = (f"{p['Min']} .. {p['Max']}"
+                                if p['Min'] is not None and p['Max'] is not None
+                                else "норма не задана")
+                    logging.info(f"  {p['Параметр']} = {p['Значение']} "
+                                 f"(норма: {norm_str})")
+        else:
+            logging.info("Бракованных изделий не найдено.")
+
+    # Проверяем, есть ли вообще что копировать в новый протокол
+    if final_result.empty and not rejected_to_copy:
+        print("Нет данных для копирования в новый протокол "
+              "(фильтр не дал результатов).")
+        return None, 0, 0
+
+    logging.info(
+        f"\n Обработка завершена. Годных к копированию: "
+        f"{len(final_result)}, бракованных: {len(rejected_to_copy)}"
+    )
+
+    logging.info("\n Создание нового замера...")
+    new_measure_id = create_new_measure_id(engine, measure_ids, msk,
+                                            program_type, operator)
+
+    if new_measure_id:
+        logging.info("\n Копирование данных в новый замер...")
+
+        psi_count = copy_psi_data(
+            engine, measure_ids, valid_numbers_df, new_measure_id,
+            msk, operator, program_type, psi_type,
+        )
+        temp_count = copy_psidatatemp_data(
+            engine, measure_ids, valid_numbers_df, new_measure_id, msk
+        )
+
+        if rejected_to_copy:
+            logging.info("\n Копирование бракованных изделий...")
+            rejected_psi_count, rejected_temp_count = copy_rejected_data(
+                engine, measure_ids, rejected_to_copy, new_measure_id,
+                msk, operator, program_type, psi_type,
+            )
+        else:
+            rejected_psi_count, rejected_temp_count = 0, 0
+
+        final_psi_count, final_temp_count = get_table_counts(engine, new_measure_id)
+
+        logging.info(f"\n  Новый замер успешно создан!")
+        logging.info(f"    Тип протокола: {psi_type}")
+        logging.info(f"    Measure_ID: {new_measure_id}")
+        if msk:
+            logging.info(f"    MSK: {msk}")
+        if program_type:
+            logging.info(f"    Program_Type: {program_type}")
+            try:
+                machine_sql = f"SELECT * FROM machines WHERE Name = '{program_type}'"
+                machine_data = pd.read_sql(machine_sql, engine)
+                if not machine_data.empty:
+                    machine_data = machine_data.iloc[0]
+                    logging.info(f"    Примененные данные машины:")
+                    logging.info(f"      Serial_N: {machine_data.get('Serial_N', 'не указан')}")
+                    logging.info(f"      Call_Date: {machine_data.get('Call_Date', 'не указана')}")
+                    logging.info(f"      M_Type: {machine_data.get('M_Type', 'не указан')}")
+                    machine_type = machine_data.get('Type', 'не указан')
+                    if machine_type == 'Transat':
+                        logging.info(f"      MachineType: CNA-300 (Transat)")
+                    else:
+                        logging.info(f"      MachineType: {machine_type}")
+            except Exception:
+                pass
+        if operator:
+            logging.info(f"    Operator: {operator}")
+        logging.info(f"    Записей в psidata: {final_psi_count}")
+        logging.info(f"    Записей в psidatatemp: {final_temp_count}")
+        logging.info(f"    Годных изделий: {psi_count}")
+        logging.info(f"    Бракованных изделий: {rejected_psi_count}")
+
+        logging.info(f"\n Уникальные изделия в новом замере:")
+
+        with engine.connect() as conn:
+            unique_numbers_sql = text(
+                "SELECT DISTINCT N FROM psidata WHERE Measure_ID = :measure_id ORDER BY N"
+            )
+            result = conn.execute(unique_numbers_sql,
+                                  {'measure_id': new_measure_id})
+            unique_numbers = [row[0] for row in result]
+
+            for idx, number in enumerate(unique_numbers):
+                logging.info(f"   {idx + 1:3d}. {number}")
+
+        _log_load("\n" + "=" * 70)
+        _log_load(
+            f"[process] ГОТОВО. Итог: годных={len(final_result)}, "
+            f"бракованных={len(rejected_to_copy)}, "
+            f"new_measure_id={new_measure_id}"
+        )
+        _log_load("=" * 70)
+
+        return new_measure_id, final_psi_count, final_temp_count
+
+    _log_load("\n" + "=" * 70)
+    _log_load(
+        f"[process] ГОТОВО. Итог: годных={len(final_result)}, "
+        f"бракованных={len(rejected_to_copy)}, new_measure_id=None"
+    )
+    _log_load("=" * 70)
+
+    return None, 0, 0
+def process_measure_ids_with_copy_1(measure_ids, msk=None, program_type=None, operator=None, psi_type='ОТК'):
     """Основная функция для обработки списка Measure_ID с копированием в новый замер"""
     engine = create_engine(str(Options.get_connection_string()))
 

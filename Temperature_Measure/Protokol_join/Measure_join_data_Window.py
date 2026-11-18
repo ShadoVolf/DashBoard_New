@@ -14,6 +14,7 @@ from Temperature_Measure.Protokol_join.Join_Measure_Data import (
     search_measure_ids_by_number_partial,
     format_measure_combo_label,
     get_measure_summary,
+    _parse_numbers_filter,
 )
 from Temperature_Measure.unite_protokol.sort_logic import (
     load_psidata_by_measure_id,
@@ -172,6 +173,32 @@ def _build_content(dpg):
             )
             dpg.add_text("")
             dpg.add_text("")
+
+    dpg.add_separator()
+    # ============================================================
+    # Фильтр номеров, остающихся в протоколе
+    # ============================================================
+    dpg.add_text("Номера для протокола")
+    with dpg.group(horizontal=True):
+        dpg.add_input_text(
+            tag='join_numbers_filter', width=-130,
+            hint='XL0001, XL0005-XL0025',
+        )
+        dpg.add_button(
+            label='Очистить', width=120,
+            callback=lambda: dpg.set_value('join_numbers_filter', ''),
+        )
+    dpg.add_text(
+        "Пусто — все номера. Формат: XL0001, XL0005-XL0025, ...",
+        color=(140, 140, 140),
+    )
+
+    with dpg.group(horizontal=True):
+        dpg.add_checkbox(
+            tag='join_only_good',
+            label='Только годные изделия',
+            default_value=False,
+        )
 
     dpg.add_separator()
 
@@ -474,6 +501,102 @@ def join_data_callback(dpg):
     operator = dpg.get_value('operator_edit')
     change_data = dpg.get_value('join_data_random_add')
 
+    psi_type = 'ОТК'
+    if dpg.does_item_exist('join_psi_type'):
+        v = dpg.get_value('join_psi_type')
+        if v in ('ПСИ', 'ОТК'):
+            psi_type = v
+
+    # ▼ NEW: whitelist номеров и «только годные»
+    numbers_filter_text = ''
+    if dpg.does_item_exist('join_numbers_filter'):
+        numbers_filter_text = dpg.get_value('join_numbers_filter') or ''
+    only_good = False
+    if dpg.does_item_exist('join_only_good'):
+        only_good = bool(dpg.get_value('join_only_good'))
+
+    numbers_filter, parse_warnings = _parse_numbers_filter(numbers_filter_text)
+    if parse_warnings:
+        for w in parse_warnings:
+            print(f'[join_data] ⚠ {w}')
+
+    if not input_text.strip():
+        dpg.set_value('join_data_result_log_process_window',
+                      "Ошибка: не введены номера протоколов")
+        return
+
+    _join_state.update({
+        'measure_id':    None,
+        'msk':           None,
+        'program_type':  None,
+        'operator':      None,
+        'psi_type':      psi_type,
+        'only_good':     only_good,
+        'numbers_count': len(numbers_filter) if numbers_filter else 0,
+    })
+    if dpg.does_item_exist('join_preview_button'):
+        dpg.configure_item('join_preview_button', enabled=False)
+    if dpg.does_item_exist('join_print_button'):
+        dpg.configure_item('join_print_button', enabled=False)
+
+    try:
+        measure_ids = []
+        for item in input_text.split(','):
+            item = item.strip()
+            if '-' in item:
+                start, end = map(int, item.split('-'))
+                measure_ids.extend(range(start, end + 1))
+            else:
+                measure_ids.append(int(item))
+
+        measure_ids = sorted(set(measure_ids))
+
+        info_message = f"Начинаю обработку протоколов: {measure_ids}\n"
+        info_message += f"Количество протоколов: {len(measure_ids)}\n"
+        info_message += f"Тип протокола: {psi_type}\n"
+
+        if numbers_filter:
+            sample = sorted(numbers_filter)[:5]
+            info_message += (
+                f"Фильтр номеров: {len(numbers_filter)} шт. "
+                f"(например: {sample}{'...' if len(numbers_filter) > 5 else ''})\n"
+            )
+        else:
+            info_message += "Фильтр номеров: не задан\n"
+        info_message += f"Только годные изделия: {'да' if only_good else 'нет'}\n"
+
+        if change_data == "Изменять данные":
+            info_message += "Будут обновлены:\n"
+            if msk:
+                info_message += f"  - MSK: {msk}\n"
+            if program_type:
+                info_message += f"  - Программа: {program_type}\n"
+            if operator:
+                info_message += f"  - Оператор: {operator}\n"
+        info_message += "Подготовка к объединению..."
+
+        dpg.set_value('join_data_result_log_process_window', info_message)
+
+        thread = threading.Thread(
+            target=process_measure_ids_with_thread,
+            args=(measure_ids, dpg, msk, program_type, operator,
+                  change_data, psi_type, only_good, numbers_filter),
+        )
+        thread.daemon = True
+        thread.start()
+
+    except ValueError as e:
+        dpg.set_value('join_data_result_log_process_window',
+                      f"Ошибка в формате ввода: {e}\n"
+                      f"Пример: 253799, 253216 или 253799-253216")
+
+def join_data_callback_1(dpg):
+    input_text = dpg.get_value('protokol_id_select')
+    msk = dpg.get_value('MSK_number_edit')
+    program_type = dpg.get_value('machine_edit')
+    operator = dpg.get_value('operator_edit')
+    change_data = dpg.get_value('join_data_random_add')
+
     # ▼ NEW: тип протокола из combo
     psi_type = 'ОТК'
     if dpg.does_item_exist('join_psi_type'):
@@ -487,13 +610,15 @@ def join_data_callback(dpg):
         return
 
     # ▼ NEW: сброс состояния и блокировка кнопок до нового результата
-    _join_state.update({
-        'measure_id':   None,
-        'msk':          None,
+    _join_state = {
+        'measure_id': None,
+        'msk': None,
         'program_type': None,
-        'operator':     None,
-        'psi_type':     psi_type,
-    })
+        'operator': None,
+        'psi_type': 'ОТК',
+        'only_good': False,
+        'numbers_count': 0,
+    }
     if dpg.does_item_exist('join_preview_button'):
         dpg.configure_item('join_preview_button', enabled=False)
     if dpg.does_item_exist('join_print_button'):
@@ -544,6 +669,100 @@ def join_data_callback(dpg):
 # Callback: обработка в фоне
 # ---------------------------------------------------------------------------
 def process_measure_ids_with_thread(measure_ids, dpg, msk, program_type,
+                                     operator, change_data, psi_type='ОТК',
+                                     only_good=False, numbers_filter=None):
+    old_stdout = sys.stdout
+    output_capture = StringIO()
+    sys.stdout = output_capture
+
+    try:
+        dpg.set_value("join_data_progress", 0.1)
+        dpg.set_value(
+            'join_data_result_log_process_window',
+            dpg.get_value('join_data_result_log_process_window') +
+            "\nЗагружаю данные...",
+        )
+
+        if change_data == "Изменять данные":
+            msk_to_use = msk if msk else None
+            program_type_to_use = program_type if program_type else None
+            operator_to_use = operator if operator else None
+        else:
+            msk_to_use = None
+            program_type_to_use = None
+            operator_to_use = None
+
+        new_measure_id, psi_count, temp_count = process_measure_ids_with_copy(
+            measure_ids,
+            msk=msk_to_use,
+            program_type=program_type_to_use,
+            operator=operator_to_use,
+            psi_type=psi_type,
+            only_good=only_good,
+            numbers_filter=numbers_filter,
+        )
+
+        sys.stdout = old_stdout
+        captured_output = output_capture.getvalue()
+
+        dpg.set_value("join_data_progress", 1.0)
+
+        if new_measure_id:
+            _join_state.update({
+                'measure_id':   int(new_measure_id),
+                'msk':          msk_to_use,
+                'program_type': program_type_to_use,
+                'operator':     operator_to_use,
+                'psi_type':     psi_type,
+            })
+            if dpg.does_item_exist('join_preview_button'):
+                dpg.configure_item('join_preview_button', enabled=True)
+            if dpg.does_item_exist('join_print_button'):
+                dpg.configure_item('join_print_button', enabled=True)
+
+            dpg.set_value('Result_measure_ID', str(new_measure_id))
+
+            filter_msg = (
+                f"- Фильтр номеров: {len(numbers_filter)} шт.\n"
+                if numbers_filter else
+                "- Фильтр номеров: не задан\n"
+            )
+            only_good_msg = f"- Только годные: {'да' if only_good else 'нет'}\n"
+
+            result_message = (
+                f"Объединение успешно завершено.\n\n"
+                f"Результаты:\n"
+                f"- Новый протокол: {new_measure_id}\n"
+                f"- Тип протокола: {psi_type}\n"
+                f"- MSK: {msk_to_use if msk_to_use else 'не изменялся'}\n"
+                f"- Программа: {program_type_to_use if program_type_to_use else 'не изменялась'}\n"
+                f"- Оператор: {operator_to_use if operator_to_use else 'не изменялся'}\n"
+                f"{filter_msg}{only_good_msg}"
+                f"- Записей в psidata: {psi_count}\n"
+                f"- Записей в psidatatemp: {temp_count}\n"
+                f"- Обработано протоколов: {len(measure_ids)}\n\n"
+                f"Доступны кнопки «Просмотр результата» и «Печать PDF».\n\n"
+                f"Лог выполнения:\n{captured_output}"
+            )
+        else:
+            dpg.set_value('Result_measure_ID', 'Ошибка')
+            result_message = (
+                f"Ошибка при создании нового протокола\n\n"
+                f"Лог выполнения:\n{captured_output}"
+            )
+
+        dpg.set_value('join_data_result_log_process_window', result_message)
+
+    except Exception as e:
+        sys.stdout = old_stdout
+        error_message = (
+            f"Критическая ошибка:\n{str(e)}\n\n"
+            f"Трассировка:\n{traceback.format_exc()}"
+        )
+        dpg.set_value('join_data_result_log_process_window', error_message)
+        dpg.set_value("join_data_progress", 0.0)
+
+def process_measure_ids_with_thread_1(measure_ids, dpg, msk, program_type,
                                      operator, change_data, psi_type='ОТК'):
     old_stdout = sys.stdout
     output_capture = StringIO()
