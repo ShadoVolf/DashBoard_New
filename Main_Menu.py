@@ -1,6 +1,7 @@
 from Archive_View import create_archive_view_window
 from Console import ConsoleManager
 from PSI_Specification.Temperature_profile.Temp_profile_Windows import create_main_temp_profile_windows
+from Power_Measure import create_power_measure_window
 from RT.RT_TECH_Parameters.Measure_RT_Windows import create_rt_windows
 from SpecEditor import create_spec_editor_window
 from Statistik.DashBoard import create_main_windows
@@ -102,6 +103,12 @@ def create_main_menu(dpg):
                 callback=show_frequency_measure,
                 tag='FrequencyMeasure_Menu',
             )
+            if create_power_measure_window is not None:
+                dpg.add_menu_item(
+                    label="Измерение мощности",
+                    callback=lambda: create_power_measure_window(),
+                    tag='PowerMeasure_Menu'
+                )
 
         dpg.add_menu(label="Окна", tag='Windows_Menu')
 
