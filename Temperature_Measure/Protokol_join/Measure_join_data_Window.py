@@ -14,6 +14,7 @@ from Temperature_Measure.Protokol_join.Join_Measure_Data import (
     search_measure_ids_by_number_partial,
     format_measure_combo_label,
     get_measure_summary,
+    _parse_numbers_filter,
 )
 from Temperature_Measure.unite_protokol.sort_logic import (
     load_psidata_by_measure_id,
@@ -172,6 +173,32 @@ def _build_content(dpg):
             )
             dpg.add_text("")
             dpg.add_text("")
+
+    dpg.add_separator()
+    # ============================================================
+    # Фильтр номеров, остающихся в протоколе
+    # ============================================================
+    dpg.add_text("Номера для протокола")
+    with dpg.group(horizontal=True):
+        dpg.add_input_text(
+            tag='join_numbers_filter', width=-130,
+            hint='XL0001, XL0005-XL0025',
+        )
+        dpg.add_button(
+            label='Очистить', width=120,
+            callback=lambda: dpg.set_value('join_numbers_filter', ''),
+        )
+    dpg.add_text(
+        "Пусто — все номера. Формат: XL0001, XL0005-XL0025, ...",
+        color=(140, 140, 140),
+    )
+
+    with dpg.group(horizontal=True):
+        dpg.add_checkbox(
+            tag='join_only_good',
+            label='Только годные изделия',
+            default_value=False,
+        )
 
     dpg.add_separator()
 
@@ -474,25 +501,38 @@ def join_data_callback(dpg):
     operator = dpg.get_value('operator_edit')
     change_data = dpg.get_value('join_data_random_add')
 
-    # ▼ NEW: тип протокола из combo
     psi_type = 'ОТК'
     if dpg.does_item_exist('join_psi_type'):
         v = dpg.get_value('join_psi_type')
         if v in ('ПСИ', 'ОТК'):
             psi_type = v
 
+    # ▼ NEW: whitelist номеров и «только годные»
+    numbers_filter_text = ''
+    if dpg.does_item_exist('join_numbers_filter'):
+        numbers_filter_text = dpg.get_value('join_numbers_filter') or ''
+    only_good = False
+    if dpg.does_item_exist('join_only_good'):
+        only_good = bool(dpg.get_value('join_only_good'))
+
+    numbers_filter, parse_warnings = _parse_numbers_filter(numbers_filter_text)
+    if parse_warnings:
+        for w in parse_warnings:
+            print(f'[join_data] ⚠ {w}')
+
     if not input_text.strip():
         dpg.set_value('join_data_result_log_process_window',
                       "Ошибка: не введены номера протоколов")
         return
 
-    # ▼ NEW: сброс состояния и блокировка кнопок до нового результата
     _join_state.update({
-        'measure_id':   None,
-        'msk':          None,
-        'program_type': None,
-        'operator':     None,
-        'psi_type':     psi_type,
+        'measure_id':    None,
+        'msk':           None,
+        'program_type':  None,
+        'operator':      None,
+        'psi_type':      psi_type,
+        'only_good':     only_good,
+        'numbers_count': len(numbers_filter) if numbers_filter else 0,
     })
     if dpg.does_item_exist('join_preview_button'):
         dpg.configure_item('join_preview_button', enabled=False)
@@ -514,6 +554,17 @@ def join_data_callback(dpg):
         info_message = f"Начинаю обработку протоколов: {measure_ids}\n"
         info_message += f"Количество протоколов: {len(measure_ids)}\n"
         info_message += f"Тип протокола: {psi_type}\n"
+
+        if numbers_filter:
+            sample = sorted(numbers_filter)[:5]
+            info_message += (
+                f"Фильтр номеров: {len(numbers_filter)} шт. "
+                f"(например: {sample}{'...' if len(numbers_filter) > 5 else ''})\n"
+            )
+        else:
+            info_message += "Фильтр номеров: не задан\n"
+        info_message += f"Только годные изделия: {'да' if only_good else 'нет'}\n"
+
         if change_data == "Изменять данные":
             info_message += "Будут обновлены:\n"
             if msk:
@@ -529,7 +580,7 @@ def join_data_callback(dpg):
         thread = threading.Thread(
             target=process_measure_ids_with_thread,
             args=(measure_ids, dpg, msk, program_type, operator,
-                  change_data, psi_type),
+                  change_data, psi_type, only_good, numbers_filter),
         )
         thread.daemon = True
         thread.start()
@@ -540,11 +591,13 @@ def join_data_callback(dpg):
                       f"Пример: 253799, 253216 или 253799-253216")
 
 
+
 # ---------------------------------------------------------------------------
 # Callback: обработка в фоне
 # ---------------------------------------------------------------------------
 def process_measure_ids_with_thread(measure_ids, dpg, msk, program_type,
-                                     operator, change_data, psi_type='ОТК'):
+                                     operator, change_data, psi_type='ОТК',
+                                     only_good=False, numbers_filter=None):
     old_stdout = sys.stdout
     output_capture = StringIO()
     sys.stdout = output_capture
@@ -572,6 +625,8 @@ def process_measure_ids_with_thread(measure_ids, dpg, msk, program_type,
             program_type=program_type_to_use,
             operator=operator_to_use,
             psi_type=psi_type,
+            only_good=only_good,
+            numbers_filter=numbers_filter,
         )
 
         sys.stdout = old_stdout
@@ -580,7 +635,6 @@ def process_measure_ids_with_thread(measure_ids, dpg, msk, program_type,
         dpg.set_value("join_data_progress", 1.0)
 
         if new_measure_id:
-            # ▼ NEW: сохранить параметры для просмотра / печати
             _join_state.update({
                 'measure_id':   int(new_measure_id),
                 'msk':          msk_to_use,
@@ -594,6 +648,14 @@ def process_measure_ids_with_thread(measure_ids, dpg, msk, program_type,
                 dpg.configure_item('join_print_button', enabled=True)
 
             dpg.set_value('Result_measure_ID', str(new_measure_id))
+
+            filter_msg = (
+                f"- Фильтр номеров: {len(numbers_filter)} шт.\n"
+                if numbers_filter else
+                "- Фильтр номеров: не задан\n"
+            )
+            only_good_msg = f"- Только годные: {'да' if only_good else 'нет'}\n"
+
             result_message = (
                 f"Объединение успешно завершено.\n\n"
                 f"Результаты:\n"
@@ -602,6 +664,7 @@ def process_measure_ids_with_thread(measure_ids, dpg, msk, program_type,
                 f"- MSK: {msk_to_use if msk_to_use else 'не изменялся'}\n"
                 f"- Программа: {program_type_to_use if program_type_to_use else 'не изменялась'}\n"
                 f"- Оператор: {operator_to_use if operator_to_use else 'не изменялся'}\n"
+                f"{filter_msg}{only_good_msg}"
                 f"- Записей в psidata: {psi_count}\n"
                 f"- Записей в psidatatemp: {temp_count}\n"
                 f"- Обработано протоколов: {len(measure_ids)}\n\n"
@@ -625,6 +688,7 @@ def process_measure_ids_with_thread(measure_ids, dpg, msk, program_type,
         )
         dpg.set_value('join_data_result_log_process_window', error_message)
         dpg.set_value("join_data_progress", 0.0)
+
 
 
 # ---------------------------------------------------------------------------

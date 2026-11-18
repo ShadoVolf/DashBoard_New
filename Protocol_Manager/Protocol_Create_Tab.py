@@ -534,6 +534,12 @@ def _build_create_tab():
         dpg.add_button(label="Печать Предъявительский (ОТК)",
                        width=250, height=42,
                        callback=lambda: _on_print_click("ОТК"))
+        dpg.add_button(
+            label="Печать паспорта",
+            width=250,
+            height=42,
+            callback=lambda: _on_print_passport_click("ПСИ")  # для паспорта всегда ПСИ
+        )
         dpg.add_spacer(width=20)
         dpg.add_button(label="Выбрать все", width=140, height=42,
                        callback=_pm_select_all)
@@ -543,6 +549,27 @@ def _build_create_tab():
                        width=240, height=42,
                        callback=_open_create_dates_dialog)
 
+
+def _on_print_passport_click(psi_type: str):
+    if _C._loaded_df is None or _C._loaded_df.empty:
+        _pm_status("Данные не загружены")
+        return
+    # Для паспорта всегда используем нормы ПСИ
+    psi_type = "ПСИ"
+    by_mid = defaultdict(list)
+    for pos_idx, (mid, n) in _C._selected_numbers.items():
+        tag = f'pm_sel_{pos_idx}'
+        if dpg.does_item_exist(tag) and dpg.get_value(tag):
+            by_mid[mid].append(n)
+    if not by_mid:
+        _pm_status("Не выбрано ни одного номера")
+        return
+    for mid, nums in by_mid.items():
+        try:
+            from .Protocol_Passport import print_passport_for_protocol
+            print_passport_for_protocol(mid)
+        except Exception as e:
+            print(f"[Protocol] Ошибка печати паспорта ID={mid}: {e}")
 
 def _build_pm_info_panel():
     dpg.add_text("Информация о записи", color=(180, 220, 255))

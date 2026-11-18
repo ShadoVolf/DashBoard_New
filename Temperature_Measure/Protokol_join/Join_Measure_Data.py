@@ -8,12 +8,10 @@ import json
 from collections import defaultdict
 import Options
 from Temperature_Measure import Make_Measure
-
+import re
 # ===== Логирование =====
 import logging
 
-# Настраиваем базовую конфигурацию: все сообщения уровня INFO и выше пишутся в файл,
-# а в консоль дублируются только WARNING и выше (устанавливаем уровень для StreamHandler)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -23,45 +21,244 @@ logging.basicConfig(
     ]
 )
 
-# Устанавливаем для консольного обработчика уровень WARNING, чтобы INFO не выводились в консоль
 for handler in logging.root.handlers:
     if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stdout:
         handler.setLevel(logging.WARNING)
-# =======================
+
+# ---------------------------------------------------------------------------
+# Нормализация и разбор фильтра номеров (whitelist).
+# Номера сравниваются нормализованно: 'XL0001' == 'XL1' == 'xl1'.
+# ---------------------------------------------------------------------------
+_NUM_RE = re.compile(r'^([A-Za-zА-Яа-я]*)(\d+)$')
+_INTERVAL_RE = re.compile(
+    r'^\s*([A-Za-zА-Яа-я]*)(\d+)\s*-\s*([A-Za-zА-Яа-я]*)(\d+)\s*$'
+)
+
+
+def _normalize_number(n):
+    """'XL0001' → 'XL1', 'lk4737' → 'LK4737', 123 → '123'."""
+    if n is None:
+        return ''
+    s = str(n).strip().upper()
+    m = _NUM_RE.match(s)
+    if m:
+        prefix, num = m.groups()
+        return f"{prefix}{int(num)}"
+    return s
+
+
+def _parse_numbers_filter(text):
+    """Разобрать 'XL0001, XL0005-XL0025' в (set нормализованных строк, warnings).
+
+    Возвращает (None, []) если строка пустая — это значит «фильтр не задан».
+    """
+    if not text or not str(text).strip():
+        return None, []
+
+    result = set()
+    warnings = []
+
+    for item in str(text).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        m = _INTERVAL_RE.match(item)
+        if m:
+            prefix1, num1_str, prefix2, num2_str = m.groups()
+            if prefix1.upper() != prefix2.upper():
+                warnings.append(
+                    f"Интервал {item!r} пропущен: разные префиксы "
+                    f"({prefix1!r} vs {prefix2!r})"
+                )
+                continue
+            prefix = prefix1.upper()
+            n1, n2 = int(num1_str), int(num2_str)
+            if n1 > n2:
+                warnings.append(
+                    f"Интервал {item!r} пропущен: начало > конца"
+                )
+                continue
+            for n in range(n1, n2 + 1):
+                result.add(f"{prefix}{n}")
+        else:
+            result.add(_normalize_number(item))
+
+    return result, warnings
+# ============================================================================
+#  Логирование загрузки/разборки данных — всегда в консоль + в лог-файл
+# ============================================================================
+def _log_load(msg):
+    """Гарантированный вывод в консоль + дублирование в app.log.
+
+    print идёт в sys.__stdout__ — это ОРИГИНАЛЬНЫЙ stdout, он не
+    перехватывается, даже когда в фоновом потоке выполняется
+    sys.stdout = StringIO(). Поэтому диагностика загрузки видна
+    оператору вживую.
+    """
+    try:
+        print(msg, file=sys.__stdout__, flush=True)
+    except Exception:
+        pass
+    logging.info(msg)
+
+
+def _log_df(title, df, max_rows=50):
+    """Красиво вывести DataFrame в консоль и лог (с обрезкой)."""
+    if df is None:
+        _log_load(f"{title}: <None>")
+        return
+    if not isinstance(df, pd.DataFrame):
+        _log_load(f"{title}: {df}")
+        return
+
+    total = len(df)
+    show_n = min(total, max_rows) if max_rows else total
+    df_show = df.head(show_n) if (max_rows and total > max_rows) else df
+    note = f" (первые {show_n} из {total})" if show_n < total else ""
+
+    bar = "=" * 70
+    _log_load(f"\n{bar}\n{title}{note}\n"
+              f"shape={df.shape}, columns={list(df.columns)}\n{bar}")
+    try:
+        table = tabulate(
+            df_show, headers='keys', tablefmt='grid',
+            showindex=False, missingval='—',
+        )
+    except Exception as e:
+        table = f"<tabulate error: {e}>\n{df_show.to_string()}"
+    _log_load(table)
+
+
+# ---------------------------------------------------------------------------
+# Fallback-колонки psidata (аналог _PARAM_FALLBACKS в Archive_Data).
+# Ключ — Parameter_Name из spc_map_table, значение — реальная колонка psidata.
+# Для Rmax-Rmin исторические записи хранят значение в RR1, а колонка
+# `Rmax-Rmin` в psidata пустая (NULL).
+# ---------------------------------------------------------------------------
+_PARAM_FALLBACKS = {
+    'Rmax-Rmin': 'RR1',
+    'Rmax_Rmin': 'RR1',
+    'RmaxRmin':  'RR1',
+}
+
+# Переопределение колонок specification для Max/Min, если в spc_map_table
+# всё ещё прописаны несуществующие Rmax-Rminmax / Rmax-Rminmin.
+_PARAM_FALLBACK_BOUNDS = {
+    'Rmax-Rmin': {'max': 'RR1max', 'min': 'RR1min'},
+    'Rmax_Rmin': {'max': 'RR1max', 'min': 'RR1min'},
+    'RmaxRmin':  {'max': 'RR1max', 'min': 'RR1min'},
+}
+def _resolve_psidata_column(spc_row):
+    """Реальная колонка psidata, из которой читать значения параметра.
+
+    Для Rmax-Rmin fallback = RR1 (исторические записи там, где Rmax-Rmin = NULL).
+    Для остальных — Parameter_Name (после rename он совпадает с колонкой data).
+    Use (флаг спецификации) НЕЛЬЗЯ использовать как имя колонки psidata:
+    например, у параметра F Use='Ft', но колонка psidata — F, а не Ft.
+    """
+    param = spc_row.get('Parameter_Name') if hasattr(spc_row, 'get') else None
+    return _PARAM_FALLBACKS.get(param) or param
+
+
+
+def _resolve_bound_columns(spc_row):
+    """Имена колонок specification для Max/Min с учётом fallback."""
+    param = spc_row.get('Parameter_Name') if hasattr(spc_row, 'get') else None
+    max_col = spc_row.get('Max') if hasattr(spc_row, 'get') else None
+    min_col = spc_row.get('Min') if hasattr(spc_row, 'get') else None
+    over = _PARAM_FALLBACK_BOUNDS.get(param)
+    if over:
+        max_col = over.get('max', max_col)
+        min_col = over.get('min', min_col)
+    return max_col, min_col
 
 
 def load_spc_map(row):
     engine = create_engine(str(Options.get_connection_string()))
     sql = "SELECT * FROM `spc_map_table` ORDER BY `ID`"
     spc_map = pd.read_sql(sql, engine)
-    filtered_spc = spc_map[spc_map.apply(lambda x: row[x['Use']] == 1, axis=1)]
+    _log_df("spc_map_table — полная таблица", spc_map)
 
-    result_df = filtered_spc.apply(
-        lambda spc_row: pd.Series({
-            'Parameter': spc_row['Parameter_Name'],
-            'Max': float(row[spc_row['Max']]) if row[spc_row['Max']] != 'no' else None,
-            'Min': float(row[spc_row['Min']]) if row[spc_row['Min']] != 'no' else None,
-            'Code': str(int(spc_row['Code']))
-        }),
-        axis=1
-    )
+    def _is_enabled(x):
+        try:
+            return row[x['Use']] == 1
+        except Exception:
+            return False
+
+    filtered_spc = spc_map[spc_map.apply(_is_enabled, axis=1)]
+    _log_df("spc_map_table — после фильтра по флагам спецификации", filtered_spc)
+
+    def _to_result(spc_row):
+        max_col, min_col = _resolve_bound_columns(spc_row)
+        psi_col = _resolve_psidata_column(spc_row)
+
+        _log_load(
+            f"\n[spc_map] Параметр {spc_row['Parameter_Name']!r}:\n"
+            f"    spc_map.Use  = {spc_row['Use']!r}  "
+            f"→ psidata колонка = {psi_col!r}\n"
+            f"    spc_map.Max  = {spc_row['Max']!r}  "
+            f"→ spec колонка = {max_col!r}\n"
+            f"    spc_map.Min  = {spc_row['Min']!r}  "
+            f"→ spec колонка = {min_col!r}\n"
+            f"    spc_map.Code = {spc_row['Code']!r}"
+        )
+
+        def _bound(col_name):
+            if not col_name:
+                _log_load(f"      норма {col_name!r}: имя не задано → None")
+                return None
+            if col_name not in row.index:
+                _log_load(f"      норма {col_name!r}: колонки нет в спецификации → None")
+                return None
+            v = row[col_name]
+            if v is None or v == 'no':
+                _log_load(f"      норма {col_name}={v!r}: нет нормы → None")
+                return None
+            try:
+                fv = float(v)
+                _log_load(f"      норма {col_name} = {fv}")
+                return fv
+            except (TypeError, ValueError):
+                _log_load(f"      норма {col_name}={v!r}: не число → None")
+                return None
+
+        return pd.Series({
+            'Parameter':       spc_row['Parameter_Name'],
+            'Psidata_Column':  psi_col,
+            'Max':             _bound(max_col),
+            'Min':             _bound(min_col),
+            'Code':            str(int(spc_row['Code'])),
+        })
+
+    result_df = filtered_spc.apply(_to_result, axis=1)
+    _log_df("spc_map — после разбора (Parameter / Psidata_Column / Max / Min / Code)",
+            result_df)
 
     logging.info('Спецификация ПСИ загружена')
-    # Вывод таблицы только в лог-файл
-    logging.info("\nСпецификация ПСИ на изделие:\n" + tabulate(
-        result_df,
-        headers='keys',
-        tablefmt='grid',
-        showindex=False,
-        missingval='—'
-    ))
+
     df = result_df[~result_df['Parameter'].isin(['Rsp0', 'Rsp1', 'Rsp2'])]
+    _log_df("spc_map — итог (исключены Rsp0/Rsp1/Rsp2)", df)
     return df
+
+
+
 
 
 def get_available_parameters(spc_data, data_columns):
     spc_params = spc_data.set_index('Parameter')
+
+    _log_load(f"\n[get_available_parameters] spc_map параметры "
+              f"({len(spc_params)}): {list(spc_params.index)}")
+    _log_load(f"[get_available_parameters] data.columns "
+              f"({len(data_columns)}): {list(data_columns)}")
+
     available_params = spc_params.index.intersection(data_columns).tolist()
+
+    missing = [p for p in spc_params.index if p not in available_params]
+    if missing:
+        _log_load(f"[get_available_parameters] ⚠ ПРОПУЩЕНЫ (нет в данных): {missing}")
+    _log_load(f"[get_available_parameters] ✓ БУДУТ проверяться: {available_params}")
+
     if not available_params:
         raise ValueError("Ни один параметр из spc_data не найден в data.columns")
     return spc_params.loc[available_params]
@@ -284,13 +481,48 @@ def print_results(result_df, result_df2, stats_df, result_anomal):
     logging.info(f"Годных: {result_df['Status'].sum()}")
     logging.info(f"Бракованных: {len(result_df) - result_df['Status'].sum()}")
 
-
 def set_specification_to_data(spc_data, data, anomal_use=True):
+    data = data.copy()
+
+    # ▼ Fallback: если для параметра задана Psidata_Column, отличная от
+    # Parameter (например, Rmax-Rmin → RR1), заполняем NaN в колонке
+    # Parameter значениями из Psidata_Column. Валидация читает data[Parameter],
+    # поэтому без этого шага Rmax-Rmin всегда был бы NULL для исторических
+    # записей, где данные лежат в RR1.
+    if 'Psidata_Column' in spc_data.columns:
+        for _, srow in spc_data.iterrows():
+            param = srow['Parameter']
+            psi_col = srow.get('Psidata_Column')
+            if (psi_col and psi_col != param
+                    and psi_col in data.columns
+                    and param in data.columns):
+                n_nan = int(data[param].isna().sum())
+                if n_nan > 0:
+                    data[param] = data[param].where(
+                        data[param].notna(), data[psi_col]
+                    )
+                    _log_load(
+                        f"[set_spec] Fallback: {n_nan} NaN в "
+                        f"{param!r} заполнены из {psi_col!r}"
+                    )
+
+    _log_load(f"\n[set_spec] ▶ Входные данные: shape={data.shape}")
+    _log_df("set_spec: spc_data (Parameter / Psidata_Column / Max / Min / Code)",
+            spc_data.reset_index(drop=True))
+    _log_df("set_spec: первые 5 строк проверяемых данных", data.head(5), max_rows=5)
+
     spc_params = get_available_parameters(spc_data, data.columns)
 
     params = spc_params.index.tolist()
+    _log_load(f"[set_spec] Проверяемых параметров: {len(params)} → {params}")
+
     spc_params = process_min_max(spc_params)
+    _log_df("set_spec: spc_params после обработки Min/Max/Code",
+            spc_params.reset_index())
+
     mask = create_validity_mask(data, spc_params, params)
+    _log_load("[set_spec] Маска валидности по параметрам (сколько True):")
+    _log_load(mask.sum().to_string())
 
     modify_rsp_mask_based_on_spfr(mask, data, spc_params, params)
     mask = exclude_spfr_from_rejection(mask, params)
@@ -313,6 +545,9 @@ def set_specification_to_data(spc_data, data, anomal_use=True):
     result_anomal = prepare_anomal_df(data, anomaly_masks, params)
 
     result_df = add_anomal_to_status(result_df)
+    _log_df("set_spec: итог result_df (первые 10 строк)",
+            result_df.head(10), max_rows=10)
+
     if 'Status' in data.columns:
         n_mask = data['Status'] == 'Незамер.'
         if n_mask.any():
@@ -325,6 +560,8 @@ def set_specification_to_data(spc_data, data, anomal_use=True):
     valid_data = data[result_df['Anomal_Status'] == False]
     valid_norm_data = valid_data[result_df['Status']]
     stats_df = calculate_statistics(data, result_df, spc_params, params)
+    _log_df("set_spec: stats_df", stats_df)
+
     total_valid = len(valid_norm_data)
     total_defect = len(data) - total_valid
     stats_df = add_total_status(stats_df, total_valid, total_defect)
@@ -334,6 +571,8 @@ def set_specification_to_data(spc_data, data, anomal_use=True):
 
     print_results(result_df, result_df2, stats_df, result_anomal)
     return result_df, result_df2, stats_df, result_anomal
+
+
 
 
 def modify_rsp_mask_based_on_spfr(mask, data, spc_params, params):
@@ -365,6 +604,8 @@ def create_spc_map_otk(spc_map, row):
     engine = create_engine(str(Options.get_connection_string()))
     sql = "Select * from `spc_dopusk_map_table` order by `ID`"
     dopusk_map = pd.read_sql(sql, engine)
+    _log_df("spc_dopusk_map_table — карта допусков ОТК", dopusk_map)
+
     dopusk_map.drop('ID', axis=1)
     dopusk_df = dopusk_map.apply(
         lambda dop_row: pd.Series({
@@ -376,6 +617,7 @@ def create_spc_map_otk(spc_map, row):
     )
 
     merged_df = spc_map.merge(dopusk_df, on='Parameter', how='left')
+    _log_df("create_spc_map_otk: spc_map + допуски (merged_df)", merged_df)
 
     def apply_tolerance(row):
         max_val = row['Max']
@@ -415,12 +657,17 @@ def create_spc_map_otk(spc_map, row):
             row['Min'] = np.round(min_val, 3)
 
         return row
-
+    '''
     result_df = merged_df.apply(apply_tolerance, axis=1)
     result_df = result_df[['Parameter', 'Max', 'Min', 'Code']]
+    '''
+    result_df = merged_df.apply(apply_tolerance, axis=1)
+    # Psidata_Column сохраняем — он нужен в set_specification_to_data
+    # для fallback-заполнения Rmax-Rmin из RR1.
+    result_df = result_df[['Parameter', 'Psidata_Column', 'Max', 'Min', 'Code']]
+    _log_df("Спецификация ОТК — после применения допусков", result_df)
 
     logging.info('Спецификация ОТК загружена')
-    # Вывод таблицы только в лог-файл
     logging.info("\nСпецификация ОТК на изделие:\n" + tabulate(
         result_df,
         headers='keys',
@@ -491,6 +738,7 @@ def create_new_measure_id(engine, source_measure_ids=None, msk=None, program_typ
     except Exception as e:
         logging.exception(f" Ошибка при создании нового Measure_ID: {e}")
         return None
+
 
 def copy_psi_data(engine, source_measure_ids, valid_numbers, new_measure_id,
                   new_msk=None, new_operator=None, program_type=None,
@@ -597,11 +845,6 @@ def copy_psi_data(engine, source_measure_ids, valid_numbers, new_measure_id,
             # ------------------ Measure_ID / MSK / Operator ------------------
             source_data['Measure_ID'] = new_measure_id
 
-            # ▼ NEW: единый тип протокола для всех строк нового замера.
-            #   Перезаписываем независимо от режима «Изменить/Не изменять
-            #   данные»: psi_type — метаданные нового протокола, а не
-            #   изменяемые данные источника. Без этой строки значение
-            #   унаследуется от исходных замеров (могут быть смешанные).
             if has_psi_type:
                 source_data['psi_type'] = psi_type
                 logging.info(
@@ -698,238 +941,6 @@ def copy_psi_data(engine, source_measure_ids, valid_numbers, new_measure_id,
         logging.exception(f" Ошибка при копировании данных в psidata: {e}")
         return 0
 
-def copy_psi_data_1(engine, source_measure_ids, valid_numbers, new_measure_id, new_msk=None, new_operator=None,
-                  program_type=None):
-    try:
-        total_copied = 0
-
-        machine_data = None
-        if program_type:
-            try:
-                machine_sql = f"SELECT * FROM machines WHERE Name = '{program_type}'"
-                machine_data = pd.read_sql(machine_sql, engine)
-                if not machine_data.empty:
-                    machine_data = machine_data.iloc[0]
-                    logging.info(f"   Данные машины загружены: {program_type}")
-                else:
-                    logging.warning(f"   Внимание: машина '{program_type}' не найдена в таблице machines")
-                    machine_data = None
-            except Exception as e:
-                logging.exception(f"   Ошибка при загрузке данных машины: {e}")
-                machine_data = None
-
-        conditions = []
-        params = {}
-        param_counter = 0
-
-        for measure_id in source_measure_ids:
-            numbers_for_measure = valid_numbers[valid_numbers['Measure_ID'] == measure_id]['Numbers'].tolist()
-            if numbers_for_measure:
-                number_conditions = []
-                for number in numbers_for_measure:
-                    param_name = f"num_{param_counter}"
-                    number_conditions.append(f"(Measure_ID = {measure_id} AND N = :{param_name})")
-                    params[param_name] = number
-                    param_counter += 1
-                conditions.append(" OR ".join(number_conditions))
-
-        if not conditions:
-            logging.info(" Нет данных для копирования в psidata")
-            return 0
-
-        where_clause = " WHERE " + " OR ".join(conditions)
-
-        with engine.connect() as conn:
-            columns_query = """
-                SELECT COLUMN_NAME 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_NAME = 'psidata' 
-                AND TABLE_SCHEMA = DATABASE()
-                AND COLUMN_NAME != 'ID'
-                ORDER BY ORDINAL_POSITION
-            """
-            columns_df = pd.read_sql(columns_query, conn)
-            columns = columns_df['COLUMN_NAME'].tolist()
-
-            has_files_multy = 'files_multy' in columns
-
-            select_sql = text(f"SELECT * FROM psidata {where_clause}")
-            source_data = pd.read_sql(select_sql, conn, params=params)
-
-            if source_data.empty:
-                logging.info(" Нет данных для копирования в psidata")
-                return 0
-
-            if 'ID' in source_data.columns:
-                source_data = source_data.drop('ID', axis=1)
-
-            files_by_number = defaultdict(list)
-            for _, row in source_data.iterrows():
-                number = row['N']
-                file_info = []
-                if 'File' in row and pd.notna(row['File']):
-                    file_info.append(row['File'])
-                if 'File_ID' in row and pd.notna(row['File_ID']):
-                    file_info.append(row['File_ID'])
-                if file_info:
-                    files_by_number[number].append(file_info)
-
-            source_data['Measure_ID'] = new_measure_id
-
-            if new_msk is not None:
-                source_data['MSK'] = new_msk
-                logging.info(f" Обновлен MSK на {new_msk} для {len(source_data)} записей в psidata")
-
-            if new_operator is not None:
-                source_data['Operator'] = new_operator
-                logging.info(f" Обновлен Operator на {new_operator} для {len(source_data)} записей в psidata")
-
-            if machine_data is not None:
-                if 'Serial_N' in machine_data and pd.notna(machine_data['Serial_N']):
-                    source_data['Machine_Serial'] = machine_data['Serial_N']
-                    logging.info(f" Обновлен Machine_Serial на {machine_data['Serial_N']}")
-
-                if 'Call_Date' in machine_data and pd.notna(machine_data['Call_Date']):
-                    source_data['Machine_Call_Date'] = machine_data['Call_Date']
-                    logging.info(f" Обновлен Machine_Call_Date на {machine_data['Call_Date']}")
-
-                if 'M_Type' in machine_data and pd.notna(machine_data['M_Type']):
-                    source_data['M_Type'] = machine_data['M_Type']
-                    logging.info(f" Обновлен M_Type на {machine_data['M_Type']}")
-
-                if 'Type' in machine_data and pd.notna(machine_data['Type']):
-                    if machine_data['Type'] == 'Transat':
-                        source_data['MachineType'] = 'CNA-300'
-                        logging.info(" Обновлен MachineType на CNA-300 (Transat)")
-                    else:
-                        source_data['MachineType'] = machine_data['Type']
-                        logging.info(f" Обновлен MachineType на {machine_data['Type']}")
-
-            if has_files_multy:
-                source_data['files_multy'] = source_data['N'].apply(
-                    lambda x: json.dumps(files_by_number.get(x, []))
-                )
-                logging.info(" Добавлено поле files_multy с объединенными файлами")
-            else:
-                logging.warning(" Внимание: поле files_multy не найдено в таблице psidata")
-
-            source_data[columns].to_sql('psidata', conn, if_exists='append', index=False, method='multi')
-            total_copied = len(source_data)
-
-            conn.commit()
-            logging.info(f" Скопировано {total_copied} записей в psidata")
-
-        return total_copied
-
-    except Exception as e:
-        logging.exception(f" Ошибка при копировании данных в psidata: {e}")
-        return 0
-
-
-def copy_psi_data1(engine, source_measure_ids, valid_numbers, new_measure_id, new_msk=None, new_operator=None, program_type=None):
-    try:
-        total_copied = 0
-
-        machine_data = None
-        if program_type:
-            try:
-                machine_sql = f"SELECT * FROM machines WHERE Name = '{program_type}'"
-                machine_data = pd.read_sql(machine_sql, engine)
-                if not machine_data.empty:
-                    machine_data = machine_data.iloc[0]
-                    logging.info(f"   Данные машины загружены: {program_type}")
-                else:
-                    logging.warning(f"   Внимание: машина '{program_type}' не найдена в таблице machines")
-                    machine_data = None
-            except Exception as e:
-                logging.exception(f"   Ошибка при загрузке данных машины: {e}")
-                machine_data = None
-
-        conditions = []
-        params = {}
-        param_counter = 0
-
-        for measure_id in source_measure_ids:
-            numbers_for_measure = valid_numbers[valid_numbers['Measure_ID'] == measure_id]['Numbers'].tolist()
-            if numbers_for_measure:
-                number_conditions = []
-                for number in numbers_for_measure:
-                    param_name = f"num_{param_counter}"
-                    number_conditions.append(f"(Measure_ID = {measure_id} AND N = :{param_name})")
-                    params[param_name] = number
-                    param_counter += 1
-                conditions.append(" OR ".join(number_conditions))
-
-        if not conditions:
-            logging.info(" Нет данных для копирования в psidata")
-            return 0
-
-        where_clause = " WHERE " + " OR ".join(conditions)
-
-        with engine.connect() as conn:
-            columns_query = """
-                SELECT COLUMN_NAME 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_NAME = 'psidata' 
-                AND TABLE_SCHEMA = DATABASE()
-                AND COLUMN_NAME != 'ID'
-                ORDER BY ORDINAL_POSITION
-            """
-            columns_df = pd.read_sql(columns_query, conn)
-            columns = columns_df['COLUMN_NAME'].tolist()
-
-            select_sql = text(f"SELECT * FROM psidata {where_clause}")
-            source_data = pd.read_sql(select_sql, conn, params=params)
-
-            if source_data.empty:
-                logging.info(" Нет данных для копирования в psidata")
-                return 0
-
-            if 'ID' in source_data.columns:
-                source_data = source_data.drop('ID', axis=1)
-
-            source_data['Measure_ID'] = new_measure_id
-
-            if new_msk is not None:
-                source_data['MSK'] = new_msk
-                logging.info(f" Обновлен MSK на {new_msk} для {len(source_data)} записей в psidata")
-
-            if new_operator is not None:
-                source_data['Operator'] = new_operator
-                logging.info(f" Обновлен Operator на {new_operator} для {len(source_data)} записей в psidata")
-
-            if machine_data is not None:
-                if 'Serial_N' in machine_data and pd.notna(machine_data['Serial_N']):
-                    source_data['Machine_Serial'] = machine_data['Serial_N']
-                    logging.info(f" Обновлен Machine_Serial на {machine_data['Serial_N']}")
-
-                if 'Call_Date' in machine_data and pd.notna(machine_data['Call_Date']):
-                    source_data['Machine_Call_Date'] = machine_data['Call_Date']
-                    logging.info(f" Обновлен Machine_Call_Date на {machine_data['Call_Date']}")
-
-                if 'M_Type' in machine_data and pd.notna(machine_data['M_Type']):
-                    source_data['M_Type'] = machine_data['M_Type']
-                    logging.info(f" Обновлен M_Type на {machine_data['M_Type']}")
-
-                if 'Type' in machine_data and pd.notna(machine_data['Type']):
-                    if machine_data['Type'] == 'Transat':
-                        source_data['MachineType'] = 'CNA-300'
-                        logging.info(" Обновлен MachineType на CNA-300 (Transat)")
-                    else:
-                        source_data['MachineType'] = machine_data['Type']
-                        logging.info(f" Обновлен MachineType на {machine_data['Type']}")
-
-            source_data[columns].to_sql('psidata', conn, if_exists='append', index=False, method='multi')
-            total_copied = len(source_data)
-
-            conn.commit()
-            logging.info(f" Скопировано {total_copied} записей в psidata")
-
-        return total_copied
-
-    except Exception as e:
-        logging.exception(f" Ошибка при копировании данных в psidata: {e}")
-        return 0
 
 
 def copy_psidatatemp_data(engine, source_measure_ids, valid_numbers, new_measure_id, new_msk=None, new_operator=None):
@@ -1002,6 +1013,7 @@ def copy_psidatatemp_data(engine, source_measure_ids, valid_numbers, new_measure
     except Exception as e:
         logging.exception(f" Ошибка при копировании данных в psidatatemp: {e}")
         return 0
+
 
 def copy_rejected_data(engine, measure_ids, rejected_numbers, new_measure_id,
                        new_msk=None, new_operator=None, program_type=None,
@@ -1112,7 +1124,6 @@ def copy_rejected_data(engine, measure_ids, rejected_numbers, new_measure_id,
 
                             psi_data['Measure_ID'] = new_measure_id
 
-                            # ▼ NEW: перезапись типа протокола
                             if has_psi_type and 'psi_type' in psi_data.columns:
                                 psi_data['psi_type'] = psi_type
 
@@ -1186,9 +1197,6 @@ def copy_rejected_data(engine, measure_ids, rejected_numbers, new_measure_id,
                                 if new_msk is not None:
                                     temp_data['MSK'] = new_msk
 
-                                # psidatatemp — своя схема, psi_type
-                                # там обычно нет; перезаписываем только
-                                # если колонка реально существует.
                                 if 'psi_type' in temp_data.columns:
                                     temp_data['psi_type'] = psi_type
 
@@ -1198,7 +1206,7 @@ def copy_rejected_data(engine, measure_ids, rejected_numbers, new_measure_id,
                                 )
                                 total_temp_copied += len(temp_data)
 
-                            break  # строка скопирована — к следующему номеру
+                            break
 
                 except Exception as e:
                     logging.exception(
@@ -1215,234 +1223,6 @@ def copy_rejected_data(engine, measure_ids, rejected_numbers, new_measure_id,
             f" Скопировано {total_temp_copied} бракованных записей "
             f"в psidatatemp"
         )
-
-        return total_psi_copied, total_temp_copied
-
-    except Exception as e:
-        logging.exception(f"✗ Ошибка при копировании бракованных данных: {e}")
-        return 0, 0
-
-def copy_rejected_data_1(engine, measure_ids, rejected_numbers, new_measure_id, new_msk=None, new_operator=None,
-                       program_type=None):
-    try:
-        total_psi_copied = 0
-        total_temp_copied = 0
-
-        machine_data = None
-        if program_type:
-            try:
-                machine_sql = f"SELECT * FROM machines WHERE Name = '{program_type}'"
-                machine_data = pd.read_sql(machine_sql, engine)
-                if not machine_data.empty:
-                    machine_data = machine_data.iloc[0]
-                    logging.info(f"   Данные машины загружены для бракованных изделий: {program_type}")
-                else:
-                    logging.warning(f"   Внимание: машина '{program_type}' не найдена в таблице machines для бракованных изделий")
-                    machine_data = None
-            except Exception as e:
-                logging.exception(f"   Ошибка при загрузке данных машины для бракованных изделий: {e}")
-                machine_data = None
-
-        with engine.connect() as conn:
-            columns_query = """
-                SELECT COLUMN_NAME 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_NAME = 'psidata' 
-                AND TABLE_SCHEMA = DATABASE()
-                AND COLUMN_NAME != 'ID'
-                ORDER BY ORDINAL_POSITION
-            """
-            columns_df = pd.read_sql(columns_query, conn)
-            columns = columns_df['COLUMN_NAME'].tolist()
-            has_files_multy = 'files_multy' in columns
-
-        files_by_number = defaultdict(list)
-        for measure_id in measure_ids:
-            try:
-                with engine.connect() as conn:
-                    psi_sql = f"SELECT N, File, File_ID FROM psidata WHERE Measure_ID = {measure_id}"
-                    psi_files_data = pd.read_sql(psi_sql, conn)
-
-                    for _, row in psi_files_data.iterrows():
-                        number = row['N']
-                        file_info = []
-                        if pd.notna(row['File']):
-                            file_info.append(row['File'])
-                        if pd.notna(row['File_ID']):
-                            file_info.append(row['File_ID'])
-                        if file_info:
-                            files_by_number[number].append(file_info)
-            except Exception as e:
-                logging.exception(f"   Ошибка при получении файлов из Measure_ID {measure_id}: {e}")
-                continue
-
-        rejected_numbers_list = list(rejected_numbers)
-
-        for i, number in enumerate(rejected_numbers_list):
-            show_progress(i + 1, len(rejected_numbers_list), f"Копирование бракованных изделий")
-
-            for measure_id in measure_ids:
-                try:
-                    with engine.connect() as conn:
-                        psi_sql = f"SELECT * FROM psidata WHERE Measure_ID = {measure_id} AND N = '{number}' LIMIT 1"
-                        psi_data = pd.read_sql(psi_sql, conn)
-
-                        if not psi_data.empty:
-                            if 'ID' in psi_data.columns:
-                                psi_data = psi_data.drop('ID', axis=1)
-
-                            psi_data['Measure_ID'] = new_measure_id
-
-                            if new_msk is not None:
-                                psi_data['MSK'] = new_msk
-
-                            if new_operator is not None:
-                                psi_data['Operator'] = new_operator
-
-                            if machine_data is not None:
-                                if 'Serial_N' in machine_data and pd.notna(machine_data['Serial_N']):
-                                    psi_data['Machine_Serial'] = machine_data['Serial_N']
-
-                                if 'Call_Date' in machine_data and pd.notna(machine_data['Call_Date']):
-                                    psi_data['Machine_Call_Date'] = machine_data['Call_Date']
-
-                                if 'M_Type' in machine_data and pd.notna(machine_data['M_Type']):
-                                    psi_data['M_Type'] = machine_data['M_Type']
-
-                                if 'Type' in machine_data and pd.notna(machine_data['Type']):
-                                    if machine_data['Type'] == 'Transat':
-                                        psi_data['MachineType'] = 'CNA-300'
-                                    else:
-                                        psi_data['MachineType'] = machine_data['Type']
-
-                            if has_files_multy and number in files_by_number:
-                                psi_data['files_multy'] = json.dumps(files_by_number[number])
-
-                            psi_data[columns].to_sql('psidata', conn, if_exists='append', index=False)
-                            total_psi_copied += 1
-
-                            temp_sql = f"SELECT * FROM psidatatemp WHERE Measure_ID = {measure_id} AND N = '{number}'"
-                            temp_data = pd.read_sql(temp_sql, conn)
-
-                            if not temp_data.empty:
-                                if 'RecordId' in temp_data.columns:
-                                    temp_data = temp_data.drop('RecordId', axis=1)
-
-                                if 'Operator' in temp_data.columns:
-                                    temp_data = temp_data.drop('Operator', axis=1)
-
-                                temp_data['Measure_ID'] = new_measure_id
-
-                                if new_msk is not None:
-                                    temp_data['MSK'] = new_msk
-
-                                temp_data.to_sql('psidatatemp', conn, if_exists='append', index=False)
-                                total_temp_copied += len(temp_data)
-
-                            break
-
-                except Exception as e:
-                    logging.exception(f"✗ Ошибка при копировании бракованного номера {number}: {e}")
-                    continue
-
-        logging.info(f"\n Скопировано {total_psi_copied} бракованных записей в psidata")
-        logging.info(f" Скопировано {total_temp_copied} бракованных записей в psidatatemp")
-
-        return total_psi_copied, total_temp_copied
-
-    except Exception as e:
-        logging.exception(f"✗ Ошибка при копировании бракованных данных: {e}")
-        return 0, 0
-
-
-def copy_rejected_data_1(engine, measure_ids, rejected_numbers, new_measure_id, new_msk=None, new_operator=None, program_type=None):
-    try:
-        total_psi_copied = 0
-        total_temp_copied = 0
-
-        machine_data = None
-        if program_type:
-            try:
-                machine_sql = f"SELECT * FROM machines WHERE Name = '{program_type}'"
-                machine_data = pd.read_sql(machine_sql, engine)
-                if not machine_data.empty:
-                    machine_data = machine_data.iloc[0]
-                    logging.info(f"   Данные машины загружены для бракованных изделий: {program_type}")
-                else:
-                    logging.warning(f"   Внимание: машина '{program_type}' не найдена в таблице machines для бракованных изделий")
-                    machine_data = None
-            except Exception as e:
-                logging.exception(f"   Ошибка при загрузке данных машины для бракованных изделий: {e}")
-                machine_data = None
-
-        rejected_numbers_list = list(rejected_numbers)
-
-        for i, number in enumerate(rejected_numbers_list):
-            show_progress(i + 1, len(rejected_numbers_list), f"Копирование бракованных изделий")
-
-            for measure_id in measure_ids:
-                try:
-                    with engine.connect() as conn:
-                        psi_sql = f"SELECT * FROM psidata WHERE Measure_ID = {measure_id} AND N = '{number}' LIMIT 1"
-                        psi_data = pd.read_sql(psi_sql, conn)
-
-                        if not psi_data.empty:
-                            if 'ID' in psi_data.columns:
-                                psi_data = psi_data.drop('ID', axis=1)
-
-                            psi_data['Measure_ID'] = new_measure_id
-
-                            if new_msk is not None:
-                                psi_data['MSK'] = new_msk
-
-                            if new_operator is not None:
-                                psi_data['Operator'] = new_operator
-
-                            if machine_data is not None:
-                                if 'Serial_N' in machine_data and pd.notna(machine_data['Serial_N']):
-                                    psi_data['Machine_Serial'] = machine_data['Serial_N']
-
-                                if 'Call_Date' in machine_data and pd.notna(machine_data['Call_Date']):
-                                    psi_data['Machine_Call_Date'] = machine_data['Call_Date']
-
-                                if 'M_Type' in machine_data and pd.notna(machine_data['M_Type']):
-                                    psi_data['M_Type'] = machine_data['M_Type']
-
-                                if 'Type' in machine_data and pd.notna(machine_data['Type']):
-                                    if machine_data['Type'] == 'Transat':
-                                        psi_data['MachineType'] = 'CNA-300'
-                                    else:
-                                        psi_data['MachineType'] = machine_data['Type']
-
-                            psi_data.to_sql('psidata', conn, if_exists='append', index=False)
-                            total_psi_copied += 1
-
-                            temp_sql = f"SELECT * FROM psidatatemp WHERE Measure_ID = {measure_id} AND N = '{number}'"
-                            temp_data = pd.read_sql(temp_sql, conn)
-
-                            if not temp_data.empty:
-                                if 'RecordId' in temp_data.columns:
-                                    temp_data = temp_data.drop('RecordId', axis=1)
-
-                                if 'Operator' in temp_data.columns:
-                                    temp_data = temp_data.drop('Operator', axis=1)
-
-                                temp_data['Measure_ID'] = new_measure_id
-
-                                if new_msk is not None:
-                                    temp_data['MSK'] = new_msk
-
-                                temp_data.to_sql('psidatatemp', conn, if_exists='append', index=False)
-                                total_temp_copied += len(temp_data)
-
-                            break
-
-                except Exception as e:
-                    logging.exception(f"✗ Ошибка при копировании бракованного номера {number}: {e}")
-                    continue
-
-        logging.info(f"\n Скопировано {total_psi_copied} бракованных записей в psidata")
-        logging.info(f" Скопировано {total_temp_copied} бракованных записей в psidatatemp")
 
         return total_psi_copied, total_temp_copied
 
@@ -1513,27 +1293,23 @@ def get_rejected_numbers(engine, measure_ids, valid_numbers_df):
     return rejected_numbers
 
 
-# ===== Функция для получения детальной информации о браке =====
 def get_failed_details(full_df):
     """
     Из объединённого датафрейма (со статусами, значениями и нормами)
     возвращает словарь {номер: [{'Параметр':, 'Значение':, 'Min':, 'Max':}, ...]}
     """
     failed_items = {}
-    # Определяем все колонки со статусами (не аномальные)
     status_cols = [col for col in full_df.columns if col.endswith('_status') and not col.endswith('_anomal_status')]
     param_names = [col.replace('_status', '') for col in status_cols]
 
     for _, row in full_df.iterrows():
         number = row['Numbers']
-        if row['Status'] == False:  # брак
+        if row['Status'] == False:
             params_info = []
             for param in param_names:
                 status_col = f"{param}_status"
                 if row[status_col] == False:
-                    # Получаем значение параметра (из колонки с именем параметра)
                     value = row[param] if param in row else None
-                    # Нормы хранятся в колонках param_Min и param_Max (добавляем при объединении)
                     min_col = f"{param}_Min"
                     max_col = f"{param}_Max"
                     min_val = row[min_col] if min_col in row else None
@@ -1547,30 +1323,165 @@ def get_failed_details(full_df):
             if params_info:
                 failed_items[number] = params_info
     return failed_items
-# ==================================================
+# ============================================================================
+#   Логирование объединения протоколов в БД
+# ============================================================================
+
+def _ensure_join_log_table(engine):
+    """Создать psi_join_log при первом обращении (идемпотентно)."""
+    sql = text("""
+        CREATE TABLE IF NOT EXISTS psi_join_log (
+            ID INT AUTO_INCREMENT PRIMARY KEY,
+            Created_At DATETIME DEFAULT CURRENT_TIMESTAMP,
+            Source_Measure_IDs VARCHAR(2000) NOT NULL,
+            New_Measure_ID INT NULL,
+            MSK VARCHAR(255) NULL,
+            Program_Type VARCHAR(255) NULL,
+            Operator VARCHAR(255) NULL,
+            Psi_Type VARCHAR(10) NULL,
+            Only_Good TINYINT DEFAULT 0,
+            Numbers_Filter TEXT NULL,
+            Good_Count INT DEFAULT 0,
+            Rejected_Count INT DEFAULT 0,
+            PSI_Rows_Copied INT DEFAULT 0,
+            Temp_Rows_Copied INT DEFAULT 0,
+            Rejected_PSI_Copied INT DEFAULT 0,
+            Rejected_Temp_Copied INT DEFAULT 0,
+            Success TINYINT DEFAULT 1,
+            Error_Message TEXT NULL,
+            Duration_Sec DECIMAL(10,2) NULL,
+            INDEX idx_created (Created_At),
+            INDEX idx_new_mid (New_Measure_ID)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    with engine.begin() as conn:
+        conn.execute(sql)
 
 
-def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None, operator=None, psi_type='ОТК'):
-    """Основная функция для обработки списка Measure_ID с копированием в новый замер"""
+def _write_join_log(engine, source_measure_ids, new_measure_id,
+                    msk, program_type, operator, psi_type,
+                    only_good, numbers_filter,
+                    good_count=0, rejected_count=0,
+                    psi_rows=0, temp_rows=0,
+                    rejected_psi=0, rejected_temp=0,
+                    success=True, error_message=None, duration=None):
+    """Записать факт объединения в psi_join_log (не падает при ошибке)."""
+    try:
+        _ensure_join_log_table(engine)
+
+        filter_str = None
+        if numbers_filter:
+            filter_str = ','.join(sorted(str(x) for x in numbers_filter))[:4000]
+
+        sql = text("""
+            INSERT INTO psi_join_log
+                (Source_Measure_IDs, New_Measure_ID, MSK, Program_Type,
+                 Operator, Psi_Type, Only_Good, Numbers_Filter,
+                 Good_Count, Rejected_Count, PSI_Rows_Copied,
+                 Temp_Rows_Copied, Rejected_PSI_Copied,
+                 Rejected_Temp_Copied,
+                 Success, Error_Message, Duration_Sec)
+            VALUES
+                (:src, :new_id, :msk, :pt, :op, :psi, :og, :nf,
+                 :gc, :rc, :prc, :trc, :rpc, :rtc, :succ, :err, :dur)
+        """)
+        with engine.begin() as conn:
+            conn.execute(sql, {
+                'src':    ','.join(str(m) for m in source_measure_ids),
+                'new_id': new_measure_id,
+                'msk':    msk,
+                'pt':     program_type,
+                'op':     operator,
+                'psi':    psi_type,
+                'og':     1 if only_good else 0,
+                'nf':     filter_str,
+                'gc':     int(good_count or 0),
+                'rc':     int(rejected_count or 0),
+                'prc':    int(psi_rows or 0),
+                'trc':    int(temp_rows or 0),
+                'rpc':    int(rejected_psi or 0),
+                'rtc':    int(rejected_temp or 0),
+                'succ':   1 if success else 0,
+                'err':    error_message,
+                'dur':    float(duration) if duration is not None else None,
+            })
+        _log_load(
+            f"[join_log] ✓ Запись в psi_join_log: "
+            f"new_measure_id={new_measure_id}, success={success}"
+        )
+        return True
+    except Exception as e:
+        # Логирование не должно ронять объединение
+        logging.exception(f"[join_log] ✗ Ошибка записи в psi_join_log: {e}")
+        return False
+
+
+def get_join_history(limit: int = 50, engine=None) -> pd.DataFrame:
+    """Последние N операций объединения — для UI/аудита."""
+    eng = _get_engine(engine)
+    try:
+        _ensure_join_log_table(eng)
+        sql = f"SELECT * FROM psi_join_log ORDER BY ID DESC LIMIT {int(limit)}"
+        return pd.read_sql(sql, eng)
+    except Exception as e:
+        logging.exception(f"[get_join_history] {e}")
+        return pd.DataFrame()
+
+def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None,
+                                   operator=None, psi_type='ОТК',
+                                   only_good=False, numbers_filter=None):
+    """Основная функция для обработки списка Measure_ID с копированием в новый замер.
+
+    only_good      — если True, в новый протокол попадут только годные изделия.
+    numbers_filter — set нормализованных номеров (см. _parse_numbers_filter).
+                     None — фильтр не задан (все номера).
+    """
     engine = create_engine(str(Options.get_connection_string()))
 
     psi_type = psi_type if psi_type in ('ПСИ', 'ОТК') else 'ОТК'
+
+    _log_load("\n" + "=" * 70)
+    _log_load(
+        f"[process] СТАРТ: measure_ids={measure_ids}, "
+        f"msk={msk}, program_type={program_type}, "
+        f"operator={operator}, psi_type={psi_type}, "
+        f"only_good={only_good}, "
+        f"numbers_filter={'задан' if numbers_filter else 'не задан'} "
+        f"({len(numbers_filter) if numbers_filter else 0} шт.)"
+    )
+    _log_load("=" * 70)
+    start_ts = time.time()
     logging.info(f"   Тип протокола (psi_type): {psi_type}")
 
     psi_map_sql = "SELECT * FROM psidata_map_table"
     psi_map = pd.read_sql(psi_map_sql, engine)
+    _log_df("psidata_map_table — маппинг Field ↔ Parameter", psi_map)
 
     column_mapping = dict(zip(psi_map['Field'], psi_map['Parameter']))
 
-    all_results = []          # для годных изделий (используется позже)
-    all_valid_numbers = []    # для годных номеров с Measure_ID
-    all_merged_dfs = []       # объединённые датафреймы (статусы + значения + нормы)
+    _log_load(f"[process] Маппинг Field→Parameter "
+              f"({len(column_mapping)} записей):")
+    for f, p in column_mapping.items():
+        _log_load(f"    {f!r:>20} → {p!r}")
+
+    all_results = []
+    all_valid_numbers = []
+    all_merged_dfs = []
+
+    # ▼ Для расчёта rejected: множество нормализованных номеров ВСЕХ годных
+    #   (не только попавших в numbers_filter).
+    all_good_numbers_norm = set()
 
     logging.info(" Начало обработки Measure_ID...")
     logging.info(f" Параметры обновления:")
     logging.info(f"   MSK: {msk}")
     logging.info(f"   Program_Type: {program_type}")
     logging.info(f"   Operator: {operator}")
+    logging.info(f"   Только годные: {only_good}")
+    logging.info(
+        f"   Фильтр номеров: "
+        f"{'задан (' + str(len(numbers_filter)) + ' шт.)' if numbers_filter else 'не задан'}"
+    )
 
     if program_type:
         try:
@@ -1598,15 +1509,33 @@ def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None, oper
         psi_sql = f"SELECT * FROM psidata WHERE Measure_ID = {measure_id}"
         psi_data = pd.read_sql(psi_sql, engine)
 
+        _log_load(f"\n[process] ▶ Measure_ID {measure_id} "
+                  f"({i + 1}/{len(measure_ids)})")
+
         if psi_data.empty:
             logging.warning(f" Данные для Measure_ID {measure_id} не найдены")
             continue
 
+        _log_load(f"[process] psidata: {len(psi_data)} строк × "
+                  f"{len(psi_data.columns)} колонок")
+        _log_load(f"[process] Колонки psidata: {list(psi_data.columns)}")
+        _log_df(f"psidata (Measure_ID={measure_id}, первые 3 строки)",
+                psi_data.head(3), max_rows=3)
+
         psi_data_renamed = psi_data.rename(columns=column_mapping)
+
+        _log_load("[process] После переименования колонок:")
+        for old in psi_data.columns:
+            if old in column_mapping:
+                _log_load(f"    {old!r} → {column_mapping[old]!r}")
+        _log_load(f"[process] Итоговые колонки: "
+                  f"{list(psi_data_renamed.columns)}")
 
         show_progress(0.3, 1, f"Обработка спецификаций для Measure_ID {measure_id}")
 
         unique_spc = psi_data_renamed['Spc'].unique()
+        _log_load(f"[process] Уникальных спецификаций: "
+                  f"{list(unique_spc)}")
 
         for spc_name in unique_spc:
             logging.info(f"    Обработка спецификации: {spc_name}")
@@ -1618,22 +1547,42 @@ def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None, oper
                 logging.warning(f"   Спецификация {spc_name} не найдена")
                 continue
 
+            _log_df(f"specification: {spc_name!r}", spec_data)
+            spec_row = spec_data.iloc[0]
+
+            _log_load(f"[process]   Ключевые поля спецификации "
+                      f"{spc_name!r}:")
+            for field in ('Name', 'NameR', 'Rmax-Rmin', 'RR1max', 'RR1min',
+                          'Rmax', 'Rmin', 'Fmax', 'Fmin', 'R', 'F',
+                          'C0', 'Cq', 'Status'):
+                if field in spec_data.columns:
+                    _log_load(f"      {field!r} = {spec_row[field]!r}")
+
             spc_mapped = load_spc_map(spec_data.iloc[0])
             map_spc_otk = create_spc_map_otk(spc_mapped, spec_data.iloc[0])
 
+            _log_df(f"spc_mapped для {spc_name!r}", spc_mapped)
+            _log_df(f"map_spc_otk для {spc_name!r}", map_spc_otk)
+
             spc_psi_data = psi_data_renamed[psi_data_renamed['Spc'] == spc_name]
+            _log_load(f"[process]   Данных для {spc_name!r}: "
+                      f"{len(spc_psi_data)} строк")
 
             result_df, result_df2, stats_df, result_anomal = set_specification_to_data(
                 map_spc_otk, spc_psi_data
             )
 
-            # Добавляем Measure_ID к результатам
+            _log_load(f"[process]   ✓ {spc_name!r}: "
+                      f"годных={int(result_df['Status'].sum())}, "
+                      f"брак={len(result_df) - int(result_df['Status'].sum())}")
+            _log_df(f"stats_df для {spc_name!r}", stats_df)
+
             result_df['Measure_ID'] = measure_id
             result_df2['Measure_ID'] = measure_id
 
-            # --- Объединяем result_df (статусы) и result_df2 (значения) ---
-            merged = pd.merge(result_df, result_df2, on=['Numbers', 'Positions', 'Measure_ID'], suffixes=('', '_val'))
-            # Добавляем нормы из map_spc_otk
+            merged = pd.merge(result_df, result_df2,
+                              on=['Numbers', 'Positions', 'Measure_ID'],
+                              suffixes=('', '_val'))
             norms = map_spc_otk.set_index('Parameter')[['Min', 'Max']]
             for param in norms.index:
                 merged[f"{param}_Min"] = norms.loc[param, 'Min']
@@ -1641,22 +1590,82 @@ def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None, oper
 
             all_merged_dfs.append(merged)
 
-            # Сохраняем только годные изделия
-            valid_items = result_df[result_df['Status'] == True][['Numbers', 'Measure_ID', 'Status']]
-            all_results.append(valid_items)
-            all_valid_numbers.extend(valid_items[['Numbers', 'Measure_ID']].to_dict('records'))
+            # Все годные этой спецификации (для расчёта rejected)
+            valid_items_all = result_df[result_df['Status'] == True][
+                ['Numbers', 'Measure_ID']
+            ]
+            for _, r in valid_items_all.iterrows():
+                all_good_numbers_norm.add(_normalize_number(r['Numbers']))
+
+            # Что попадёт в новый протокол (с учётом numbers_filter)
+            if numbers_filter is not None:
+                valid_items_to_copy = valid_items_all[
+                    valid_items_all['Numbers'].apply(_normalize_number)
+                    .isin(numbers_filter)
+                ]
+                if len(valid_items_to_copy) < len(valid_items_all):
+                    _log_load(
+                        f"[process]   Фильтр номеров: {len(valid_items_to_copy)}"
+                        f" из {len(valid_items_all)} годных попадут в протокол"
+                    )
+            else:
+                valid_items_to_copy = valid_items_all
+
+            all_results.append(valid_items_to_copy)
+            all_valid_numbers.extend(
+                valid_items_to_copy[['Numbers', 'Measure_ID']]
+                .to_dict('records')
+            )
 
         show_progress(1, 1, f"Завершено для Measure_ID {measure_id}")
 
-    # Объединяем годные результаты
     if all_results:
         final_result = pd.concat(all_results, ignore_index=True)
         valid_numbers_df = pd.DataFrame(all_valid_numbers)
     else:
-        final_result = pd.DataFrame(columns=['Numbers', 'Measure_ID', 'Status'])
+        final_result = pd.DataFrame(columns=['Numbers', 'Measure_ID'])
         valid_numbers_df = pd.DataFrame(columns=['Numbers', 'Measure_ID'])
 
-    # ===== ВЫВОД ДЕТАЛЬНОГО ОТЧЁТА ПО БРАКУ (ТОЛЬКО В ЛОГ-ФАЙЛ) =====
+    # ------------------------------------------------------------------
+    # Rejected = все номера минус ВСЕ годные (не только из whitelist).
+    # Это позволяет корректно отделить брак от годных вне whitelist.
+    # ------------------------------------------------------------------
+    all_numbers_in_measures = get_all_numbers_from_measure_ids(engine, measure_ids)
+    rejected_numbers_all = {
+        n for n in all_numbers_in_measures
+        if _normalize_number(n) not in all_good_numbers_norm
+    }
+
+    if only_good:
+        rejected_to_copy = set()
+        _log_load(
+            "[process] Режим «только годные»: бракованные в новый "
+            "протокол не попадут"
+        )
+    elif numbers_filter is not None:
+        rejected_to_copy = {
+            n for n in rejected_numbers_all
+            if _normalize_number(n) in numbers_filter
+        }
+        _log_load(
+            f"[process] Брак из whitelist: {len(rejected_to_copy)} "
+            f"из {len(rejected_numbers_all)} бракованных всего"
+        )
+    else:
+        rejected_to_copy = rejected_numbers_all
+
+    # Предупреждение о номерах, которых нет ни среди годных, ни среди бракованных
+    if numbers_filter:
+        found_norm = {_normalize_number(n) for n in valid_numbers_df['Numbers']} \
+                     if not valid_numbers_df.empty else set()
+        found_norm |= {_normalize_number(n) for n in rejected_to_copy}
+        missing = numbers_filter - found_norm
+        if missing:
+            _log_load(
+                f"[process] ⚠ Номера из whitelist не найдены в данных "
+                f"({len(missing)} шт.): {sorted(missing)[:20]}"
+            )
+
     if all_merged_dfs:
         combined = pd.concat(all_merged_dfs, ignore_index=True)
         failed_details = get_failed_details(combined)
@@ -1665,38 +1674,53 @@ def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None, oper
             for number, params in failed_details.items():
                 logging.info(f"Номер {number}:")
                 for p in params:
-                    norm_str = f"{p['Min']} .. {p['Max']}" if p['Min'] is not None and p['Max'] is not None else "норма не задана"
-                    logging.info(f"  {p['Параметр']} = {p['Значение']} (норма: {norm_str})")
+                    norm_str = (f"{p['Min']} .. {p['Max']}"
+                                if p['Min'] is not None and p['Max'] is not None
+                                else "норма не задана")
+                    logging.info(f"  {p['Параметр']} = {p['Значение']} "
+                                 f"(норма: {norm_str})")
         else:
             logging.info("Бракованных изделий не найдено.")
 
-    # ===== ПРОВЕРКА НАЛИЧИЯ ГОДНЫХ (вывод в консоль через print) =====
-    if final_result.empty:
-        print("Нет годных изделий. Дальнейшие операции (создание нового замера, копирование) не производятся.")
+    # Проверяем, есть ли вообще что копировать в новый протокол
+    if final_result.empty and not rejected_to_copy:
+        print("Нет данных для копирования в новый протокол "
+              "(фильтр не дал результатов).")
+        _write_join_log(  # ← добавить блок
+            engine, measure_ids, None,
+            msk, program_type, operator, psi_type,
+            only_good, numbers_filter,
+            success=False,
+            error_message="Нет данных для копирования (фильтр не дал результатов)",
+            duration=time.time() - start_ts,
+        )
         return None, 0, 0
 
-    logging.info(f"\n Обработка завершена. Найдено {len(final_result)} годных изделий")
+    logging.info(
+        f"\n Обработка завершена. Годных к копированию: "
+        f"{len(final_result)}, бракованных: {len(rejected_to_copy)}"
+    )
 
-    # Создаём новый замер и копируем данные (только если есть годные)
     logging.info("\n Создание нового замера...")
-
-    new_measure_id = create_new_measure_id(engine, measure_ids, msk, program_type, operator)
+    new_measure_id = create_new_measure_id(engine, measure_ids, msk,
+                                            program_type, operator)
 
     if new_measure_id:
         logging.info("\n Копирование данных в новый замер...")
 
         psi_count = copy_psi_data(
             engine, measure_ids, valid_numbers_df, new_measure_id,
-            msk, operator, program_type, psi_type,  # ← +psi_type
+            msk, operator, program_type, psi_type,
         )
-        temp_count = copy_psidatatemp_data(engine, measure_ids, valid_numbers_df, new_measure_id, msk)
+        temp_count = copy_psidatatemp_data(
+            engine, measure_ids, valid_numbers_df, new_measure_id, msk
+        )
 
-        rejected_numbers = get_rejected_numbers(engine, measure_ids, valid_numbers_df)
-        if rejected_numbers:
+        if rejected_to_copy:
             logging.info("\n Копирование бракованных изделий...")
             rejected_psi_count, rejected_temp_count = copy_rejected_data(
-                engine, measure_ids, rejected_numbers, new_measure_id,
-                msk, operator, program_type, psi_type,  # ← +psi_type
+                engine, measure_ids, rejected_to_copy, new_measure_id,
+                msk, operator, program_type, psi_type,
             )
         else:
             rejected_psi_count, rejected_temp_count = 0, 0
@@ -1704,7 +1728,7 @@ def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None, oper
         final_psi_count, final_temp_count = get_table_counts(engine, new_measure_id)
 
         logging.info(f"\n  Новый замер успешно создан!")
-        logging.info(f"    Тип протокола: {psi_type}")  # ← NEW в итоговом логе
+        logging.info(f"    Тип протокола: {psi_type}")
         logging.info(f"    Measure_ID: {new_measure_id}")
         if msk:
             logging.info(f"    MSK: {msk}")
@@ -1724,7 +1748,7 @@ def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None, oper
                         logging.info(f"      MachineType: CNA-300 (Transat)")
                     else:
                         logging.info(f"      MachineType: {machine_type}")
-            except:
+            except Exception:
                 pass
         if operator:
             logging.info(f"    Operator: {operator}")
@@ -1736,16 +1760,56 @@ def process_measure_ids_with_copy(measure_ids, msk=None, program_type=None, oper
         logging.info(f"\n Уникальные изделия в новом замере:")
 
         with engine.connect() as conn:
-            unique_numbers_sql = text("SELECT DISTINCT N FROM psidata WHERE Measure_ID = :measure_id ORDER BY N")
-            result = conn.execute(unique_numbers_sql, {'measure_id': new_measure_id})
+            unique_numbers_sql = text(
+                "SELECT DISTINCT N FROM psidata WHERE Measure_ID = :measure_id ORDER BY N"
+            )
+            result = conn.execute(unique_numbers_sql,
+                                  {'measure_id': new_measure_id})
             unique_numbers = [row[0] for row in result]
 
             for idx, number in enumerate(unique_numbers):
                 logging.info(f"   {idx + 1:3d}. {number}")
+        _write_join_log(  # ← добавить блок
+            engine, measure_ids, new_measure_id,
+            msk, program_type, operator, psi_type,
+            only_good, numbers_filter,
+            good_count=len(final_result),
+            rejected_count=len(rejected_to_copy),
+            psi_rows=psi_count,
+            temp_rows=temp_count,
+            rejected_psi=rejected_psi_count,
+            rejected_temp=rejected_temp_count,
+            success=True,
+            duration=time.time() - start_ts,
+        )
+        _log_load("\n" + "=" * 70)
+        _log_load(
+            f"[process] ГОТОВО. Итог: годных={len(final_result)}, "
+            f"бракованных={len(rejected_to_copy)}, "
+            f"new_measure_id={new_measure_id}"
+        )
+        _log_load("=" * 70)
 
         return new_measure_id, final_psi_count, final_temp_count
+    _write_join_log(  # ← добавить блок
+        engine, measure_ids, None,
+        msk, program_type, operator, psi_type,
+        only_good, numbers_filter,
+        good_count=len(final_result),
+        rejected_count=len(rejected_to_copy),
+        success=False,
+        error_message="Не удалось создать Measure_ID",
+        duration=time.time() - start_ts,
+    )
+    _log_load("\n" + "=" * 70)
+    _log_load(
+        f"[process] ГОТОВО. Итог: годных={len(final_result)}, "
+        f"бракованных={len(rejected_to_copy)}, new_measure_id=None"
+    )
+    _log_load("=" * 70)
 
     return None, 0, 0
+
 
 
 # ============================================================================
@@ -1795,9 +1859,6 @@ def _get_engine(engine=None):
     return create_engine(str(Options.get_connection_string()))
 
 
-# ---------------------------------------------------------------------------
-#                       Поиск МСК по подстроке
-# ---------------------------------------------------------------------------
 def search_msk_by_partial(partial, limit: int = 200, engine=None) -> list:
     """Поиск МСК по частичному совпадению.
 
@@ -1810,7 +1871,6 @@ def search_msk_by_partial(partial, limit: int = 200, engine=None) -> list:
     partial_s = str(partial).strip()
     limit = int(limit)
 
-    # 1) архивный справочник
     search_fn = _get_search_archive_msk()
     if search_fn is not None:
         try:
@@ -1820,7 +1880,6 @@ def search_msk_by_partial(partial, limit: int = 200, engine=None) -> list:
         except Exception as e:
             logging.warning(f"[search_msk_by_partial] archive error: {e}")
 
-    # 2) fallback — прямой SQL по psidata
     eng = _get_engine(engine)
     safe = _safe_sql_str(partial_s)
     sql = (
@@ -1838,12 +1897,6 @@ def search_msk_by_partial(partial, limit: int = 200, engine=None) -> list:
         return []
 
 
-# ---------------------------------------------------------------------------
-#              Поиск Measure_ID по частичному МСК (основной замер)
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-#              Поиск Measure_ID по частичному МСК (основной замер)
-# ---------------------------------------------------------------------------
 def search_measure_ids_by_msk_partial(partial_msk, limit: int = 200,
                                        engine=None) -> pd.DataFrame:
     """Замеры для МСК, найденного поиском (как в модуле Архив).
@@ -1884,43 +1937,7 @@ def search_measure_ids_by_msk_partial(partial_msk, limit: int = 200,
             f"[search_measure_ids_by_msk_partial] SQL error: {e}")
         return pd.DataFrame()
 
-def search_measure_ids_by_msk_partial_1(partial_msk, limit: int = 200,
-                                       engine=None) -> pd.DataFrame:
-    """Поиск замеров по частичному МСК.
 
-    Возвращает DataFrame:
-        Measure_ID, MSK, Spc, Date, N_Count
-    Отсортировано по Measure_ID DESC (свежие сверху).
-    """
-    if not partial_msk or not str(partial_msk).strip():
-        return pd.DataFrame()
-
-    eng = _get_engine(engine)
-    safe = _safe_sql_str(str(partial_msk).strip())
-    limit = int(limit)
-    sql = (
-        "SELECT Measure_ID, MIN(MSK) AS MSK, MIN(Spc) AS Spc, "
-        "MIN(Date) AS Date, COUNT(*) AS N_Count "
-        "FROM psidata "
-        f"WHERE MSK LIKE '%{safe}%' "
-        "  AND Measure_ID IS NOT NULL "
-        "  AND MSK IS NOT NULL "
-        "GROUP BY Measure_ID "
-        "ORDER BY Measure_ID DESC "
-        f"LIMIT {limit}"
-    )
-    logging.info(f"[search_measure_ids_by_msk_partial] SQL: {sql}")
-    try:
-        return pd.read_sql(sql, eng)
-    except Exception as e:
-        logging.exception(
-            f"[search_measure_ids_by_msk_partial] SQL error: {e}")
-        return pd.DataFrame()
-
-
-# ---------------------------------------------------------------------------
-#           Поиск Measure_ID по подстроке номера резонатора (N)
-# ---------------------------------------------------------------------------
 def search_measure_ids_by_number_partial(partial, limit: int = 500,
                                           engine=None) -> pd.DataFrame:
     """Поиск основных замеров по подстроке номера резонатора.
@@ -1948,7 +1965,6 @@ def search_measure_ids_by_number_partial(partial, limit: int = 500,
     mids_from_lookup = set()
     lookup_ok = False
 
-    # ---------------------------------------------------------- 1) lookup
     if Lookup is not None:
         try:
             Lookup.ensure_lookup_table(eng)
@@ -1969,7 +1985,6 @@ def search_measure_ids_by_number_partial(partial, limit: int = 500,
         except Exception as e:
             logging.warning(f"[search_by_number] lookup error: {e}")
 
-    # --------------------------- 2) решаем, нужен ли fallback
     lookup_empty = len(mids_from_lookup) == 0
     lookup_truncated = len(mids_from_lookup) >= limit
     need_fallback = (not lookup_ok) or lookup_empty or lookup_truncated
@@ -2011,7 +2026,6 @@ def search_measure_ids_by_number_partial(partial, limit: int = 500,
         except Exception as e:
             logging.exception(f"[search_by_number] fallback error: {e}")
 
-        # self-heal
         if Lookup is not None and lookup_ok and fallback_pairs:
             missing = [(m, n) for m, n in fallback_pairs
                        if m not in mids_from_lookup]
@@ -2027,7 +2041,6 @@ def search_measure_ids_by_number_partial(partial, limit: int = 500,
     if not all_mids:
         return pd.DataFrame()
 
-    # --------------------------------- 3) детали по measure_ids
     from sqlalchemy import bindparam, text as sqltext
     mids_list = sorted(all_mids)[:limit]
     stmt = sqltext(
@@ -2047,9 +2060,6 @@ def search_measure_ids_by_number_partial(partial, limit: int = 500,
         return pd.DataFrame()
 
 
-# ---------------------------------------------------------------------------
-#             Сводка по выбранному основному замеру (для UI)
-# ---------------------------------------------------------------------------
 def get_measure_summary(measure_id, engine=None) -> dict:
     """Краткая информация о замере — для панели «Основной замер».
 

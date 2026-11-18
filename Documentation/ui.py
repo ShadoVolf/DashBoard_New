@@ -37,7 +37,12 @@ import dearpygui.dearpygui as dpg
 
 from . import db as doc_db
 from .seed import seed_all
-
+from .seed import seed_all
+try:
+    from .seed_assistant import seed_assistant_docs
+except Exception:
+    def seed_assistant_docs():
+        pass
 try:
     from Authorization.Login import LoginUser
 except Exception:                                   # pragma: no cover
@@ -482,6 +487,7 @@ def _create_main_window():
     try:
         doc_db.ensure_tables()
         seed_all()
+        seed_assistant_docs()
     except Exception as e:
         print(f"[Documentation] init error: {e}")
 
@@ -1225,6 +1231,7 @@ def create_documentation_window():
     try:
         doc_db.ensure_tables()
         seed_all()
+        seed_assistant_docs()
     except Exception as e:
         print(f"[Documentation] init error: {e}")
 

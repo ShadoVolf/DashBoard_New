@@ -14,6 +14,18 @@ from . import Protocol_Constants as _C
 from .Protocol_Create_Tab import _build_create_tab, _pm_bootstrap
 from .Protocol_Archive_Tab import _build_archive_tab, _pm_arch_bootstrap
 from .Protocol_Data import ensure_order_columns
+from .Protocol_Passport import print_passport_for_protocol
+
+
+def _on_print_passport():
+    if not _C._active_archive_id:
+        try:
+            from .Protocol_Common import _pm_arch_status
+            _pm_arch_status('Сначала выберите протокол')
+        except Exception:
+            pass
+        return
+    print_passport_for_protocol(_C._active_archive_id)
 
 
 def _register_for_window_manager():
@@ -67,6 +79,10 @@ def create_protocol_manager_window():
                 dpg.add_menu_item(
                     label="Отправить в ОТК (LotRK)",
                     callback=lambda: _on_send_to_lot_rk())
+                dpg.add_separator()
+                dpg.add_menu_item(
+                    label="Печать паспорта",
+                    callback=lambda: _on_print_passport())
 
         with dpg.tab_bar():
             with dpg.tab(label="Создание протокола"):

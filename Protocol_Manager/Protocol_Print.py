@@ -16,6 +16,7 @@ from Archive_View.Archive_Data import (
 from Archive_View.Archive_UI import _load_spc_map_for_display
 from .Protocol_Data import log_action, add_numbers_to_protocol
 from .Presentation_Cache import get_or_build_presentation_params
+from .Protocol_Passport import print_passport_for_protocol
 
 def _engine():
     return create_engine(str(Options.get_connection_string()))
@@ -251,7 +252,7 @@ def print_archived_protocol(protokol_id: int):
         v = p_info.get('psi_type')
         if v is not None and not pd.isna(v) and str(v).strip():
             psi_type = str(v).strip()
-    if psi_type not in ('ПСИ', 'ОТК'):
+    if psi_type not in ('ПСИ', 'ОТК', 'Паспорт'):
         psi_type = 'ОТК'
 
     # 2. Номера из архива
@@ -332,7 +333,11 @@ def print_archived_protocol(protokol_id: int):
     # 7. PDF с тем же Measure_protokol_ID (для QR)
     filename = f"arch_protocol_{protokol_n}_{psi_type}.pdf"
 
-    if psi_type == 'ОТК':
+    if psi_type == 'Паспорт':
+        # Делегируем генерацию паспорта специализированной функции
+        print_passport_for_protocol(protokol_id)
+        return
+    elif psi_type == 'ОТК':
         path = create_presentation_protocol(
             data_df=data_df, status_df=status_df, view_data=view_data,
             tu_data=tu_data, presentation_params=presentation_params,
