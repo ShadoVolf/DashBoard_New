@@ -250,6 +250,12 @@ def run_nl_query_impl(sender, data, dpg_):
                      color=(255, 150, 150))
         return
 
+    # -------- Spec / temp interval (создание спецификаций и интервалов) --------
+    spc_parsed = spec_parser.parse(q)
+    if spc_parsed:
+        _exec_spec_tool(spc_parsed['intent'], spc_parsed['params'], dpg_)
+        return
+
     if _is_any(q, _ARCHIVE_LAUNCH_KW):
         aparsed = archive_parser.parse(q)
         if aparsed and aparsed['intent'] != 'open_archive':
