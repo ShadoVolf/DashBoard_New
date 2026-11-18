@@ -29,7 +29,7 @@ from .Protocol_Data import (
 )
 from .Protocol_Print import print_archived_protocol
 
-
+from .Protocol_Passport import print_passport_for_protocol
 # ============================================================================
 # Bootstrap — фикс: каскад запускается ВНЕ suppress
 # ============================================================================
@@ -296,6 +296,7 @@ def _attach_arch_table_popup(enabled: bool):
         dpg.add_menu_item(label="Печать",
                           tag="btn_arch_print", enabled=enabled,
                           callback=_on_archive_print)
+
         dpg.add_menu_item(label="Добавить номера",
                           tag="btn_arch_add", enabled=enabled,
                           callback=_on_archive_add)
@@ -1083,3 +1084,10 @@ def _on_archive_print():
     if not _C._active_archive_id:
         return
     print_archived_protocol(_C._active_archive_id)
+
+
+def _on_archive_print_passport():
+    """Обработчик для печати паспорта из контекстного меню архива."""
+    if not _C._active_archive_id:
+        return
+    print_passport_for_protocol(_C._active_archive_id)

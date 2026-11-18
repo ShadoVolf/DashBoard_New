@@ -35,6 +35,7 @@ _PARAM_ALIASES = {
     'RcRbmax':      'Rc_Rbmax',
     'Rc_Rbmax':     'Rc_Rbmax',
     'ABS(Fmax, Fmin)': 'Fmaxm',
+    'Rmax-Rmin': 'RR1',
 
     # --- прочие «двойные» имена с / или _ ---
     'ABS(Fmax,Fmin)':       'ABS(Fmax, Fmin)',
