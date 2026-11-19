@@ -8,7 +8,7 @@ from Statistik.DashBoard import create_main_windows
 from Temperature_Measure.Measure_windows import create_main_measure_windows
 from ResonatorGraph import create_graph_window
 
-
+from PhaseNoise_View import create_phase_noise_window
 try:
     from Virtual_Measure import create_virtual_measure_window
 except ImportError as _e:
@@ -45,6 +45,12 @@ def create_main_menu(dpg):
                                   callback=show_protocol_manager,
                                   tag='Protocol_Manager_Menu',
                                   user_data=dpg)
+                dpg.add_menu_item(
+                    label="Фазовые шумы",
+                    callback=lambda: create_phase_noise_window(),
+                    tag="PhaseNoise_Menu",
+                    user_data=dpg,
+                )
 
         # === НОВОЕ: пункт верхнего уровня «Ассистент» ===
         dpg.add_menu_item(
