@@ -1,1 +1,243 @@
-"""Детерминированный разбор NL: спецификации, модификация, интервалы.\n\nПримеры:\n  «создай спецификацию РК507-98.440М-240 на основе РК507-98.415М-220»\n  «создай спецификацию NEW на базе OLD, точность настройки =+/- 20»\n  «измени в спецификации РК507-98.415М-220 точность настройки =+/- 7,\n   сопротивление до 120»\n  «установи в РК507-98.415М-220 R max 30 min 10»\n  «создай температурный интервал от -30 до +60 шагом 5 с точками 23,28»\n"""\nfrom __future__ import annotations\n\nimport re\nfrom typing import Optional\n\nfrom .spec_tools import parse_interval_text, parse_norm_assignment\n\n_CREATE_SPEC_RE = re.compile(\n    r'(?:созда|сдела|сформир|зарегистр)\\w*\\s+'\n    r'(?:(?:новую|следующ\\w+|друг\\w+)\\s+)?'\n    r'(?:спецификац\\w*|спек\\w*|spc|spec)\\b',\n    re.IGNORECASE,\n)\n_MODIFY_SPEC_RE = re.compile(\n    r'(?:измен|постав|установи|поправ|задай|обнов|прав)\\w*\\s+'\n    r'(?:в\\s+)?'\n    r'(?:спецификац\\w*|спек\\w*|spc|spec)?',\n    re.IGNORECASE,\n)\n_INTERVAL_KW_RE = re.compile(r'интервал', re.IGNORECASE)\n_TEMP_KW_RE = re.compile(r'температур\\w*', re.IGNORECASE)\n\n_SPC_WORD_RE = re.compile(\n    r'(?:спецификац\\w*|спек\\w*|spc|spec|баз\\w*|основ\\w*)'\n    r'[\\s:№#]*'\n    r'([A-Za-zА-Яа-я0-9]+(?:[-–—][A-Za-zА-Яа-я0-9.,]+)*)',\n    re.IGNORECASE,\n)\n_SPC_BARE_RE = re.compile(\n    r'(?<![A-Za-zА-Яа-я0-9])'\n    r'([A-Za-zА-Яа-я]{1,4}\\d{2,4}[-–—]\\d{1,4}[.,]\\d{1,4}[A-Za-zА-Яа-я]?'\n    r'(?:[-–—]\\d{1,6})?)'\n    r'(?![A-Za-zА-Яа-я0-9])',\n)\n_BASE_RE = re.compile(\n    r'(?:на\\s+основ\\w+|на\\s+баз\\w+|по\\s+образц\\w+|коп\\w+)\\s+'\n    r'([A-Za-zА-Яа-я0-9]+(?:[-–—][A-Za-zА-Яа-я0-9.,]+)*)',\n    re.IGNORECASE,\n)\n_LIST_SPECS_RE = re.compile(\n    r'(?:список|покажи|показать|какие)\\s+.*спецификац|спецификац\\w*\\s+список',\n    re.IGNORECASE,\n)\n_GET_PARAMS_RE = re.compile(\n    r'(?:параметр\\w*|норм\\w*)\\s+(?:спецификац\\w*|спек\\w*|spc|spec)',\n    re.IGNORECASE,\n)\n_SPC_MAP_LIST_RE = re.compile(\n    r'(?:какие\\s+)?(?:параметр\\w*|обозначени\\w*)[^.?]*'\n    r'(?:spc[_\\s]?map|справочник|все\\s+параметр)',\n    re.IGNORECASE,\n)\n_DELETE_RE = re.compile(\n    r'(?:удал|сотр|уничтож|вычелк)\\w*\\s+.*(?:спецификац\\w*|спек\\w*)',\n    re.IGNORECASE,\n)\n\n\ndef _clean_token(s: str) -> str:\n    return (s or '').strip().strip('.,;:!?').strip()\n\n\ndef _extract_spc_codes(text: str) -> list[str]:\n    return [m.group(1) for m in _SPC_BARE_RE.finditer(text)]\n\n\ndef _extract_base(text: str) -> Optional[str]:\n    m = _BASE_RE.search(text)\n    if m:\n        return _clean_token(m.group(1))\n    return None\n\n\ndef _extract_new_name(text: str, base: Optional[str],\n                      spc_codes: list[str]) -> Optional[str]:\n    m = re.search(\n        r'(?:созда|сдела|сформир|зарегистр)\\w*\\s+(?:новую\\s+)?'\n        r'(?:спецификац\\w*|спек\\w*|spc|spec)\\s+'\n        r'([A-Za-zА-Яа-я0-9_]+(?:[-–—][A-Za-zА-Яа-я0-9.,_]+)*)',\n        text, re.IGNORECASE)\n    if m:\n        name = _clean_token(m.group(1))\n        if name.lower() not in ('на', 'из', 'от', 'для', 'с', 'по', 'new',\n                                'базе', 'основе'):\n            return name\n    for c in spc_codes:\n        if base and c.casefold() == base.casefold():\n            continue\n        return c\n    return None\n\n\ndef _split_change_tokens(seg: str) -> list[str]:\n    seg = (seg or '').strip().strip('.;:')\n    if not seg:\n        return []\n    parts = re.split(r'\\s*,\\s*|\\s*;\\s*|\\s+и\\s+', seg)\n    return [p.strip() for p in parts if p.strip()]\n\n\ndef _extract_changes_tail(text: str, spc: Optional[str]) -> list[str]:\n    t = text\n    if spc:\n        t = re.sub(re.escape(spc), ' ', t, count=1, flags=re.IGNORECASE)\n    t = re.sub(\n        r'(?:измен|постав|установи|поправ|задай|обнов|прав)\\w*',\n        ' ', t, flags=re.IGNORECASE)\n    t = re.sub(\n        r'(?:в\\s+)?(?:спецификац\\w*|спек\\w*|spc|spec)',\n        ' ', t, flags=re.IGNORECASE)\n    t = re.sub(r'\\s+', ' ', t).strip(' :,-')\n    return _split_change_tokens(t)\n\n\ndef _extract_create_param_tokens(text: str, consumed: list[str]) -> list[str]:\n    t = text\n    for c in consumed:\n        if c:\n            t = t.replace(c, ' ')\n    m = re.search(\n        r'(?:с\\s+параметр\\w*|параметр\\w*|добав\\w*|включ\\w*|постав\\w*|'\n        r'установи\\w*|точность|сопротивление|r\\b|c0|c1|q\\b)'\n        r'[\\s:]*(.+)$',\n        t, re.IGNORECASE)\n    if not m:\n        if re.search(r'\\+/-|±|max|min|до\\s+\\d', t, re.I):\n            return _split_change_tokens(t)\n        return []\n    seg = m.group(0)\n    seg = re.split(r'(?:интервал|температур)', seg, flags=re.IGNORECASE)[0]\n    return _split_change_tokens(seg)\n\n\ndef _extract_wait(text: str) -> Optional[float]:\n    m = re.search(r'(?:выдержк\\w*|wait|время)\\D{0,10}(\\d+(?:[.,]\\d+)?)',\n                  text, re.IGNORECASE)\n    if m:\n        try:\n            return float(m.group(1).replace(',', '.'))\n        except ValueError:\n            return None\n    return None\n\n\ndef parse(q: str) -> Optional[dict]:\n    if not q or not q.strip():\n        return None\n    text = q.strip()\n    low = text.lower()\n\n    if 'протокол' in low:\n        return None\n\n    if re.search(r'(?:удал|сотр)\\w+\\s+.*спецификац', low):\n        return None\n\n    interval = parse_interval_text(text)\n    want_interval_kw = bool(_INTERVAL_KW_RE.search(low))\n    want_temp_kw = bool(_TEMP_KW_RE.search(low))\n\n    if interval and (want_interval_kw or want_temp_kw):\n        codes = _extract_spc_codes(text)\n        spc = None\n        m = re.search(\n            r'(?:для|спецификац\\w*|спек\\w*|spc|spec)'\n            r'[\\s:№#]*([A-Za-zА-Яа-я0-9]+(?:[-–—][A-Za-zА-Яа-я0-9.,]+)*)',\n            text, re.IGNORECASE)\n        if m:\n            spc = _clean_token(m.group(1))\n        if not spc and codes:\n            spc = codes[-1]\n        wait = _extract_wait(text)\n        if wait is not None:\n            interval['wait'] = wait\n        return {\n            'intent': 'create_temp_interval',\n            'params': {'spc': spc, 'interval': interval},\n        }\n\n    if _CREATE_SPEC_RE.search(text):\n        base = _extract_base(text)\n        codes = _extract_spc_codes(text)\n        name = _extract_new_name(text, base, codes)\n        if not base and codes:\n            if name and len(codes) >= 2:\n                for c in codes:\n                    if c.casefold() != name.casefold():\n                        base = c\n                        break\n            elif not name and codes:\n                base = codes[0]\n        if name and base and name.casefold() == base.casefold():\n            alt = [c for c in codes if c.casefold() != name.casefold()]\n            base = alt[0] if alt else None\n\n        tokens = _extract_create_param_tokens(\n            text, consumed=[n for n in (name, base) if n])\n        new_params: list = []\n        for tok in tokens:\n            parsed = parse_norm_assignment(tok)\n            if parsed.get('param'):\n                if (parsed.get('min') is not None\n                        or parsed.get('max') is not None\n                        or parsed.get('pm') is not None):\n                    new_params.append(parsed)\n                else:\n                    new_params.append(parsed['param'])\n            elif tok:\n                new_params.append(tok)\n\n        wait = _extract_wait(text)\n        if interval and wait is not None:\n            interval['wait'] = wait\n        params: dict = {\n            'name': name,\n            'base': base,\n            'new_params': new_params,\n        }\n        if interval:\n            params['interval'] = interval\n        if wait is not None:\n            params['wait'] = wait\n        return {'intent': 'create_spec', 'params': params}\n\n    if _MODIFY_SPEC_RE.search(text) and (\n            'спецификац' in low or 'спек' in low or _extract_spc_codes(text)\n    ):\n        codes = _extract_spc_codes(text)\n        spc = codes[0] if codes else None\n        if not spc:\n            m = _SPC_WORD_RE.search(text)\n            if m:\n                spc = _clean_token(m.group(1))\n        changes_raw = _extract_changes_tail(text, spc)\n        changes = []\n        for tok in changes_raw:\n            parsed = parse_norm_assignment(tok)\n            if parsed.get('param'):\n                changes.append(parsed)\n            elif tok:\n                changes.append(tok)\n        return {\n            'intent': 'modify_spec',\n            'params': {'spc': spc, 'changes': changes},\n        }\n\n    if _SPC_MAP_LIST_RE.search(text):\n        return {'intent': 'list_spc_params', 'params': {}}\n\n    if _GET_PARAMS_RE.search(text):\n        codes = _extract_spc_codes(text)\n        spc = codes[0] if codes else None\n        if not spc:\n            m = _SPC_WORD_RE.search(text)\n            spc = _clean_token(m.group(1)) if m else None\n        return {'intent': 'get_spec_params', 'params': {'spc': spc}}\n\n    if _LIST_SPECS_RE.search(text) and 'спецификац' in low:\n        return {'intent': 'list_specs', 'params': {'search': ''}}\n\n    if interval and re.search(r'(?:шаг|step)', low):\n        codes = _extract_spc_codes(text)\n        return {\n            'intent': 'create_temp_interval',\n            'params': {\n                'spc': codes[-1] if codes else None,\n                'interval': interval,\n            },\n        }\n\n    return None\n
+"""Детерминированный разбор NL-запросов: спецификации и температурные интервалы.
+
+Возвращает dict {'intent': ..., 'params': {...}} либо None.
+
+Примеры:
+  «создай спецификацию РК507-98.440М-240 на основе РК507-98.415М-220»
+  «создай спецификацию NEW на базе OLD с параметрами R, C0»
+  «создай интервал -10...+50 step 5(28, 43) для спецификации РК507-98.415М-220»
+  «температурный интервал от -30 до +60 шагом 5 с точками 23,28»
+  «список спецификаций» / «параметры спецификации XXX»
+  «какие параметры есть в spc_map»
+"""
+from __future__ import annotations
+
+import re
+from typing import Optional
+
+from .spec_tools import parse_interval_text
+
+_CREATE_SPEC_RE = re.compile(
+    r'(?:созда|сдела|сформир|добав|зарегистр)\w*\s+'
+    r'(?:(?:новую|следующ\w+|друг\w+)\s+)?'
+    r'(?:спецификац\w*|спек\w*|spc|spec)\b',
+    re.IGNORECASE,
+)
+_INTERVAL_KW_RE = re.compile(r'интервал', re.IGNORECASE)
+_TEMP_KW_RE = re.compile(r'температур\w*', re.IGNORECASE)
+
+_SPC_WORD_RE = re.compile(
+    r'(?:спецификац\w*|спек\w*|spc|spec|баз\w*|основ\w*)'
+    r'[\s:№#]*'
+    r'([A-Za-zА-Яа-я0-9]+(?:[-–—][A-Za-zА-Яа-я0-9.,]+)*)',
+    re.IGNORECASE,
+)
+# РК507-98.415М-220 / RK507-98,415M-220
+_SPC_BARE_RE = re.compile(
+    r'(?<![A-Za-zА-Яа-я0-9])'
+    r'([A-Za-zА-Яа-я]{1,4}\d{2,4}[-–—]\d{1,4}[.,]\d{1,4}[A-Za-zА-Яа-я]?'
+    r'(?:[-–—]\d{1,6})?)'
+    r'(?![A-Za-zА-Яа-я0-9])',
+)
+_BASE_RE = re.compile(
+    r'(?:на\s+основ\w+|на\s+баз\w+|по\s+образц\w+|коп\w+)\s+'
+    r'([A-Za-zА-Яа-я0-9]+(?:[-–—][A-Za-zА-Яа-я0-9.,]+)*)',
+    re.IGNORECASE,
+)
+_WITH_PARAMS_RE = re.compile(
+    r'(?:с\s+параметр\w*|параметр\w*|добав\w*|включ\w*)\s*[:\-]?\s*'
+    r'(.+)$',
+    re.IGNORECASE,
+)
+_LIST_SPECS_RE = re.compile(
+    r'(?:список|покажи|показать|какие)\s+.*спецификац|спецификац\w*\s+список',
+    re.IGNORECASE,
+)
+_GET_PARAMS_RE = re.compile(
+    r'(?:параметр\w*|норм\w*)\s+(?:спецификац\w*|спек\w*|spc|spec)',
+    re.IGNORECASE,
+)
+_SPC_MAP_LIST_RE = re.compile(
+    r'(?:какие\s+)?(?:параметр\w*|обозначени\w*)[^.?]*'
+    r'(?:spc[_\s]?map|справочник|все\s+параметр)',
+    re.IGNORECASE,
+)
+
+
+def _clean_token(s: str) -> str:
+    return (s or '').strip().strip('.,;:!?').strip()
+
+
+def _extract_spc_codes(text: str) -> list[str]:
+    """Все «голые» коды спецификаций вида РК507-98.415М-220."""
+    return [m.group(1) for m in _SPC_BARE_RE.finditer(text)]
+
+
+def _extract_base(text: str) -> Optional[str]:
+    m = _BASE_RE.search(text)
+    if m:
+        return _clean_token(m.group(1))
+    return None
+
+
+def _extract_new_name(text: str, base: Optional[str],
+                      spc_codes: list[str]) -> Optional[str]:
+    """Имя новой спецификации: после глагола «создай спецификацию X …»."""
+    m = re.search(
+        r'(?:созда|сдела|сформир|добав|зарегистр)\w*\s+(?:новую\s+)?'
+        r'(?:спецификац\w*|спек\w*|spc|spec)\s+'
+        r'([A-Za-zА-Яа-я0-9_]+(?:[-–—][A-Za-zА-Яа-я0-9.,_]+)*)',
+        text, re.IGNORECASE)
+    if m:
+        name = _clean_token(m.group(1))
+        if name.lower() not in ('на', 'из', 'от', 'для', 'с', 'по', 'new',
+                                'базе', 'основе'):
+            return name
+    for c in spc_codes:
+        if base and c.casefold() == base.casefold():
+            continue
+        return c
+    return None
+
+
+def _split_param_tokens(seg: str) -> list[str]:
+    seg = seg.strip().strip('.;:')
+    if not seg:
+        return []
+    parts = re.split(r',|;|\s+и\s+', seg)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _extract_params(text: str, consumed: list[str]) -> list[str]:
+    t = text
+    for c in consumed:
+        if c:
+            t = t.replace(c, ' ')
+    m = _WITH_PARAMS_RE.search(t)
+    if not m:
+        return []
+    seg = m.group(1)
+    seg = re.split(r'(?:интервал|температур)', seg, flags=re.IGNORECASE)[0]
+    tokens = _split_param_tokens(seg)
+    cleaned = []
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok or tok.lower() in (
+            'параметр', 'параметры', 'параметрами',
+            'новый', 'новые', 'добавь', 'включи',
+            'максимум', 'минимум',
+        ):
+            continue
+        cleaned.append(tok)
+    return cleaned
+
+
+def _extract_wait(text: str) -> Optional[float]:
+    m = re.search(r'(?:выдержк\w*|wait|время)\D{0,10}(\d+(?:[.,]\d+)?)',
+                  text, re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1).replace(',', '.'))
+        except ValueError:
+            return None
+    return None
+
+
+def parse(q: str) -> Optional[dict]:
+    if not q or not q.strip():
+        return None
+    text = q.strip()
+    low = text.lower()
+
+    # протоколы — не наш домен
+    if 'протокол' in low:
+        return None
+
+    # удаление спецификаций ассистентом не поддерживается
+    if re.search(r'(?:удал|сотр)\w+\s+.*спецификац', low):
+        return None
+
+    interval = parse_interval_text(text)
+    want_interval_kw = bool(_INTERVAL_KW_RE.search(low))
+    want_temp_kw = bool(_TEMP_KW_RE.search(low))
+
+    # ---- создание интервала (профиль; опционально для спецификации) ----
+    if interval and (want_interval_kw or want_temp_kw):
+        codes = _extract_spc_codes(text)
+        spc = None
+        m = re.search(
+            r'(?:для|спецификац\w*|спек\w*|spc|spec)'
+            r'[\s:№#]*([A-Za-zА-Яа-я0-9]+(?:[-–—]'
+            r'[A-Za-zА-Яа-я0-9.,]+)*)',
+            text, re.IGNORECASE)
+        if m:
+            spc = _clean_token(m.group(1))
+        if not spc and codes:
+            spc = codes[-1]
+        wait = _extract_wait(text)
+        if wait is not None:
+            interval['wait'] = wait
+        return {
+            'intent': 'create_temp_interval',
+            'params': {'spc': spc, 'interval': interval},
+        }
+
+    # ---- создание спецификации (+опционально интервал) ----
+    if _CREATE_SPEC_RE.search(text):
+        base = _extract_base(text)
+        codes = _extract_spc_codes(text)
+        name = _extract_new_name(text, base, codes)
+        if not base and codes:
+            if name and len(codes) >= 2:
+                for c in codes:
+                    if c.casefold() != name.casefold():
+                        base = c
+                        break
+            elif not name and codes:
+                base = codes[0]
+        if name and base and name.casefold() == base.casefold():
+            alt = [c for c in codes if c.casefold() != name.casefold()]
+            base = alt[0] if alt else None
+        params_list = _extract_params(
+            text, consumed=[n for n in (name, base) if n])
+        wait = _extract_wait(text)
+        if interval and wait is not None:
+            interval['wait'] = wait
+        params = {
+            'name': name,
+            'base': base,
+            'new_params': params_list,
+        }
+        if interval:
+            params['interval'] = interval
+        if wait is not None:
+            params['wait'] = wait
+        return {'intent': 'create_spec', 'params': params}
+
+    # ---- справочные запросы ----
+    if _SPC_MAP_LIST_RE.search(text):
+        return {'intent': 'list_spc_params', 'params': {}}
+
+    if _GET_PARAMS_RE.search(text):
+        codes = _extract_spc_codes(text)
+        spc = codes[0] if codes else None
+        if not spc:
+            m = _SPC_WORD_RE.search(text)
+            spc = _clean_token(m.group(1)) if m else None
+        return {'intent': 'get_spec_params', 'params': {'spc': spc}}
+
+    if _LIST_SPECS_RE.search(text) and 'спецификац' in low:
+        return {'intent': 'list_specs', 'params': {'search': ''}}
+
+    # голый интервал со словом «шаг/step»
+    if interval and re.search(r'(?:шаг|step)', low):
+        codes = _extract_spc_codes(text)
+        return {
+            'intent': 'create_temp_interval',
+            'params': {
+                'spc': codes[-1] if codes else None,
+                'interval': interval,
+            },
+        }
+
+    return None
