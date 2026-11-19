@@ -1,4 +1,4 @@
-"""Запуск модулей (статистика, протоколы, графики) в том же процессе.
+"""Запуск модулей (статистика, протоколы, графики, архив) в том же процессе.
 
 Backward-compat: is_statistics_running/launch_statistics сохранены.
 """
@@ -21,6 +21,12 @@ _MODULES = {
         'tags':    ('resonator_graph_window', 'resonator_graph_controls'),
         'factory': ('ResonatorGraph.ui', 'create_graph_window'),
         'label':   'модуль графиков (ResonatorGraph)',
+    },
+    'archive': {
+        'tags':    ('archive_view_window',),
+        'factory': ('Archive_View.Archive_Window',
+                    'create_archive_view_window'),
+        'label':   'модуль архива (Archive_View)',
     },
 }
 _LAUNCHED: dict[str, bool] = {}
@@ -80,3 +86,11 @@ def is_graph_running() -> bool:
 
 def launch_graph(dpg_=None) -> dict:
     return launch_module('graph', dpg_)
+
+
+def is_archive_running() -> bool:
+    return is_module_running('archive')
+
+
+def launch_archive(dpg_=None) -> dict:
+    return launch_module('archive', dpg_)

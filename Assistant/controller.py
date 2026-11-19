@@ -1,12 +1,14 @@
-"""Обработчик NL-запросов: pending → launch → protocol/graph → LLM(stats).
+"""Обработчик NL-запросов: pending → launch → archive/protocol/graph → LLM(stats).
 
 Приоритет:
   1. Активный pending.
   2. Явные launch-команды.
-  3. Сильный protocol-контекст («протокол») → protocol_parser.
-  4. Graph-парсер (игнорирует «протокол»).
-  5. Protocol-парсер (слабые формы).
-  6. Fallback-подсказки / LLM-статистика.
+  3. Spec / температурные интервалы.
+  4. Архив (явный контекст «архив» / export xls архива).
+  5. Сильный protocol-контекст («протокол») → protocol_parser.
+  6. Graph-парсер (игнорирует «протокол»).
+  7. Protocol-парсер (слабые формы).
+  8. Fallback-подсказки / LLM-статистика.
 """
 import re
 
@@ -18,11 +20,16 @@ from .launcher import (
     is_statistics_running, launch_statistics,
     is_protocol_running,   launch_protocol,
     is_graph_running,      launch_graph,
+    is_archive_running,    launch_archive,
 )
 from . import protocol_parser
 from . import protocol_tools
 from . import graph_parser
 from . import graph_tools
+from . import archive_parser
+from . import archive_tools
+from . import spec_parser
+from . import spec_tools
 
 try:
     from .protocol_tools_patch import install_protocol_tools_patches
@@ -45,6 +52,11 @@ _GRAPH_LAUNCH_KW = (
     'запусти график', 'открой график', 'открыть график',
     'запусти модуль график', 'открой модуль график',
     'открыть графики', 'запустить графики', 'open graph', 'launch graph',
+)
+_ARCHIVE_LAUNCH_KW = (
+    'запусти архив', 'открой архив', 'открыть архив',
+    'запусти модуль архив', 'открой модуль архив',
+    'открыть архив бд', 'launch archive', 'open archive',
 )
 _STATS_QUERY_KW = (
     'стат', 'stat', 'мск', 'msk', 'слот', 'slot',
@@ -98,6 +110,16 @@ def _ensure_module_opened(dpg_, key):
         elif res.get('status') == 'error':
             _log(dpg_, f'Не удалось открыть графики: {res.get("error")}',
                  color=(255, 150, 150))
+        return
+    if key == 'archive':
+        if is_archive_running():
+            return
+        res = launch_archive(dpg_)
+        if res.get('status') == 'launched':
+            _log(dpg_, 'Открываю модуль архива...')
+        elif res.get('status') == 'error':
+            _log(dpg_, f'Не удалось открыть архив: {res.get("error")}',
+                 color=(255, 150, 150))
 
 
 def _apply_soft_msk(name, params):
@@ -131,6 +153,29 @@ def _exec_tool(name, params, dpg_):
 def _exec_graph_tool(name, params, dpg_):
     res = graph_tools.execute(name, params, dpg_)
     _log(dpg_, graph_tools.format_result(name, res),
+         color=(255, 150, 150) if isinstance(res, dict) and res.get('error')
+         else (150, 255, 150))
+
+
+def _exec_archive_tool(name, params, dpg_):
+    res = archive_tools.execute(name, params, dpg_)
+    _log(dpg_, archive_tools.format_result(name, res),
+         color=(255, 150, 150) if isinstance(res, dict) and res.get('error')
+         else (150, 255, 150))
+
+
+def _exec_spec_tool(name, params, dpg_):
+    """Инструменты спецификаций и температурных интервалов."""
+    res = spec_tools.execute(name, params, dpg_)
+    if isinstance(res, dict) and res.get('action') == 'dry_run':
+        set_pending('confirm_spec_' + name, {
+            'tool': name,
+            'params': params,
+        })
+        _log(dpg_, spec_tools.format_result(name, res),
+             color=(255, 220, 150))
+        return
+    _log(dpg_, spec_tools.format_result(name, res),
          color=(255, 150, 150) if isinstance(res, dict) and res.get('error')
          else (150, 255, 150))
 
@@ -175,9 +220,16 @@ def run_nl_query_impl(sender, data, dpg_):
             _log(dpg_, '[CANCEL] Предыдущая операция отменена (новый запрос).',
                  color=(255, 220, 150))
         else:
-            res = protocol_tools.handle_pending_reply(q, dpg_)
+            # сначала spec-pending, потом protocol
+            res = None
+            if str(pending.get('kind', '')).startswith('confirm_spec'):
+                res = spec_tools.handle_pending_reply(q, dpg_)
+            if res is None:
+                res = protocol_tools.handle_pending_reply(q, dpg_)
             if res is not None:
-                _log(dpg_, protocol_tools.format_result('pending', res),
+                fmt = (spec_tools.format_result if str(pending.get('kind', '')).startswith('confirm_spec')
+                       else protocol_tools.format_result)
+                _log(dpg_, fmt('pending', res),
                      color=(255, 150, 150) if res.get('error')
                      else (150, 255, 150))
                 return
@@ -224,29 +276,63 @@ def run_nl_query_impl(sender, data, dpg_):
                      color=(255, 150, 150))
         return
 
-    # -------- 3. Strong protocol context first --------
+    # -------- Spec / temp interval (создание спецификаций и интервалов) --------
+    spc_parsed = spec_parser.parse(q)
+    if spc_parsed:
+        _exec_spec_tool(spc_parsed['intent'], spc_parsed['params'], dpg_)
+        return
+
+    if _is_any(q, _ARCHIVE_LAUNCH_KW):
+        aparsed = archive_parser.parse(q)
+        if aparsed and aparsed['intent'] != 'open_archive':
+            _exec_archive_tool(aparsed['intent'], aparsed['params'], dpg_)
+            return
+        if is_archive_running():
+            # Есть параметры загрузки — всё равно выполнить load
+            if aparsed and aparsed.get('params') and any(
+                aparsed['params'].get(k)
+                for k in ('msk', 'spc', 'measure_id', 'numbers')
+            ):
+                _exec_archive_tool('open_archive', aparsed['params'], dpg_)
+            else:
+                _log(dpg_, 'Модуль архива уже открыт.')
+        else:
+            params = (aparsed or {}).get('params') or {}
+            _exec_archive_tool('open_archive', params, dpg_)
+        return
+
+    # -------- 3. Archive (явный контекст / экспорт) --------
+    aparsed = archive_parser.parse(q)
+    if aparsed:
+        _exec_archive_tool(aparsed['intent'], aparsed['params'], dpg_)
+        return
+
+    # -------- 4. Strong protocol context first --------
     if 'протокол' in q_low:
         parsed = protocol_parser.parse(q)
         if parsed:
             _exec_tool(parsed['intent'], parsed['params'], dpg_)
             return
 
-    # -------- 4. Graph parse --------
+    # -------- 5. Graph parse --------
     gparsed = graph_parser.parse(q)
     if gparsed:
         _exec_graph_tool(gparsed['intent'], gparsed['params'], dpg_)
         return
 
-    # -------- 5. Protocol weak forms --------
+    # -------- 6. Protocol weak forms --------
     parsed = protocol_parser.parse(q)
     if parsed:
         _exec_tool(parsed['intent'], parsed['params'], dpg_)
         return
 
-    # -------- 6. Fallback hints --------
+    # -------- 7. Fallback hints --------
     has_stats = _is_any(q, _STATS_QUERY_KW)
     has_graph = any(k in q_low for k in (
         'граф', 'график', 'plot', 'тчх', 'плотн', 'распредел',
+    ))
+    has_archive = any(k in q_low for k in (
+        'архив', 'archive',
     ))
     has_protocol_weak = (
             'заказ' in q_low
@@ -255,6 +341,20 @@ def run_nl_query_impl(sender, data, dpg_):
             or re.search(r'(?:удали|убери|сними)\w*\s+номер', q_low) is not None
             or re.search(r'(?:отправ\w*|передай\w*)\s+(?:в\s+)?отк', q_low) is not None
     )
+
+    if has_archive and not has_stats:
+        _log(dpg_,
+             'Не удалось разобрать запрос к архиву. Примеры:\n'
+             '  «открой архив»\n'
+             '  «найди мск 456» / «поиск мск по 25-24»\n'
+             '  «загрузи архив МСК 456»\n'
+             '  «все мск для номеров JN4450-JN4460»\n'
+             '  «последние 10 мск для спецификации XXX»\n'
+             '  «напечатай архив МСК 456»\n'
+             '  «экспорт в excel архив МСК 456»\n'
+             '  «excel последние 5 мск спецификации XXX»',
+             color=(255, 220, 150))
+        return
 
     if has_graph and not has_stats:
         _log(dpg_,
@@ -278,7 +378,7 @@ def run_nl_query_impl(sender, data, dpg_):
              color=(255, 220, 150))
         return
 
-    # -------- 7. Stats (LLM) --------
+    # -------- 8. Stats (LLM) --------
     if has_stats:
         _ensure_module_opened(dpg_, 'stats')
 

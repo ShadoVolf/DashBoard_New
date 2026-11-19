@@ -18,6 +18,9 @@ hiddenimports = (
     + collect_submodules('Temperature_Measure')
     + collect_submodules('Archive_View')
     + collect_submodules('Authorization')
+    + collect_submodules('Assistant')         # ← НОВОЕ, с большой A
+    + collect_submodules('Statistik')         # ← НОВОЕ (dashboard_llm и др.)
+    + collect_submodules('ResonatorGraph')    # ← НОВОЕ (graph_tools/controller)
     + [
         # Подмодули Virtual_Measure явно (train_models намеренно пропущен)
         'Virtual_Measure.Virtual_Data',
@@ -79,7 +82,7 @@ datas = []
 
 a = Analysis(
     ['main.py'],
-    pathex=[],
+    pathex=['.'],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
@@ -133,5 +136,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['morion_40.ico'],
-    hide_console='hide-late',
+    hide_console=None,
 )
