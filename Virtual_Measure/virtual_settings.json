@@ -13,11 +13,11 @@
   "last_used": {
     "rtype": "Etalon",
     "spc": "Etalon",
-    "msk": "826-96*",
-    "measure_id": "275410",
+    "msk": "826-88*",
+    "measure_id": "272909",
     "only_good": false,
     "machine_type": "Saunders",
-    "machine_sn": "87560"
+    "machine_sn": "76648"
   },
   "nn": {
     "mlp_enabled": false,
