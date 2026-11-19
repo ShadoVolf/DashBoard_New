@@ -2348,38 +2348,10 @@ def create_simple_otk_protocol(data_df, status_df, view_data, tu_data,
 
     table.setStyle(TableStyle(styles))
     story.append(table)
-    story.append(Spacer(1, 5 * mm))
+    story.append(Spacer(1, 8 * mm))
 
-    # ======================= 3. ЗАКЛЮЧЕНИЕ (без ВП) =======================
-    n_total = len(data_df)
-    spc_text = view_data.get('Spc_Text', '')
-    tu_text = view_data.get('TU', '')
-
+    # ======================= 3. ПОДПИСИ (заключение убрано) =======================
     concl = ParagraphStyle('PC', fontName='Arial', fontSize=9.5, leading=12, alignment=TA_LEFT)
-
-    story.append(Paragraph("ЗАКЛЮЧЕНИЕ",
-                           ParagraphStyle('PCTitle', fontName='Arial', fontSize=11, leading=14, alignment=TA_CENTER,
-                                          spaceAfter=5, spaceBefore=5)))
-
-    if n_total < 10 and 'Numbers' in data_df.columns:
-        nums_str = ", ".join(data_df['Numbers'].astype(str).tolist())
-        prefix_text = f"Изделия <b>{spc_text}</b> за № <b>{nums_str}</b>"
-    else:
-        prefix_text = f"Изделия <b>{spc_text}</b> в количестве <b>{n_total}</b> шт."
-
-    story.append(Paragraph(
-        f"{prefix_text} соответствуют требованиям ТУ <b>{tu_text}</b>.", concl))
-
-    story.append(Spacer(1, 3 * mm))
-
-    story.append(Paragraph(
-        f"Изделия за №№ __________________________________ "
-        f"не соответствуют требованиям ТУ <b>{tu_text}</b> "
-        f"и подлежат возврату изготовителю.", concl))
-
-    story.append(Spacer(1, 10 * mm))
-
-    # ======================= 4. ПОДПИСИ =======================
     sig_data = [
         [Paragraph("Представитель ОТК", concl), Spacer(1, 1), Spacer(1, 1), Spacer(1, 1)],
         [Spacer(1, 1), Paragraph("______________________", concl), Paragraph("______________________", concl),
