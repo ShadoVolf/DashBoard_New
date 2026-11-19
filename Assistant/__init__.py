@@ -16,7 +16,7 @@
 без побочных эффектов и без запуска GUI/БД-цепочек.
 """
 from __future__ import annotations
-
+from . import window  # noqa: F401  — якорь для PyInstaller
 from importlib import import_module
 
 # Публичные имена → модуль, где они определены.
