@@ -1,0 +1,74 @@
+--- a/Virtual_Measure/Virtual_Data.py
++++ b/Virtual_Measure/Virtual_Data.py
+@@ -959,6 +959,7 @@
+     total = len(base_df)
+     psidata_rows = []
+     temp_rows = []
++    all_corrections = []
+     TMP_MID = -1
+ 
+     _tick(10, f'\u0413\u0435\u043d\u0435\u0440\u0430\u0446\u0438\u044f \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0439 (\u0438\u0437\u0434\u0435\u043b\u0438\u0439: {total})...')
+@@ -1074,6 +1075,14 @@
+ 
+         # ---- \u0422\u0435\u043c\u043f\u0435\u0440\u0430\u0442\u0443\u0440\u043d\u044b\u0435 \u0442\u043e\u0447\u043a\u0438 ----
+         new_temps_for_item = []
++        # ---- Correct temperature outliers if base resonator is good ----
++        if n in temp_groups:
++            from .temp_outlier_correction import correct_temperature_outliers
++            corrected_temp_df, corrections = correct_temperature_outliers(
++                temp_groups[n], base_row, param_ranges, tnastr)
++            temp_groups[n] = corrected_temp_df
++            if corrections:
++                all_corrections.extend(corrections)
+         if n in temp_groups:
+             for _, t_row in temp_groups[n].iterrows():
+                 new_t = t_row.to_dict()
+@@ -1297,6 +1306,7 @@
+         'ae_per_row':       ae_per_row,
+         'spec_per_row':     spec_per_row,
+         'param_ranges':     param_ranges,
++        'corrections_log':  all_corrections,
+     }
+ def generate_virtual_data_3(
+         base_measure_id: int,
+@@ -2203,6 +2213,14 @@
+         source_mid=preview.get('base_mid'),
+         virtual_mid=new_mid)
+ 
++    if preview.get('corrections_log'):
++        from .temp_outlier_correction import log_corrections
++        log_corrections(
++            msk=preview.get('new_msk'),
++            source_mid=preview.get('base_mid'),
++            virtual_mid=new_mid,
++            corrections_log=preview.get('corrections_log'))
++
+     preview['new_mid'] = new_mid
+     _tick(100, '\u0413\u043e\u0442\u043e\u0432\u043e')
+     return new_mid, n_psi, n_temp
+@@ -2227,6 +2245,8 @@
+         "`Source_Measure_ID` INT,"
+         "`Virtual_Measure_ID` INT,"
+         "`Login` VARCHAR(255),"
++        "`Corrections` TEXT,"
++        "`Has_Corrections` TINYINT(1) DEFAULT 0,"
+         "PRIMARY KEY (`ID`),"
+         "KEY `idx_msk`  (`MSK`),"
+         "KEY `idx_src`  (`Source_Measure_ID`),"
+@@ -2237,6 +2257,16 @@
+     try:
+         with _engine().begin() as conn:
+             conn.execute(text(ddl))
++            for col_ddl in (
++                "ALTER TABLE `virtual_measure_log` "
++                "ADD COLUMN `Corrections` TEXT NULL",
++                "ALTER TABLE `virtual_measure_log` "
++                "ADD COLUMN `Has_Corrections` TINYINT(1) DEFAULT 0",
++            ):
++                try:
++                    conn.execute(text(col_ddl))
++                except Exception:
++                    pass
+         _virtual_log_ready = True
+         print(f"[Virtual {_ts()}] virtual_measure_log: \u0442\u0430\u0431\u043b\u0438\u0446\u0430 \u0433\u043e\u0442\u043e\u0432\u0430",
+               flush=True)
