@@ -1,4 +1,5 @@
-"""Assistant — LLM-ассистент с поддержкой модулей Статистика, Протоколы, Графики и Архив.
+"""Assistant — LLM-ассистент с поддержкой модулей Статистика, Протоколы,
+Графики, Архив и Спецификации (в т.ч. температурные интервалы).
 
 Публичный API:
     create_assistant_window, show_assistant_window,
@@ -12,8 +13,8 @@
 
 Импорты ленивые (PEP 562): тяжёлые модули (controller, window, launcher)
 подгружаются только при первом обращении к их атрибутам. Это позволяет
-тестам импортировать парсеры (graph_parser, protocol_parser, archive_parser)
-без побочных эффектов и без запуска GUI/БД-цепочек.
+тестам импортировать парсеры (graph_parser, protocol_parser, archive_parser,
+spec_parser) без побочных эффектов и без запуска GUI/БД-цепочек.
 """
 from __future__ import annotations
 from . import window  # noqa: F401  — якорь для PyInstaller
@@ -54,6 +55,8 @@ _SUBMODULES = frozenset({
     'constants', 'launcher', 'window', 'controller',
     'graph_parser', 'protocol_parser', 'protocol_tools',
     'archive_parser', 'archive_tools',
+    # спецификации / температурные интервалы
+    'spec_parser', 'spec_tools', 'spc_map_fallback',
 })
 
 __all__ = list(_ATTR_TO_MODULE)
