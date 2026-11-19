@@ -382,3 +382,4 @@ def print_archived_protocol(protokol_id: int):
     _status(f'Протокол N {protokol_n} ({psi_type}) распечатан')
     log_action("PRINT_ARCHIVE", protokol_id, measure_id,
                f"Печать {psi_type}", "Admin")
+

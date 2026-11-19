@@ -912,7 +912,7 @@ def _on_archive_select(sender, app_data, user_data):
         _C._active_archive_mid = None
 
     psi_type = header.get('psi_type') or 'ОТК'
-    if str(psi_type) not in ('ПСИ', 'ОТК', 'Паспорт'):
+    if str(psi_type) not in ('ПСИ', 'ОТК', 'Паспорт', 'ОТКп', 'ОТК_простой', 'ОТК-простой'):
         psi_type = 'ОТК'
     _C._active_archive_psi_type = str(psi_type)
 
