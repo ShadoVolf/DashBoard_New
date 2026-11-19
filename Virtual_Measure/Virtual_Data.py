@@ -1,1 +1,1 @@
-PLACEHOLDER_READ_FROM_ARTIFACT
+@/home/workdir/artifacts/Virtual_Data_FINAL.py
