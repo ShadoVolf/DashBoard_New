@@ -7,6 +7,7 @@ GRAPH_CONTAINER    = "phase_noise_graph_container"
 GRAPH_IMAGE_TAG    = "phase_noise_graph_image"
 INFO_PANEL_TAG     = "phase_noise_info_panel"
 NORMS_GROUP        = "phase_noise_norms_group"
+STATS_GROUP        = "phase_noise_stats_group"
 STATUS_TEXT_TAG    = "phase_noise_status_text"
 
 # Отстройка -> поле данных в phaze_noise (как в edtNumberChange)
