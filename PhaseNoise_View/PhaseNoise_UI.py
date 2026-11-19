@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from .PhaseNoise_Constants import (
     GRAPH_CONTAINER, GRAPH_IMAGE_TAG, TABLE_CONTAINER,
     STATUS_TEXT_TAG, ALL_MSK_LABEL, ALL_MEAS_LABEL, WINDOW_TAG,
-    NORMS_GROUP, INFO_PANEL_TAG,
+    NORMS_GROUP, STATS_GROUP, INFO_PANEL_TAG,
 )
 from .PhaseNoise_Data import (
     get_resonator_types, get_spc_by_type, get_msk_by_spc,
@@ -20,7 +20,10 @@ from .PhaseNoise_Data import (
     load_phaze_noise, load_phaze_noise_data, load_specification,
     build_norms, get_operator_fname, search_msk_partial, parse_numbers_input,
 )
-from .PhaseNoise_Helpers import build_summary_table, collect_norm_points
+from .PhaseNoise_Helpers import (
+    build_summary_table, collect_norm_points,
+    build_offset_stats, overall_yield, _fmt_num,
+)
 from .PhaseNoise_Graph import build_graph
 from .PhaseNoise_Export import export_to_pdf
 from .PhaseNoise_Lookup import (
@@ -96,9 +99,9 @@ def build_filter_bar():
 
 
 def build_info_panel():
-    """Правая панель: график сверху, под ним спецификация ФШ + кнопки."""
+    """Правая панель: график сверху, под ним спецификация ФШ + статистика + кнопки."""
     dpg.add_text("График PN(Freq)", color=(180, 220, 255))
-    with dpg.child_window(height=320, tag=GRAPH_CONTAINER, border=True):
+    with dpg.child_window(height=280, tag=GRAPH_CONTAINER, border=True):
         dpg.add_text("(график появится после <Загрузить>)",
                      color=(120, 120, 120))
 
@@ -107,6 +110,11 @@ def build_info_panel():
     with dpg.group(tag=NORMS_GROUP):
         dpg.add_text("- спецификация не выбрана -",
                      tag="pn_norms_hint", color=(140, 140, 140))
+
+    dpg.add_separator()
+    dpg.add_text("Статистика по отстройкам", color=(180, 220, 255))
+    with dpg.child_window(height=160, tag=STATS_GROUP, border=True):
+        dpg.add_text("- загрузите данные -", color=(140, 140, 140))
 
     dpg.add_separator()
     dpg.add_text("Инструменты", color=(180, 220, 255))
@@ -212,7 +220,6 @@ def _on_msk_change(*_):
     try:
         msk = dpg.get_value("pn_msk") or ""
         log.info(f"on_msk_change: {msk!r}")
-        # при смене МСК сбрасываем MeasureID, чтобы не тянуть старый
         dpg.set_value("pn_mid", ALL_MEAS_LABEL)
         if msk and msk != ALL_MSK_LABEL:
             mids = get_measure_ids_by_msk(msk)
@@ -276,11 +283,11 @@ def _on_msk_search(*_):
 
 def _on_clear_msk_search(*_):
     dpg.set_value("pn_msk_search", "")
-    _on_spc_change()  # восстановить полный список МСК по спеке
+    _on_spc_change()
 
 
 # ===================================================================
-# 3. Нормы / спецификация (правая панель под графиком)
+# 3. Нормы / спецификация + статистика
 # ===================================================================
 def _fill_norms(spc: str | None):
     dpg.delete_item(NORMS_GROUP, children_only=True)
@@ -304,6 +311,45 @@ def _fill_norms(spc: str | None):
         line = (f"Норма {nm['num']}: отстройка {off} Гц  "
                 f"min={vmin_s}  max={vmax_s} дБ/Гц")
         dpg.add_text(line, parent=NORMS_GROUP)
+
+
+def _fill_stats(measurements: pd.DataFrame, norms: list[dict]):
+    """Заполнить блок статистики по отстройкам."""
+    dpg.delete_item(STATS_GROUP, children_only=True)
+    if measurements is None or measurements.empty or not norms:
+        dpg.add_text("- нет данных -", parent=STATS_GROUP, color=(140, 140, 140))
+        return
+
+    oy = overall_yield(measurements, norms)
+    pct = oy["pct_good"]
+    pct_s = f"{pct:.1f}%" if pct is not None else "—"
+    header = (f"Выборка: {oy['n_total']} | Годных: {oy['n_good']} "
+              f"({pct_s}) | Брак: {oy['n_fail']}")
+    dpg.add_text(header, parent=STATS_GROUP, color=(150, 220, 150))
+
+    stats = build_offset_stats(measurements, norms)
+    if not stats:
+        dpg.add_text("Нет активных норм", parent=STATS_GROUP)
+        return
+
+    with dpg.table(parent=STATS_GROUP, header_row=True, resizable=True,
+                   policy=dpg.mvTable_SizingStretchProp,
+                   scrollY=True, height=-1):
+        for col in ("Отстр.", "n", "mean", "σ", "min", "max", "med",
+                    "% годн.", "Cpk"):
+            dpg.add_table_column(label=col)
+        for st in stats:
+            with dpg.table_row():
+                dpg.add_text(st["offset_label"])
+                dpg.add_text(str(st["n"]))
+                dpg.add_text(_fmt_num(st["mean"]))
+                dpg.add_text(_fmt_num(st["std"]))
+                dpg.add_text(_fmt_num(st["min"]))
+                dpg.add_text(_fmt_num(st["max"]))
+                dpg.add_text(_fmt_num(st["median"]))
+                pct = st["pct_good"]
+                dpg.add_text(f"{pct:.1f}" if pct is not None else "—")
+                dpg.add_text(_fmt_num(st["cpk"]))
 
 
 # ===================================================================
@@ -366,7 +412,6 @@ def _on_load(*_):
         msk_val = msk if msk and msk != ALL_MSK_LABEL else None
         mid = int(mid_raw) if str(mid_raw).isdigit() else None
 
-        # приоритет: numbers > mid > msk/n
         if numbers:
             meas = load_phaze_noise(numbers=numbers)
         elif mid or msk_val or n:
@@ -380,6 +425,7 @@ def _on_load(*_):
         if meas.empty:
             dpg.set_value(STATUS_TEXT_TAG, "Нет данных по фильтру")
             _render_table(pd.DataFrame())
+            _fill_stats(pd.DataFrame(), [])
             return
 
         spec_row = load_specification(s) or {}
@@ -397,12 +443,13 @@ def _on_load(*_):
             if meas.empty:
                 dpg.set_value(STATUS_TEXT_TAG, "Годных нет")
                 _render_table(pd.DataFrame())
+                _fill_stats(pd.DataFrame(), [])
                 return
 
         summary = build_summary_table(meas, norms)
         _render_table(summary)
+        _fill_stats(meas, norms)
 
-        # точки по ВСЕМ MeasureID из загруженных измерений
         mids = [int(x) for x in meas["MeasureID"].dropna().unique().tolist()]
         points = load_phaze_noise_data(measure_ids=mids)
         log.info(f"on_load: points rows = {len(points)} for {len(mids)} mid")
@@ -463,7 +510,6 @@ def _render_graph(fig):
     if dpg.does_item_exist(GRAPH_IMAGE_TAG):
         dpg.delete_item(GRAPH_IMAGE_TAG)
 
-    # очистить контейнер
     dpg.delete_item(GRAPH_CONTAINER, children_only=True)
 
     try:
