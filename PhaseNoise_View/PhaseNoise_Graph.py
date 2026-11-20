@@ -1,8 +1,8 @@
 """Построение графика ФШ нативным dpg.plot.
 
-X = отстройка, Гц (логарифмическая ось), по умолчанию 1 Гц .. 100 кГц.
+X = отстройка, Гц (логарифмическая ось), 1 Гц .. 100 кГц.
 Y = PN, дБ/Гц.
-Кривая = пара (MeasureID, N) из phaze_noise_data.
+Линии серий без маркеров; точки только у норм.
 """
 
 from __future__ import annotations
@@ -20,12 +20,17 @@ PLOT_TAG = "pn_dpg_plot"
 X_AXIS_TAG = "pn_dpg_x"
 Y_AXIS_TAG = "pn_dpg_y"
 
+PLOT_TAG_BIG = "pn_dpg_plot_big"
+X_AXIS_TAG_BIG = "pn_dpg_x_big"
+Y_AXIS_TAG_BIG = "pn_dpg_y_big"
+BIG_WINDOW_TAG = "pn_graph_big_window"
+BIG_CONTAINER_TAG = "pn_graph_big_container"
+
 DEFAULT_X_MIN_HZ = 1.0
 DEFAULT_X_MAX_HZ = 100_000.0
 
 LINE_WEIGHT = 1.5
-MARKER_SIZE = 2.0
-NORM_MARKER_SIZE = 4.0
+NORM_MARKER_SIZE = 5.0
 
 SERIES_COLORS = [
     (255, 85, 85, 255),
@@ -131,6 +136,9 @@ def render_graph(
     number_filter: str | None = None,
     x_min_hz: float = DEFAULT_X_MIN_HZ,
     x_max_hz: float = DEFAULT_X_MAX_HZ,
+    plot_tag: str = PLOT_TAG,
+    x_tag: str = X_AXIS_TAG,
+    y_tag: str = Y_AXIS_TAG,
 ) -> None:
     operator_names = operator_names or {}
     meta = _meas_meta(measurements)
@@ -138,12 +146,18 @@ def render_graph(
     if dpg.does_item_exist(parent):
         dpg.delete_item(parent, children_only=True)
 
+    if dpg.does_item_exist(plot_tag):
+        try:
+            dpg.delete_item(plot_tag)
+        except Exception:
+            pass
+
     with dpg.plot(
         label="PN",
         parent=parent,
         height=height,
         width=-1,
-        tag=PLOT_TAG,
+        tag=plot_tag,
         anti_aliased=True,
         no_menus=False,
     ):
@@ -151,16 +165,16 @@ def render_graph(
         dpg.add_plot_axis(
             dpg.mvXAxis,
             label="Отстройка, Гц",
-            tag=X_AXIS_TAG,
+            tag=x_tag,
             log_scale=True,
         )
-        with dpg.plot_axis(dpg.mvYAxis, label="PN, дБ/Гц", tag=Y_AXIS_TAG):
+        with dpg.plot_axis(dpg.mvYAxis, label="PN, дБ/Гц", tag=y_tag):
             if graph_df is None or graph_df.empty:
-                _apply_x_limits(x_min_hz, x_max_hz)
+                _apply_x_limits(x_tag, x_min_hz, x_max_hz)
                 return
 
             pairs = list_series_from_points(graph_df)
-            if number_filter:
+            if group_mode != "msk" and number_filter:
                 nf = str(number_filter).strip().upper()
                 pairs = [
                     (mid, n) for mid, n in pairs
@@ -202,16 +216,9 @@ def render_graph(
                     label = f"MSK {msk} - {label}"
 
                 color = SERIES_COLORS[i % len(SERIES_COLORS)]
-                dpg.add_line_series(xs, ys, label=label, parent=Y_AXIS_TAG)
+                dpg.add_line_series(xs, ys, label=label, parent=y_tag)
                 try:
                     dpg.bind_item_theme(dpg.last_item(), _line_theme(color))
-                except Exception:
-                    pass
-                dpg.add_scatter_series(xs, ys, label=None, parent=Y_AXIS_TAG)
-                try:
-                    dpg.bind_item_theme(
-                        dpg.last_item(), _scatter_theme(color, MARKER_SIZE)
-                    )
                 except Exception:
                     pass
 
@@ -225,13 +232,13 @@ def render_graph(
                     color_n = NORM_COLORS_RGBA[
                         (np_["num"] - 1) % len(NORM_COLORS_RGBA)
                     ]
-                    tag = f"pn_norm_{mid}_{n}_{np_['num']}"
+                    tag = f"pn_norm_{plot_tag}_{mid}_{n}_{np_['num']}"
                     if dpg.does_item_exist(tag):
                         dpg.delete_item(tag)
                     dpg.add_scatter_series(
                         [fx], [float(np_["value"])],
                         label=np_["marker_text"] if len(pairs) == 1 else None,
-                        parent=Y_AXIS_TAG,
+                        parent=y_tag,
                         tag=tag,
                     )
                     try:
@@ -242,25 +249,25 @@ def render_graph(
                         pass
                     all_ys.append(float(np_["value"]))
 
-            _apply_x_limits(x_min_hz, x_max_hz)
+            _apply_x_limits(x_tag, x_min_hz, x_max_hz)
             if all_ys:
                 ymin = min(all_ys)
                 ymax = max(all_ys)
                 if math.isfinite(ymin) and math.isfinite(ymax):
                     pad = max(2.0, (ymax - ymin) * 0.08) if ymax > ymin else 5.0
                     try:
-                        dpg.set_axis_limits(Y_AXIS_TAG, ymin - pad, ymax + pad)
+                        dpg.set_axis_limits(y_tag, ymin - pad, ymax + pad)
                     except Exception:
                         pass
 
 
-def _apply_x_limits(x_min_hz: float, x_max_hz: float) -> None:
-    if not dpg.does_item_exist(X_AXIS_TAG):
+def _apply_x_limits(x_tag: str, x_min_hz: float, x_max_hz: float) -> None:
+    if not dpg.does_item_exist(x_tag):
         return
     lo = max(float(x_min_hz), 1e-12)
     hi = max(float(x_max_hz), lo * 10)
     try:
-        dpg.set_axis_limits(X_AXIS_TAG, lo, hi)
+        dpg.set_axis_limits(x_tag, lo, hi)
     except Exception:
         pass
 
@@ -288,7 +295,7 @@ def _line_theme(color: tuple[int, int, int, int]):
     return th
 
 
-def _scatter_theme(color: tuple[int, int, int, int], size: float = MARKER_SIZE):
+def _scatter_theme(color: tuple[int, int, int, int], size: float = NORM_MARKER_SIZE):
     key = ("sc", color, size)
     if key in _theme_cache:
         return _theme_cache[key]
@@ -311,6 +318,63 @@ def _scatter_theme(color: tuple[int, int, int, int], size: float = MARKER_SIZE):
     return th
 
 
+def open_enlarged_graph(
+    graph_df: pd.DataFrame,
+    measurements: pd.DataFrame,
+    norms: list[dict],
+    operator_names: dict | None = None,
+    group_mode: str = "msk",
+    selected_keys: set[str] | None = None,
+    number_filter: str | None = None,
+) -> None:
+    try:
+        sw = dpg.get_viewport_client_width() or dpg.get_viewport_width() or 1280
+        sh = dpg.get_viewport_client_height() or dpg.get_viewport_height() or 800
+    except Exception:
+        sw, sh = 1280, 800
+
+    w = max(640, int(sw * 0.70))
+    h = max(480, int(sh * 0.70))
+    x = max(0, (sw - w) // 2)
+    y = max(0, (sh - h) // 2)
+
+    if dpg.does_item_exist(BIG_WINDOW_TAG):
+        dpg.delete_item(BIG_WINDOW_TAG)
+
+    with dpg.window(
+        label="Фазовые шумы - график",
+        tag=BIG_WINDOW_TAG,
+        width=w,
+        height=h,
+        pos=(x, y),
+        modal=False,
+        no_collapse=True,
+    ):
+        dpg.add_text(
+            "Колесо мыши над графиком - смена номера "
+            "(в режиме msk все кривые на одном)",
+            color=(150, 200, 255),
+        )
+        with dpg.child_window(tag=BIG_CONTAINER_TAG, height=-1, border=False):
+            pass
+
+    plot_h = max(400, h - 80)
+    render_graph(
+        BIG_CONTAINER_TAG,
+        graph_df,
+        measurements if measurements is not None else pd.DataFrame(),
+        norms or [],
+        operator_names or {},
+        group_mode=group_mode,
+        height=plot_h,
+        selected_keys=selected_keys,
+        number_filter=number_filter,
+        plot_tag=PLOT_TAG_BIG,
+        x_tag=X_AXIS_TAG_BIG,
+        y_tag=Y_AXIS_TAG_BIG,
+    )
+
+
 def build_graph(
     graph_df,
     measurements,
@@ -326,7 +390,7 @@ def build_graph(
     from .PhaseNoise_Constants import NORM_COLORS, STATUS_FAIL as SF
 
     FIG_W, FIG_H = 5.2, 3.4
-    LINE_W, MARKER_S, NORM_S = 0.8, 4, 20
+    LINE_W, NORM_S = 1.0, 20
 
     def _apply_dark(ax, fig):
         bg, fg, grid_c = "#1e1e1e", "#d0d0d0", "#404040"
@@ -346,7 +410,7 @@ def build_graph(
 
     if graph_df is not None and not graph_df.empty:
         pairs = list_series_from_points(graph_df)
-        if number_filter:
+        if group_mode != "msk" and number_filter:
             nf = str(number_filter).strip().upper()
             pairs = [(m, n) for m, n in pairs if str(n).strip().upper() == nf]
         if selected_keys is not None:
@@ -369,8 +433,6 @@ def build_graph(
             c = colors[i % len(colors)]
             ax.plot(sub["Freq"], sub["PN"], color=c, linewidth=LINE_W,
                     alpha=0.9, label=f"N {n} / ID {mid}", zorder=3)
-            ax.scatter(sub["Freq"], sub["PN"], s=MARKER_S, color=c,
-                       linewidths=0, zorder=4)
             m = meta.get(series_key(mid, n)) or meta.get(mid) or {}
             for np_ in collect_norm_points(m, norms):
                 if np_["value"] is None:
