@@ -894,11 +894,37 @@ def _safe_int(v, default=None):
         return int(float(v))
     except (TypeError, ValueError):
         return default
+# NEW: глобальный флаг «показывать Shum*». Управляется чекбоксом
+# archive_shum_check в Archive_UI через set_include_shum().
+_INCLUDE_SHUM: bool = False
+
+
+def set_include_shum(flag: bool) -> None:
+    """Включить/выключить параметры фазового шума (Shum, Shum1..4)."""
+    global _INCLUDE_SHUM
+    _INCLUDE_SHUM = bool(flag)
+
+
+def is_include_shum() -> bool:
+    """Текущее состояние флага Shum*."""
+    return _INCLUDE_SHUM
 def load_spc_map_for_archive(spc_name: str) -> pd.DataFrame:
     """
     Карта норм из spc_map_table, фильтр по Use=1.
+
     Содержит: Parameter, Max, Min, Code, Round, Order, Note, Note_mini.
     Не пропускает строки, если Max/Min = 'no'/NaN/пустое.
+
+    Особый случай — параметры фазового шума (Shum, Shum1..4):
+      * в spc_map_table у них в колонке Use записан литерал '1'
+        (это НЕ имя столбца specification, поэтому старый код
+        `row.get('1')` возвращал None и всегда отбрасывал эти строки);
+      * флаг использования берётся из одноимённой колонки specification
+        (`Shum`, `Shum1`, `Shum2`, `Shum3`, `Shum4`);
+      * дополнительно требуется включённый глобальный флаг _INCLUDE_SHUM
+        (галочка «Параметры шума (Shum)» в Archive_UI);
+      * при выключенной галочке Shum* не попадают в spc_map вообще —
+        ни в таблицу, ни в нормы, ни в протоколы.
     """
     spc_df = load_specification(spc_name)
     if spc_df.empty:
@@ -915,11 +941,23 @@ def load_spc_map_for_archive(spc_name: str) -> pd.DataFrame:
 
     result = []
     for _, spc_row in spc_map_table.iterrows():
-        use_val = _safe_int(row.get(spc_row['Use']), default=0)
-        if use_val != 1:
-            continue
-
         param_name = str(spc_row['Parameter_Name'])
+        is_shum = param_name.startswith('Shum')
+
+        # NEW: для Shum* флаг использования берётся из одноимённого столбца
+        # specification (Shum, Shum1..4), а НЕ из spc_map_table.Use — там
+        # записан литерал '1', не являющийся именем столбца спецификации.
+        if is_shum:
+            if not _INCLUDE_SHUM:
+                continue
+            use_val = _safe_int(row.get(param_name), default=0)
+            if use_val != 1:
+                continue
+        else:
+            use_val = _safe_int(row.get(spc_row['Use']), default=0)
+            if use_val != 1:
+                continue
+
         max_val = _safe_float(row.get(spc_row['Max']))
         min_val = _safe_float(row.get(spc_row['Min']))
 
@@ -946,57 +984,7 @@ def load_spc_map_for_archive(spc_name: str) -> pd.DataFrame:
         })
     return pd.DataFrame(result)
 
-def load_spc_map_for_archive_11(spc_name: str) -> pd.DataFrame:
-    """
-    Карта норм из spc_map_table, фильтр по Use=1.
-    Содержит: Parameter, Max, Min, Code, Round, Order, Note, Note_mini.
-    Не пропускает строки, если Max/Min = 'no'/NaN/пустое.
-    """
-    spc_df = load_specification(spc_name)
-    if spc_df.empty:
-        return pd.DataFrame()
 
-    row = spc_df.iloc[0]
-    engine = create_engine(str(get_connection_string()))
-    try:
-        spc_map_table = pd.read_sql(
-            "SELECT * FROM spc_map_table ORDER BY ID", engine)
-    except Exception as e:
-        print(f"[Archive] Ошибка загрузки spc_map_table: {e}")
-        return pd.DataFrame()
-
-    result = []
-    for _, spc_row in spc_map_table.iterrows():
-        use_val = _safe_int(row.get(spc_row['Use']), default=0)
-        if use_val != 1:
-            continue
-
-        param_name = str(spc_row['Parameter_Name'])
-        max_val = _safe_float(row.get(spc_row['Max']))
-        min_val = _safe_float(row.get(spc_row['Min']))
-
-        note = spc_row.get('Note')
-        note = str(note) if pd.notna(note) and note != '' else param_name
-
-        note_mini = spc_row.get('Note_mini')
-        note_mini = (str(note_mini)
-                     if pd.notna(note_mini) and note_mini != ''
-                     else note)
-
-        order = _safe_int(spc_row.get('Order'), default=999)
-        rnd = _safe_int(spc_row.get('Round'), default=None)
-
-        result.append({
-            'Parameter': param_name,
-            'Max': max_val,
-            'Min': min_val,
-            'Code': _safe_int(spc_row.get('Code'), 0) or 0,
-            'Round': rnd,
-            'Order': order,
-            'Note': note,
-            'Note_mini': note_mini,
-        })
-    return pd.DataFrame(result)
 
 
 # ===========================================================================
