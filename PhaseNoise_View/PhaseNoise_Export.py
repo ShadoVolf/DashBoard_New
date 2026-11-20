@@ -7,6 +7,9 @@
 
 from __future__ import annotations
 
+import os
+import platform
+import subprocess
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -41,9 +44,6 @@ def _register_fonts() -> str:
     """Регистрация шрифтов как в Temperature_Measure/Report.py."""
     global _FONT_REG
     if not _FONT_REG:
-        # Report.py:
-        #   pdfmetrics.registerFont(TTFont('Courier', 'fonts\\couriercyrillic.ttf'))
-        #   pdfmetrics.registerFont(TTFont('Arial', 'fonts\\ArialRegular.ttf'))
         arial_path = "fonts\\ArialRegular.ttf"
         courier_path = "fonts\\couriercyrillic.ttf"
         arial_abs = _FONTS_DIR / "ArialRegular.ttf"
@@ -64,7 +64,6 @@ def _register_fonts() -> str:
             _FONT_REG = True
         except Exception as e:
             print(f"[PhaseNoise] font register: {e}")
-            # если Report уже зарегистрировал Arial - ок
             _FONT_REG = True
     return "Arial"
 
@@ -96,6 +95,19 @@ def _f(v) -> str:
         return f"{float(v):0.2f}"
     except (TypeError, ValueError):
         return "---"
+
+
+def open_pdf(filename: str) -> None:
+    """Открывает PDF в программе по умолчанию (как Temperature_Measure/Report.py)."""
+    try:
+        if platform.system() == "Darwin":
+            subprocess.run(["open", filename], check=False)
+        elif platform.system() == "Windows":
+            os.startfile(filename)  # type: ignore[attr-defined]
+        else:
+            subprocess.run(["xdg-open", filename], check=False)
+    except Exception as e:
+        print(f"[PhaseNoise] Ошибка при открытии файла: {e}")
 
 
 def export_to_pdf(
@@ -143,6 +155,7 @@ def export_to_pdf(
     )
     doc.build(flow)
     print(f"[PhaseNoise] PDF сохранён: {filepath}")
+    open_pdf(filepath)
     return filepath
 
 
