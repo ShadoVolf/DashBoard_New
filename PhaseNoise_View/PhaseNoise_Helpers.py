@@ -1,150 +1,203 @@
-"""Хелперы ФШ: нормы, сводная таблица, статистика."""
-
-from __future__ import annotations
+"""Статусы, сводные таблицы, сбор точек норм, статистика по отстройкам."""
 
 import math
-from typing import Any
-
 import pandas as pd
+from .PhaseNoise_Constants import (
+    OFFSET_TO_FIELD, STATUS_OK, STATUS_FAIL, STATUS_NA,
+)
 
-from .PhaseNoise_Constants import STATUS_FAIL, STATUS_OK, STATUS_NA
+
+def data_value_at_offset(meas_row: dict, offset: int) -> float | None:
+    """Аналог ветвлений if ShOT==1 -> Shum1, ... в PhazeNoise.cpp."""
+    field = OFFSET_TO_FIELD.get(offset)
+    if not field:
+        return None
+    v = meas_row.get(field)
+    if v is None or pd.isna(v):
+        return None
+    return float(v)
+
+
+def calc_status(data: float | None, vmin: float | None, vmax: float | None) -> str:
+    """
+    Аналог проверки в C++:
+        if ShMax!='no' and fabs(data) > ShMax -> Брак
+        if ShMin!='no' and fabs(data) < ShMin -> Брак
+    """
+    if data is None:
+        return STATUS_NA
+    a = abs(data)
+    if vmax is not None and a > vmax:
+        return STATUS_FAIL
+    if vmin is not None and a < vmin:
+        return STATUS_FAIL
+    return STATUS_OK
 
 
 def collect_norm_points(meas_row: dict, norms: list[dict]) -> list[dict]:
-    """Точки норм для одной строки измерения."""
-    out = []
+    """
+    Возвращает список точек для наложения на график:
+        { "num", "offset", "value", "status", "min", "max", "marker_text" }
+    """
+    pts = []
     for nm in norms:
-        num = nm["num"]
-        field = f"PN{num}" if num > 1 else "PN"
-        # в phaze_noise колонки могут быть PN / PN2 / ...
-        raw = meas_row.get(field)
-        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-            # запасные имена
-            raw = meas_row.get(f"ФазовыеШумы{num}") or meas_row.get(f"PN_{num}")
-        try:
-            val = float(raw) if raw is not None and not (isinstance(raw, float) and pd.isna(raw)) else None
-        except (TypeError, ValueError):
-            val = None
-
-        status = STATUS_NA
-        if val is not None:
-            vmin, vmax = nm.get("min"), nm.get("max")
-            ok = True
-            if vmin is not None and val < vmin:
-                ok = False
-            if vmax is not None and val > vmax:
-                ok = False
-            status = STATUS_OK if ok else STATUS_FAIL
-
-        out.append({
-            "num": num,
+        v = data_value_at_offset(meas_row, nm["offset"])
+        st = calc_status(v, nm["min"], nm["max"])
+        marker = (
+            f"{nm['num']} {_fmt_hz(nm['offset'])}   "
+            f"{'-' if v is None else f'{v:0.2f}'}  {st}"
+        )
+        pts.append({
+            "num": nm["num"],
             "offset": nm["offset"],
-            "value": val,
-            "min": nm.get("min"),
-            "max": nm.get("max"),
-            "status": status,
-            "marker_text": f"N{num} {nm['offset']}Hz",
+            "value": v,
+            "status": st,
+            "min": nm["min"],
+            "max": nm["max"],
+            "marker_text": marker,
         })
-    return out
+    return pts
 
 
-def build_summary_table(meas: pd.DataFrame, norms: list[dict]) -> pd.DataFrame:
+def build_summary_table(measurements: pd.DataFrame, norms: list[dict]) -> pd.DataFrame:
+    """Сводная таблица по отстройкам для UI/Excel/PDF."""
     rows = []
-    for _, m in meas.iterrows():
-        d = m.to_dict()
-        pts = collect_norm_points(d, norms)
+    for _, m in measurements.iterrows():
         row = {
-            "ID": d.get("ID"),
-            "MeasureID": d.get("MeasureID"),
-            "MSK": d.get("MSK"),
-            "N": d.get("N"),
-            "Spc": d.get("Spc"),
-            "Date": d.get("_Date_") or d.get("Date"),
-            "Time": d.get("_Time_") or d.get("Time"),
+            "MSK": m.get("MSK"),
+            "N": m.get("N"),
+            "Spc": m.get("Spc"),
+            "Date": m.get("_Date_"),
+            "Time": m.get("_Time_"),
+            "Operator": m.get("Operator"),
+            "MeasureID": m.get("MeasureID"),
+            "ID": m.get("ID"),
         }
-        for p in pts:
-            row[f"PN{p['num']}"] = p["value"]
-            row[f"St{p['num']}"] = p["status"]
+        for nm in norms:
+            off = nm["offset"]
+            v = data_value_at_offset(m.to_dict(), off)
+            row[f"{_fmt_hz(off)}"] = v
+            row[f"Статус {nm['num']}"] = calc_status(v, nm["min"], nm["max"])
         rows.append(row)
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-def overall_yield(measurements: pd.DataFrame, norms: list[dict]) -> dict:
-    if measurements is None or measurements.empty:
-        return {"n_total": 0, "n_good": 0, "n_fail": 0, "pct_good": None}
-    n_total = len(measurements)
-    n_good = 0
-    for _, m in measurements.iterrows():
-        pts = collect_norm_points(m.to_dict(), norms)
-        if pts and all(p["status"] != STATUS_FAIL for p in pts):
-            if any(p["status"] == STATUS_OK for p in pts):
-                n_good += 1
-            elif all(p["status"] == STATUS_NA for p in pts):
-                pass
-            else:
-                n_good += 1
-        elif not pts:
-            n_good += 1
-    n_fail = n_total - n_good
-    pct = 100.0 * n_good / n_total if n_total else None
-    return {"n_total": n_total, "n_good": n_good, "n_fail": n_fail, "pct_good": pct}
-
-
 def build_offset_stats(measurements: pd.DataFrame, norms: list[dict]) -> list[dict]:
     """Статистика по каждой активной отстройке."""
-    out = []
+    result = []
     if measurements is None or measurements.empty or not norms:
-        return out
+        return result
+
     for nm in norms:
-        vals = []
-        n_ok = 0
+        vals_raw = []
+        n_good = 0
+        n_fail = 0
         for _, m in measurements.iterrows():
-            pts = {p["num"]: p for p in collect_norm_points(m.to_dict(), norms)}
-            p = pts.get(nm["num"])
-            if not p or p["value"] is None:
+            v = data_value_at_offset(m.to_dict(), nm["offset"])
+            if v is None:
                 continue
-            vals.append(float(p["value"]))
-            if p["status"] == STATUS_OK:
-                n_ok += 1
-        if not vals:
+            vals_raw.append(float(v))
+            st = calc_status(v, nm["min"], nm["max"])
+            if st == STATUS_OK:
+                n_good += 1
+            elif st == STATUS_FAIL:
+                n_fail += 1
+
+        n = len(vals_raw)
+        if n == 0:
+            result.append({
+                "num": nm["num"],
+                "offset": nm["offset"],
+                "offset_label": _fmt_hz(nm["offset"]),
+                "n": 0,
+                "mean": None, "std": None, "min": None, "max": None,
+                "median": None, "n_good": 0, "n_fail": 0, "pct_good": None,
+                "cpk": None,
+                "vmin": nm["min"], "vmax": nm["max"],
+            })
             continue
-        s = pd.Series(vals, dtype=float)
+
+        s = pd.Series(vals_raw, dtype=float)
         mean = float(s.mean())
-        std = float(s.std(ddof=1)) if len(s) > 1 else 0.0
-        cpk = _cpk(mean, std, nm.get("min"), nm.get("max"))
-        pct_good = 100.0 * n_ok / len(vals) if vals else None
-        out.append({
-            "offset_label": f"{nm['offset']} Hz",
-            "n": len(vals),
+        std = float(s.std(ddof=1)) if n >= 2 else 0.0
+        vmin = nm["min"]
+        vmax = nm["max"]
+        cpk = _calc_cpk(mean, std, vmin, vmax)
+
+        result.append({
+            "num": nm["num"],
+            "offset": nm["offset"],
+            "offset_label": _fmt_hz(nm["offset"]),
+            "n": n,
             "mean": mean,
             "std": std,
             "min": float(s.min()),
             "max": float(s.max()),
             "median": float(s.median()),
-            "pct_good": pct_good,
+            "n_good": n_good,
+            "n_fail": n_fail,
+            "pct_good": 100.0 * n_good / n if n else None,
             "cpk": cpk,
+            "vmin": vmin,
+            "vmax": vmax,
         })
-    return out
+    return result
 
 
-def _cpk(mean: float, std: float, lsl, usl) -> float | None:
-    """Cpk. None если std~0 или нет границ."""
-    if std is None or std <= 1e-12 or math.isnan(std):
+def overall_yield(measurements: pd.DataFrame, norms: list[dict]) -> dict:
+    """
+    Общий выход годных: измерение годно, только если все активные нормы OK.
+    """
+    if measurements is None or measurements.empty:
+        return {"n_total": 0, "n_good": 0, "n_fail": 0, "pct_good": None}
+    n_total = 0
+    n_good = 0
+    for _, m in measurements.iterrows():
+        pts = collect_norm_points(m.to_dict(), norms)
+        if not pts:
+            continue
+        n_total += 1
+        if all(p["status"] == STATUS_OK for p in pts):
+            n_good += 1
+    n_fail = n_total - n_good
+    return {
+        "n_total": n_total,
+        "n_good": n_good,
+        "n_fail": n_fail,
+        "pct_good": 100.0 * n_good / n_total if n_total else None,
+    }
+
+
+def _calc_cpk(mean: float, std: float,
+              lsl: float | None, usl: float | None) -> float | None:
+    if std is None or std < 1e-12:
         return None
     parts = []
     if usl is not None:
-        parts.append((float(usl) - mean) / (3.0 * std))
+        parts.append((usl - mean) / (3.0 * std))
     if lsl is not None:
-        parts.append((mean - float(lsl)) / (3.0 * std))
+        parts.append((mean - lsl) / (3.0 * std))
     if not parts:
         return None
     return float(min(parts))
 
 
-def _fmt_num(v) -> str:
-    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+def _fmt_hz(hz: int) -> str:
+    try:
+        hz = int(hz)
+    except (TypeError, ValueError):
+        return str(hz)
+    if hz >= 1_000_000:
+        return f"{hz // 1_000_000}МГц"
+    if hz >= 1000:
+        return f"{hz // 1000}кГц"
+    return f"{hz}Гц"
+
+
+def _fmt_num(v, digits: int = 2) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
         return "-"
     try:
-        return f"{float(v):.3g}"
+        return f"{float(v):.{digits}f}"
     except (TypeError, ValueError):
         return "-"
