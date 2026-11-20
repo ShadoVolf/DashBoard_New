@@ -1,6 +1,6 @@
 """Построение графика ФШ нативным dpg.plot.
 
-X = log10(отстройка, Гц), по умолчанию 1 Гц … 100 кГц.
+X = отстройка, Гц (логарифмическая ось), по умолчанию 1 Гц .. 100 кГц.
 Y = PN, дБ/Гц.
 Кривая = пара (MeasureID, N) из phaze_noise_data.
 """
@@ -22,6 +22,10 @@ Y_AXIS_TAG = "pn_dpg_y"
 
 DEFAULT_X_MIN_HZ = 1.0
 DEFAULT_X_MAX_HZ = 100_000.0
+
+LINE_WEIGHT = 1.5
+MARKER_SIZE = 2.0
+NORM_MARKER_SIZE = 4.0
 
 SERIES_COLORS = [
     (255, 85, 85, 255),
@@ -54,14 +58,14 @@ def parse_series_key(key: str) -> tuple[int, str]:
     return mid, n
 
 
-def _safe_log10(v: float) -> float | None:
+def _safe_freq(v) -> float | None:
     try:
         fv = float(v)
     except (TypeError, ValueError):
         return None
     if fv <= 0 or math.isnan(fv) or math.isinf(fv):
         return None
-    return math.log10(fv)
+    return fv
 
 
 def _meas_meta(measurements: pd.DataFrame) -> dict:
@@ -135,7 +139,7 @@ def render_graph(
         dpg.delete_item(parent, children_only=True)
 
     with dpg.plot(
-        label="PN (отстройка)",
+        label="PN",
         parent=parent,
         height=height,
         width=-1,
@@ -146,8 +150,9 @@ def render_graph(
         dpg.add_plot_legend(location=dpg.mvPlot_Location_NorthEast)
         dpg.add_plot_axis(
             dpg.mvXAxis,
-            label="Отстройка, log10(Гц)",
+            label="Отстройка, Гц",
             tag=X_AXIS_TAG,
+            log_scale=True,
         )
         with dpg.plot_axis(dpg.mvYAxis, label="PN, дБ/Гц", tag=Y_AXIS_TAG):
             if graph_df is None or graph_df.empty:
@@ -177,14 +182,14 @@ def render_graph(
 
                 xs, ys = [], []
                 for _, row in sub.iterrows():
-                    lx = _safe_log10(row.get("Freq"))
+                    fx = _safe_freq(row.get("Freq"))
                     try:
                         yv = float(row.get("PN"))
                     except (TypeError, ValueError):
                         continue
-                    if lx is None or math.isnan(yv):
+                    if fx is None or math.isnan(yv):
                         continue
-                    xs.append(lx)
+                    xs.append(fx)
                     ys.append(yv)
                 if not xs:
                     continue
@@ -192,9 +197,9 @@ def render_graph(
 
                 m = meta.get(series_key(mid, n)) or meta.get(mid) or {}
                 msk = m.get("MSK", "")
-                label = f"№ {n or m.get('N', '')} / ID {mid}"
+                label = f"N {n or m.get('N', '')} / ID {mid}"
                 if msk:
-                    label = f"МСК {msk} · {label}"
+                    label = f"MSK {msk} - {label}"
 
                 color = SERIES_COLORS[i % len(SERIES_COLORS)]
                 dpg.add_line_series(xs, ys, label=label, parent=Y_AXIS_TAG)
@@ -203,13 +208,19 @@ def render_graph(
                 except Exception:
                     pass
                 dpg.add_scatter_series(xs, ys, label=None, parent=Y_AXIS_TAG)
+                try:
+                    dpg.bind_item_theme(
+                        dpg.last_item(), _scatter_theme(color, MARKER_SIZE)
+                    )
+                except Exception:
+                    pass
 
                 pts = collect_norm_points(m, norms) if m else []
                 for np_ in pts:
                     if np_["value"] is None:
                         continue
-                    lx = _safe_log10(np_["offset"])
-                    if lx is None:
+                    fx = _safe_freq(np_["offset"])
+                    if fx is None:
                         continue
                     color_n = NORM_COLORS_RGBA[
                         (np_["num"] - 1) % len(NORM_COLORS_RGBA)
@@ -218,13 +229,15 @@ def render_graph(
                     if dpg.does_item_exist(tag):
                         dpg.delete_item(tag)
                     dpg.add_scatter_series(
-                        [lx], [float(np_["value"])],
+                        [fx], [float(np_["value"])],
                         label=np_["marker_text"] if len(pairs) == 1 else None,
                         parent=Y_AXIS_TAG,
                         tag=tag,
                     )
                     try:
-                        dpg.bind_item_theme(tag, _scatter_theme(color_n))
+                        dpg.bind_item_theme(
+                            tag, _scatter_theme(color_n, NORM_MARKER_SIZE)
+                        )
                     except Exception:
                         pass
                     all_ys.append(float(np_["value"]))
@@ -242,10 +255,10 @@ def render_graph(
 
 
 def _apply_x_limits(x_min_hz: float, x_max_hz: float) -> None:
-    lo = _safe_log10(x_min_hz)
-    hi = _safe_log10(x_max_hz)
-    if lo is None or hi is None or not dpg.does_item_exist(X_AXIS_TAG):
+    if not dpg.does_item_exist(X_AXIS_TAG):
         return
+    lo = max(float(x_min_hz), 1e-12)
+    hi = max(float(x_max_hz), lo * 10)
     try:
         dpg.set_axis_limits(X_AXIS_TAG, lo, hi)
     except Exception:
@@ -256,7 +269,7 @@ _theme_cache: dict[tuple, Any] = {}
 
 
 def _line_theme(color: tuple[int, int, int, int]):
-    key = ("line", color)
+    key = ("line", color, LINE_WEIGHT)
     if key in _theme_cache:
         return _theme_cache[key]
     with dpg.theme() as th:
@@ -264,12 +277,19 @@ def _line_theme(color: tuple[int, int, int, int]):
             dpg.add_theme_color(
                 dpg.mvPlotCol_Line, color, category=dpg.mvThemeCat_Plots
             )
+            try:
+                dpg.add_theme_style(
+                    dpg.mvPlotStyleVar_LineWeight, LINE_WEIGHT,
+                    category=dpg.mvThemeCat_Plots,
+                )
+            except Exception:
+                pass
     _theme_cache[key] = th
     return th
 
 
-def _scatter_theme(color: tuple[int, int, int, int]):
-    key = ("sc", color)
+def _scatter_theme(color: tuple[int, int, int, int], size: float = MARKER_SIZE):
+    key = ("sc", color, size)
     if key in _theme_cache:
         return _theme_cache[key]
     with dpg.theme() as th:
@@ -280,6 +300,13 @@ def _scatter_theme(color: tuple[int, int, int, int]):
             dpg.add_theme_color(
                 dpg.mvPlotCol_MarkerOutline, color, category=dpg.mvThemeCat_Plots
             )
+            try:
+                dpg.add_theme_style(
+                    dpg.mvPlotStyleVar_MarkerSize, size,
+                    category=dpg.mvThemeCat_Plots,
+                )
+            except Exception:
+                pass
     _theme_cache[key] = th
     return th
 
@@ -299,7 +326,7 @@ def build_graph(
     from .PhaseNoise_Constants import NORM_COLORS, STATUS_FAIL as SF
 
     FIG_W, FIG_H = 5.2, 3.4
-    LINE_W, MARKER_S, NORM_S = 0.8, 6, 28
+    LINE_W, MARKER_S, NORM_S = 0.8, 4, 20
 
     def _apply_dark(ax, fig):
         bg, fg, grid_c = "#1e1e1e", "#d0d0d0", "#404040"
@@ -341,7 +368,7 @@ def build_graph(
                 continue
             c = colors[i % len(colors)]
             ax.plot(sub["Freq"], sub["PN"], color=c, linewidth=LINE_W,
-                    alpha=0.9, label=f"№ {n} / ID {mid}", zorder=3)
+                    alpha=0.9, label=f"N {n} / ID {mid}", zorder=3)
             ax.scatter(sub["Freq"], sub["PN"], s=MARKER_S, color=c,
                        linewidths=0, zorder=4)
             m = meta.get(series_key(mid, n)) or meta.get(mid) or {}
