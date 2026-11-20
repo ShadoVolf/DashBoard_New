@@ -16,7 +16,7 @@ from .PhaseNoise_Data import (
     get_resonator_types, get_spc_by_type, get_msk_by_spc,
     get_measure_ids_by_spc, get_measure_ids_by_msk, get_numbers,
     load_phaze_noise, load_phaze_noise_data, load_specification,
-    build_norms, get_operator_fname, search_msk_partial, parse_numbers_input,
+    build_norms, ensure_norms, get_operator_fname, search_msk_partial, parse_numbers_input,
 )
 from .PhaseNoise_Helpers import (
     build_summary_table, collect_norm_points,
@@ -186,7 +186,7 @@ def _on_spc_change(sender=None, app_data=None, user_data=None):
             dpg.set_value("pn_mid", ALL_MEAS_LABEL)
             dpg.configure_item("pn_number", items=[])
             dpg.set_value("pn_number", "")
-            _fill_norms(None)
+            _fill_norms(None, None)
             return
         msks = get_msk_by_spc(s)
         mids = get_measure_ids_by_spc(s)
@@ -270,21 +270,29 @@ def _on_clear_msk_search(*_):
     _on_spc_change()
 
 
-def _fill_norms(spc: str | None):
+def _fill_norms(spc: str | None, norms: list | None = None):
     dpg.delete_item(NORMS_GROUP, children_only=True)
-    if not spc:
-        dpg.add_text("- спецификация не выбрана -", parent=NORMS_GROUP, color=(140, 140, 140))
-        return
-    spec = load_specification(spc)
-    norms = build_norms(spec)
+    if norms is None:
+        if not spc:
+            dpg.add_text("- спецификация не выбрана -", parent=NORMS_GROUP, color=(140, 140, 140))
+            return
+        norms = ensure_norms(build_norms(load_specification(spc)))
     if not norms:
-        dpg.add_text(f"{spc}: нет активных норм ФШ", parent=NORMS_GROUP, color=(180, 140, 80))
+        dpg.add_text("Нет отстроек", parent=NORMS_GROUP, color=(180, 140, 80))
         return
-    dpg.add_text(f"Spc: {spc}", parent=NORMS_GROUP, color=(150, 200, 255))
+    note = ""
+    if spc:
+        raw = build_norms(load_specification(spc))
+        if not raw:
+            note = " (стандарт 1/10/100/1000 Гц)"
+        dpg.add_text(f"Spc: {spc}{note}", parent=NORMS_GROUP, color=(150, 200, 255))
+    else:
+        dpg.add_text("Отстройки (стандарт 1/10/100/1000 Гц)", parent=NORMS_GROUP,
+                     color=(150, 200, 255))
     for nm in norms:
-        vmin, vmax = nm["min"], nm["max"]
-        vmin_s = f"{vmin:g}" if vmin is not None else "-"
-        vmax_s = f"{vmax:g}" if vmax is not None else "-"
+        vmin, vmax = nm.get("min"), nm.get("max")
+        vmin_s = f"{vmin:g}" if vmin is not None else "---"
+        vmax_s = f"{vmax:g}" if vmax is not None else "---"
         dpg.add_text(
             f"Норма {nm['num']}: отстройка {nm['offset']} Гц  min={vmin_s}  max={vmax_s} дБ/Гц",
             parent=NORMS_GROUP)
@@ -423,8 +431,8 @@ def _on_load(*_):
             return
 
         spec_row = load_specification(s) if s else None
-        norms = build_norms(spec_row)
-        _fill_norms(s)
+        norms = ensure_norms(build_norms(spec_row))
+        _fill_norms(s, norms)
 
         if dpg.get_value("pn_only_good") and norms:
             good_ids = [
@@ -518,12 +526,12 @@ def _on_pdf(mode: str, *_):
         if meas.empty:
             dpg.set_value(STATUS_TEXT_TAG, "Нечего экспортировать")
             return
-        export_to_pdf(
+        path = export_to_pdf(
             meas, s,
-            norms=build_norms(load_specification(s)),
+            norms=ensure_norms(build_norms(load_specification(s))),
             mode=mode, group_mode=dpg.get_value("pn_group_mode") or "msk",
-            filepath=f"phase_noise_{mode}.pdf")
-        dpg.set_value(STATUS_TEXT_TAG, f"PDF сохранён: phase_noise_{mode}.pdf")
+            filepath=None)
+        dpg.set_value(STATUS_TEXT_TAG, f"PDF сохранён: {path}")
     except Exception as e:
         log.exception(f"PDF error: {e}")
         dpg.set_value(STATUS_TEXT_TAG, f"PDF ошибка: {e}")

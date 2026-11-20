@@ -1,4 +1,4 @@
-"""SQL-слой ФШ. Каскад МСК/номеров — через справочник."""
+"""SQL-слой ФШ. Каскад МСК/номеров - через справочник."""
 
 import logging
 import re
@@ -6,6 +6,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from Options import get_connection_string
 from .PhaseNoise_Constants import NORM_DEFS
+from .PhaseNoise_Norms import DEFAULT_OFFSETS, ensure_norms  # noqa: F401
 
 log = logging.getLogger("PhaseNoise.Data")
 _engine_cache = None
@@ -31,14 +32,13 @@ def _q(sql_str: str, params: dict | None = None, label: str = "") -> pd.DataFram
         return pd.DataFrame()
 
 
-# ---------------------------------------------------------------- фильтры
 def get_resonator_types() -> list[str]:
     df = _q(
         "SELECT DISTINCT NameR FROM `specification` "
         "WHERE NameR IS NOT NULL AND TRIM(NameR) <> '' ORDER BY NameR",
         label="resonator_types")
     if df.empty:
-        log.warning("Список NameR пуст — каскад по типу будет неактивен")
+        log.warning("Список NameR пуст - каскад по типу будет неактивен")
         return []
     out = []
     for v in df["NameR"].tolist():
@@ -61,26 +61,20 @@ def get_spc_by_type(res_type: str) -> list[str]:
 
 
 def get_msk_by_spc(spc: str) -> list[str]:
-    """Список МСК по спеке — из справочника."""
     if not spc:
         return []
     try:
-        from .PhaseNoise_Lookup import (
-            lookup_msk_by_spc, is_lookup_empty,
-        )
-
+        from .PhaseNoise_Lookup import lookup_msk_by_spc, is_lookup_empty
         if not is_lookup_empty():
             found = lookup_msk_by_spc(spc)
             if found:
-                log.debug(f"msk_by_spc[{spc}] lookup -> {len(found)}")
                 return found
     except Exception as e:
         log.warning(f"lookup msk_by_spc failed: {e}")
-
     df = _q(
         "SELECT DISTINCT MSK FROM `phaze_noise` "
-        "WHERE Spc = :s AND `Delete` = 0 AND MSK IS NOT NULL "
-        "ORDER BY MSK", {"s": spc}, label=f"msk_for_spc[{spc}]")
+        "WHERE Spc = :s AND `Delete` = 0 AND MSK IS NOT NULL ORDER BY MSK",
+        {"s": spc}, label=f"msk_for_spc[{spc}]")
     if df.empty:
         return []
     return df["MSK"].dropna().astype(str).tolist()
@@ -90,21 +84,17 @@ def get_measure_ids_by_spc(spc: str) -> list[int]:
     if not spc:
         return []
     try:
-        from .PhaseNoise_Lookup import (
-            lookup_mids_by_spc,  is_lookup_empty,
-        )
-
+        from .PhaseNoise_Lookup import lookup_mids_by_spc, is_lookup_empty
         if not is_lookup_empty():
             found = lookup_mids_by_spc(spc)
             if found:
                 return found
     except Exception as e:
         log.warning(f"lookup mids_by_spc failed: {e}")
-
     df = _q(
         "SELECT DISTINCT MeasureID FROM `phaze_noise` "
-        "WHERE Spc = :s AND `Delete` = 0 AND MeasureID IS NOT NULL "
-        "ORDER BY MeasureID", {"s": spc}, label=f"mid_for_spc[{spc}]")
+        "WHERE Spc = :s AND `Delete` = 0 AND MeasureID IS NOT NULL ORDER BY MeasureID",
+        {"s": spc}, label=f"mid_for_spc[{spc}]")
     if df.empty:
         return []
     return df["MeasureID"].dropna().astype(int).tolist()
@@ -114,21 +104,17 @@ def get_measure_ids_by_msk(msk: str) -> list[int]:
     if not msk:
         return []
     try:
-        from .PhaseNoise_Lookup import (
-            lookup_mids_by_msk,  is_lookup_empty,
-        )
-
+        from .PhaseNoise_Lookup import lookup_mids_by_msk, is_lookup_empty
         if not is_lookup_empty():
             found = lookup_mids_by_msk(msk)
             if found:
                 return found
     except Exception as e:
         log.warning(f"lookup mids_by_msk failed: {e}")
-
     df = _q(
         "SELECT DISTINCT MeasureID FROM `phaze_noise` "
-        "WHERE MSK = :m AND `Delete` = 0 AND MeasureID IS NOT NULL "
-        "ORDER BY MeasureID", {"m": msk}, label=f"mid_for_msk[{msk}]")
+        "WHERE MSK = :m AND `Delete` = 0 AND MeasureID IS NOT NULL ORDER BY MeasureID",
+        {"m": msk}, label=f"mid_for_msk[{msk}]")
     if df.empty:
         return []
     return df["MeasureID"].dropna().astype(int).tolist()
@@ -136,17 +122,13 @@ def get_measure_ids_by_msk(msk: str) -> list[int]:
 
 def get_numbers(msk: str | None, measure_id: int | None, spc: str | None) -> list[str]:
     try:
-        from .PhaseNoise_Lookup import (
-            lookup_numbers,  is_lookup_empty,
-        )
-
+        from .PhaseNoise_Lookup import lookup_numbers, is_lookup_empty
         if not is_lookup_empty():
             found = lookup_numbers(msk=msk, measure_id=measure_id, spc=spc)
             if found:
                 return found
     except Exception as e:
         log.warning(f"lookup numbers failed: {e}")
-
     cond = ["`Delete` = 0", "N IS NOT NULL"]
     params: dict = {}
     if spc:
@@ -159,29 +141,24 @@ def get_numbers(msk: str | None, measure_id: int | None, spc: str | None) -> lis
         cond.append("MSK = :msk")
         params["msk"] = msk
     df = _q(
-        f"SELECT DISTINCT N FROM `phaze_noise` WHERE {' AND '.join(cond)} "
-        "ORDER BY N", params, label="numbers")
+        f"SELECT DISTINCT N FROM `phaze_noise` WHERE {' AND '.join(cond)} ORDER BY N",
+        params, label="numbers")
     if df.empty:
         return []
     return df["N"].dropna().astype(str).tolist()
 
 
 def search_msk_partial(query: str, spc: str | None = None, limit: int = 200) -> list[str]:
-    """Поиск МСК по части — только справочник (без тяжёлого запроса к phaze_noise)."""
     q = (query or "").strip()
     if not q:
         return []
     try:
         from .PhaseNoise_Lookup import find_msk_by_partial
-
         found = find_msk_by_partial(q, spc=spc, limit=limit)
-        log.info(f"msk_partial '{q}' spc={spc!r} lookup -> {len(found)}")
         if found:
             return found[:limit]
     except Exception as e:
         log.warning(f"lookup partial MSK failed: {e}")
-
-    # fallback только если справочник пуст/ошибка
     cond = ["`Delete` = 0", "MSK IS NOT NULL", "MSK LIKE :q"]
     params = {"q": f"%{q}%"}
     if spc:
@@ -218,8 +195,7 @@ def parse_numbers_input(raw: str) -> list[str]:
                         result.append(f"{prefix}{i}")
                     continue
         result.append(p)
-    seen = set()
-    out = []
+    seen, out = set(), []
     for n in result:
         if n not in seen:
             seen.add(n)
@@ -227,36 +203,30 @@ def parse_numbers_input(raw: str) -> list[str]:
     return out
 
 
-# ---------------------------------------------------------------- данные
 def load_phaze_noise(msk: str | None = None, measure_id: int | None = None,
                      n: str | None = None,
                      numbers: list[str] | None = None) -> pd.DataFrame:
     if numbers:
         try:
             from .PhaseNoise_Lookup import find_in_lookup
-
             _, mids, _ = find_in_lookup(numbers)
             if mids:
                 ids = sorted(mids)
                 placeholders = ",".join(str(i) for i in ids)
                 return _q(
                     f"SELECT * FROM `phaze_noise` WHERE `Delete` = 0 "
-                    f"AND MeasureID IN ({placeholders}) "
-                    f"ORDER BY `_Date_`, `_Time_`",
+                    f"AND MeasureID IN ({placeholders}) ORDER BY `_Date_`, `_Time_`",
                     label="load_by_numbers_lookup")
         except Exception as e:
             log.warning(f"lookup numbers failed, fallback: {e}")
-
         nums = [str(x).strip().upper() for x in numbers if x]
         if not nums:
             return pd.DataFrame()
         in_list = ",".join(f"'{n.replace(chr(39), '')}'" for n in nums)
         return _q(
             f"SELECT * FROM `phaze_noise` WHERE `Delete` = 0 "
-            f"AND UPPER(TRIM(N)) IN ({in_list}) "
-            f"ORDER BY `_Date_`, `_Time_`",
+            f"AND UPPER(TRIM(N)) IN ({in_list}) ORDER BY `_Date_`, `_Time_`",
             label="load_by_numbers")
-
     cond, params = ["`Delete` = 0"], {}
     if measure_id:
         cond.append("MeasureID = :mid")
@@ -268,7 +238,7 @@ def load_phaze_noise(msk: str | None = None, measure_id: int | None = None,
         cond.append("N = :n")
         params["n"] = n
     if len(cond) == 1:
-        log.warning("load_phaze_noise: пустой фильтр — не запускаем")
+        log.warning("load_phaze_noise: пустой фильтр - не запускаем")
         return pd.DataFrame()
     return _q(
         f"SELECT * FROM `phaze_noise` WHERE {' AND '.join(cond)} "
@@ -279,14 +249,6 @@ def load_phaze_noise_data(msk: str | None = None, measure_id: int | None = None,
                           n: str | None = None,
                           measure_ids: list[int] | None = None,
                           pairs: list[tuple] | None = None) -> pd.DataFrame:
-    """
-    Точки графика из phaze_noise_data.
-
-    Выбор:
-      - pairs: [(MeasureID, N), ...] — точный набор кривых
-      - measure_ids: все N по этим MeasureID
-      - measure_id / msk / n — одиночные фильтры
-    """
     if pairs:
         clean = []
         for item in pairs:
@@ -306,10 +268,8 @@ def load_phaze_noise_data(msk: str | None = None, measure_id: int | None = None,
         in_list = ",".join(parts)
         return _q(
             f"SELECT MeasureID, N, Freq, PN FROM `phaze_noise_data` "
-            f"WHERE (MeasureID, N) IN ({in_list}) "
-            f"ORDER BY MeasureID, N, ID",
+            f"WHERE (MeasureID, N) IN ({in_list}) ORDER BY MeasureID, N, ID",
             label="load_data_by_pairs")
-
     if measure_ids:
         ids = [int(x) for x in measure_ids if x]
         if not ids:
@@ -319,7 +279,6 @@ def load_phaze_noise_data(msk: str | None = None, measure_id: int | None = None,
             f"SELECT MeasureID, N, Freq, PN FROM `phaze_noise_data` "
             f"WHERE MeasureID IN ({placeholders}) ORDER BY MeasureID, N, ID",
             label="load_data_by_ids")
-
     cond, params = [], {}
     if measure_id:
         cond.append("MeasureID = :mid")
@@ -403,8 +362,7 @@ def load_msk_lookup(query: str = "") -> pd.DataFrame:
         where.append("(MSK LIKE :q OR N LIKE :q OR Spc LIKE :q)")
         params["q"] = f"%{query}%"
     return _q(
-        "SELECT MSK, "
-        "GROUP_CONCAT(DISTINCT N) AS N_list, "
+        "SELECT MSK, GROUP_CONCAT(DISTINCT N) AS N_list, "
         "GROUP_CONCAT(DISTINCT Spc) AS Spc_list, "
         "MAX(_Date_) AS last_date, COUNT(*) AS cnt "
         f"FROM `phaze_noise` WHERE {' AND '.join(where)} "
@@ -419,8 +377,7 @@ def load_resonator_lookup(query: str = "") -> pd.DataFrame:
         where.append("(N LIKE :q OR MSK LIKE :q OR Spc LIKE :q)")
         params["q"] = f"%{query}%"
     return _q(
-        "SELECT N, "
-        "GROUP_CONCAT(DISTINCT MSK) AS MSK_list, "
+        "SELECT N, GROUP_CONCAT(DISTINCT MSK) AS MSK_list, "
         "MAX(_Date_) AS last_date, COUNT(*) AS cnt "
         f"FROM `phaze_noise` WHERE {' AND '.join(where)} "
         "GROUP BY N ORDER BY N LIMIT 5000",
@@ -435,8 +392,7 @@ def load_measure_id_lookup(query: str = "") -> pd.DataFrame:
                      "OR MSK LIKE :q OR N LIKE :q OR Spc LIKE :q)")
         params["q"] = f"%{query}%"
     return _q(
-        "SELECT MeasureID, "
-        "GROUP_CONCAT(DISTINCT MSK) AS MSK_list, "
+        "SELECT MeasureID, GROUP_CONCAT(DISTINCT MSK) AS MSK_list, "
         "GROUP_CONCAT(DISTINCT N) AS N_list, "
         "GROUP_CONCAT(DISTINCT Spc) AS Spc_list, "
         "MAX(_Date_) AS last_date, COUNT(*) AS cnt "
