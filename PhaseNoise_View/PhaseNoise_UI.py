@@ -106,6 +106,46 @@ def build_filter_bar():
             dpg.add_button(label="Загрузить", width=110, callback=_on_load)
     dpg.add_separator()
 
+# PhaseNoise_UI.py  (добавить новую функцию)
+
+def _on_add_to_psi():
+    """
+    Считывает текущий MeasureID (из комбобокса pn_mid),
+    опционально – ID замера ПСИ из поля pn_psi_id_override,
+    и вызывает сохранение данных в psidata.
+    """
+    mid_str = dpg.get_value("pn_mid")
+    if not mid_str or mid_str == ALL_MEAS_LABEL:
+        dpg.set_value(STATUS_TEXT_TAG, "Не выбран MeasureID")
+        return
+
+    try:
+        mid = int(mid_str)
+    except ValueError:
+        dpg.set_value(STATUS_TEXT_TAG, "Некорректный MeasureID")
+        return
+
+    # Необязательный ID замера ПСИ
+    psi_id_str = dpg.get_value("pn_psi_id_override").strip()
+    psi_id: int | None = None
+    if psi_id_str:
+        try:
+            psi_id = int(psi_id_str)
+        except ValueError:
+            dpg.set_value(STATUS_TEXT_TAG, "Некорректный ID замера ПСИ")
+            return
+
+    # Импорт внутри функции, чтобы избежать циклических зависимостей
+    from .PhaseNoise_Data import save_psidata_for_measure
+
+    ok = save_psidata_for_measure(mid, psi_id)
+    if ok:
+        dpg.set_value(
+            STATUS_TEXT_TAG,
+            f"Данные добавлены в ПСИ (MeasureID={mid})",
+        )
+    else:
+        dpg.set_value(STATUS_TEXT_TAG, "Не удалось добавить данные в ПСИ")
 
 def build_info_panel():
     with dpg.group(horizontal=True):
@@ -124,6 +164,19 @@ def build_info_panel():
         dpg.add_text("- загрузите данные -", color=(140, 140, 140))
     dpg.add_separator()
     dpg.add_text("Действия", color=(180, 220, 255))
+    # в PhaseNoise_UI.py, внутри build_action_panel (рядом с другими кнопками)
+
+    dpg.add_button(
+        label="Добавить в ПСИ",
+        width=-1,
+        height=26,
+        callback=_on_add_to_psi,
+    )
+    dpg.add_input_text(
+        tag="pn_psi_id_override",
+        width=-1,
+        hint="ID замера ПСИ (опционально)",
+    )
     dpg.add_button(label="Протокол PDF", width=-1, height=26, callback=lambda s, a: _on_pdf("protocol"))
     dpg.add_button(label="Экспорт (протокол+графики)", width=-1, height=26, callback=lambda s, a: _on_pdf("both"))
     dpg.add_button(label="Только графики PDF", width=-1, height=26, callback=lambda s, a: _on_pdf("graphs"))

@@ -425,3 +425,79 @@ def load_measure_id_lookup(query: str = "") -> pd.DataFrame:
         f"FROM `phaze_noise` WHERE {' AND '.join(where)} "
         "GROUP BY MeasureID ORDER BY MeasureID DESC LIMIT 5000",
         params, label="lookup_mid")
+
+# PhaseNoise_Data.py  (добавить в конец файла)
+
+def save_psidata_for_measure(measure_id: int, psi_id: int | None = None) -> bool:
+    """
+    Записывает данные фазового шума из phaze_noise_data в таблицу psidata
+    для указанного MeasureID.
+
+    Если psi_id не задан, ищет соответствие в таблице phase_noize_id
+    по Measure_Id.
+
+    Данные записываются в поля Shum, Shum1..Shum4 по первым пяти
+    уникальным отстройкам (Freq), отсортированным по возрастанию.
+    Если уникальных отстроек меньше пяти — заполняются только доступные.
+    """
+    if not measure_id:
+        log.error("save_psidata_for_measure: measure_id не задан")
+        return False
+
+    # 1. Определяем psi_id
+    if psi_id is None:
+        df_link = _q(
+            "SELECT Psi_id FROM `phase_noize_id` WHERE Measure_Id = :mid LIMIT 1",
+            {"mid": measure_id},
+            label="psi_id_by_measure",
+        )
+        if df_link.empty:
+            log.error("Не найден Psi_id для Measure_Id=%s в phase_noize_id", measure_id)
+            return False
+        psi_id = int(df_link.iloc[0]["Psi_id"])
+
+    # 2. Загружаем данные фазового шума
+    df_pn = load_phaze_noise_data(measure_id=measure_id)
+    if df_pn.empty:
+        log.warning("Нет данных фазового шума для MeasureID=%s", measure_id)
+        return False
+
+    # 3. Сортируем по отстройке и берём первые 5 уникальных отстроек
+    df_sorted = df_pn.sort_values("Freq")
+    unique_offsets = df_sorted["Freq"].unique()[:5]
+    if len(unique_offsets) == 0:
+        log.warning("Нет отстроек для MeasureID=%s", measure_id)
+        return False
+
+    # 4. Формируем значения для полей Shum..Shum4
+    field_names = ["Shum", "Shum1", "Shum2", "Shum3", "Shum4"]
+    values: dict[str, float] = {}
+    for i, offset in enumerate(unique_offsets):
+        # Берём первую запись для данной отстройки (если несколько N)
+        row = df_sorted[df_sorted["Freq"] == offset].iloc[0]
+        values[field_names[i]] = float(row["PN"])
+
+    # 5. Формируем SQL для UPSERT (MySQL: INSERT ... ON DUPLICATE KEY UPDATE)
+    set_clause = ", ".join(f"`{k}` = VALUES(`{k}`)" for k in values)
+    columns = ["Psi_id"] + list(values.keys())
+    placeholders = ", ".join([":Psi_id"] + [f":{k}" for k in values])
+
+    sql = f"""
+        INSERT INTO `psidata` ({', '.join(f'`{c}`' for c in columns)})
+        VALUES ({placeholders})
+        ON DUPLICATE KEY UPDATE {set_clause}
+    """
+    params = {"Psi_id": psi_id, **values}
+
+    try:
+        with _engine().begin() as conn:
+            conn.execute(text(sql), params)
+        log.info(
+            "Данные записаны в psidata для Psi_id=%s (MeasureID=%s)",
+            psi_id,
+            measure_id,
+        )
+        return True
+    except Exception as e:
+        log.error("Ошибка записи в psidata: %s", e)
+        return False
