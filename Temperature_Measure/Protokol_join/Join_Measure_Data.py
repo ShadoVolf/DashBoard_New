@@ -236,8 +236,14 @@ def load_spc_map(row):
 
     logging.info('Спецификация ПСИ загружена')
 
-    df = result_df[~result_df['Parameter'].isin(['Rsp0', 'Rsp1', 'Rsp2'])]
-    _log_df("spc_map — итог (исключены Rsp0/Rsp1/Rsp2)", df)
+    # Rsp* и фазовые шумы (Shum…Shum4) не участвуют в обработке ТИ /
+    # psidata (нет в psidata_map_table).
+    _EXCLUDE = {'Rsp0', 'Rsp1', 'Rsp2', 'Shum', 'Shum1', 'Shum2', 'Shum3', 'Shum4'}
+    df = result_df[
+        ~result_df['Parameter'].isin(_EXCLUDE)
+        & ~result_df['Parameter'].astype(str).str.startswith('Shum')
+    ]
+    _log_df("spc_map — итог (исключены Rsp0/1/2 и Shum*)", df)
     return df
 
 
