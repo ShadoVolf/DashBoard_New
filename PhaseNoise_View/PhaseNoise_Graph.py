@@ -1,5 +1,7 @@
-"""Построение графика ФШ нативным dpg.plot (лог по X).
+"""Построение графика ФШ нативным dpg.plot.
 
+X = log10(отстройка, Гц), по умолчанию 1 Гц … 100 кГц.
+Y = PN, дБ/Гц.
 Кривая = пара (MeasureID, N) из phaze_noise_data.
 """
 
@@ -17,6 +19,9 @@ from .PhaseNoise_Helpers import collect_norm_points
 PLOT_TAG = "pn_dpg_plot"
 X_AXIS_TAG = "pn_dpg_x"
 Y_AXIS_TAG = "pn_dpg_y"
+
+DEFAULT_X_MIN_HZ = 1.0
+DEFAULT_X_MAX_HZ = 100_000.0
 
 SERIES_COLORS = [
     (255, 85, 85, 255),
@@ -100,6 +105,16 @@ def list_series_from_points(points: pd.DataFrame) -> list[tuple[int, str]]:
     return out
 
 
+def unique_numbers_from_points(points: pd.DataFrame) -> list[str]:
+    if points is None or points.empty or "N" not in points.columns:
+        return []
+    nums = (
+        points["N"].dropna().astype(str).str.strip()
+        .replace("", pd.NA).dropna().unique().tolist()
+    )
+    return sorted(set(nums), key=lambda s: s.upper())
+
+
 def render_graph(
     parent: int | str,
     graph_df: pd.DataFrame,
@@ -107,8 +122,11 @@ def render_graph(
     norms: list[dict],
     operator_names: dict[int, str] | None = None,
     group_mode: str = "msk",
-    height: int = 260,
+    height: int = 320,
     selected_keys: set[str] | None = None,
+    number_filter: str | None = None,
+    x_min_hz: float = DEFAULT_X_MIN_HZ,
+    x_max_hz: float = DEFAULT_X_MAX_HZ,
 ) -> None:
     operator_names = operator_names or {}
     meta = _meas_meta(measurements)
@@ -117,7 +135,7 @@ def render_graph(
         dpg.delete_item(parent, children_only=True)
 
     with dpg.plot(
-        label="PN(Freq)",
+        label="PN (отстройка)",
         parent=parent,
         height=height,
         width=-1,
@@ -126,18 +144,30 @@ def render_graph(
         no_menus=False,
     ):
         dpg.add_plot_legend(location=dpg.mvPlot_Location_NorthEast)
-        dpg.add_plot_axis(dpg.mvXAxis, label="log10(Freq, Hz)", tag=X_AXIS_TAG)
-        with dpg.plot_axis(dpg.mvYAxis, label="dB/Hz", tag=Y_AXIS_TAG):
+        dpg.add_plot_axis(
+            dpg.mvXAxis,
+            label="Отстройка, log10(Гц)",
+            tag=X_AXIS_TAG,
+        )
+        with dpg.plot_axis(dpg.mvYAxis, label="PN, дБ/Гц", tag=Y_AXIS_TAG):
             if graph_df is None or graph_df.empty:
+                _apply_x_limits(x_min_hz, x_max_hz)
                 return
 
             pairs = list_series_from_points(graph_df)
+            if number_filter:
+                nf = str(number_filter).strip().upper()
+                pairs = [
+                    (mid, n) for mid, n in pairs
+                    if str(n).strip().upper() == nf
+                ]
             if selected_keys is not None:
                 pairs = [
                     (mid, n) for mid, n in pairs
                     if series_key(mid, n) in selected_keys
                 ]
 
+            all_ys: list[float] = []
             for i, (mid, n) in enumerate(pairs):
                 sub = graph_df[
                     (graph_df["MeasureID"] == mid)
@@ -158,9 +188,9 @@ def render_graph(
                     ys.append(yv)
                 if not xs:
                     continue
+                all_ys.extend(ys)
 
-                k = series_key(mid, n)
-                m = meta.get(k) or meta.get(mid) or {}
+                m = meta.get(series_key(mid, n)) or meta.get(mid) or {}
                 msk = m.get("MSK", "")
                 label = f"№ {n or m.get('N', '')} / ID {mid}"
                 if msk:
@@ -197,6 +227,29 @@ def render_graph(
                         dpg.bind_item_theme(tag, _scatter_theme(color_n))
                     except Exception:
                         pass
+                    all_ys.append(float(np_["value"]))
+
+            _apply_x_limits(x_min_hz, x_max_hz)
+            if all_ys:
+                ymin = min(all_ys)
+                ymax = max(all_ys)
+                if math.isfinite(ymin) and math.isfinite(ymax):
+                    pad = max(2.0, (ymax - ymin) * 0.08) if ymax > ymin else 5.0
+                    try:
+                        dpg.set_axis_limits(Y_AXIS_TAG, ymin - pad, ymax + pad)
+                    except Exception:
+                        pass
+
+
+def _apply_x_limits(x_min_hz: float, x_max_hz: float) -> None:
+    lo = _safe_log10(x_min_hz)
+    hi = _safe_log10(x_max_hz)
+    if lo is None or hi is None or not dpg.does_item_exist(X_AXIS_TAG):
+        return
+    try:
+        dpg.set_axis_limits(X_AXIS_TAG, lo, hi)
+    except Exception:
+        pass
 
 
 _theme_cache: dict[tuple, Any] = {}
@@ -238,6 +291,7 @@ def build_graph(
     operator_names: dict[int, str] | None = None,
     group_mode: str = "msk",
     selected_keys: set[str] | None = None,
+    number_filter: str | None = None,
 ):
     import matplotlib
     matplotlib.use("Agg")
@@ -260,12 +314,14 @@ def build_graph(
 
     operator_names = operator_names or {}
     meta = _meas_meta(measurements)
-
     fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
     _apply_dark(ax, fig)
 
     if graph_df is not None and not graph_df.empty:
         pairs = list_series_from_points(graph_df)
+        if number_filter:
+            nf = str(number_filter).strip().upper()
+            pairs = [(m, n) for m, n in pairs if str(n).strip().upper() == nf]
         if selected_keys is not None:
             pairs = [
                 (mid, n) for mid, n in pairs
@@ -283,10 +339,9 @@ def build_graph(
             ].sort_values("Freq")
             if sub.empty:
                 continue
-            label = f"№ {n} / ID {mid}"
             c = colors[i % len(colors)]
             ax.plot(sub["Freq"], sub["PN"], color=c, linewidth=LINE_W,
-                    alpha=0.9, label=label, zorder=3)
+                    alpha=0.9, label=f"№ {n} / ID {mid}", zorder=3)
             ax.scatter(sub["Freq"], sub["PN"], s=MARKER_S, color=c,
                        linewidths=0, zorder=4)
             m = meta.get(series_key(mid, n)) or meta.get(mid) or {}
@@ -299,8 +354,9 @@ def build_graph(
                            color=color, marker=marker, s=NORM_S, zorder=5)
 
     ax.set_xscale("log")
-    ax.set_xlabel("Frequency, Hz", fontsize=8)
-    ax.set_ylabel("dB/Hz", fontsize=8)
+    ax.set_xlim(DEFAULT_X_MIN_HZ, DEFAULT_X_MAX_HZ)
+    ax.set_xlabel("Отстройка, Гц", fontsize=8)
+    ax.set_ylabel("PN, дБ/Гц", fontsize=8)
     if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=7, loc="best",
                   facecolor="#2a2a2a", edgecolor="#555555",
