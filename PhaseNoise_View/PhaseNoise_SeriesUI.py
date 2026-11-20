@@ -11,7 +11,8 @@ from .PhaseNoise_Constants import (
 )
 from .PhaseNoise_Graph import (
     render_graph, series_key, list_series_from_points,
-    unique_numbers_from_points, PLOT_TAG,
+    unique_numbers_from_points, PLOT_TAG, PLOT_TAG_BIG,
+    open_enlarged_graph, BIG_WINDOW_TAG,
 )
 
 log = logging.getLogger("PhaseNoise.SeriesUI")
@@ -69,6 +70,12 @@ def selected_keys() -> set[str]:
     return {k for k, v in _series_selected.items() if v}
 
 
+def _group_mode() -> str:
+    if dpg.does_item_exist("pn_group_mode"):
+        return dpg.get_value("pn_group_mode") or "msk"
+    return "msk"
+
+
 def set_current_number(number: str, update_combo: bool = True) -> None:
     global _current_number, _suppress_number_cb
     if not number:
@@ -88,13 +95,20 @@ def set_current_number(number: str, update_combo: bool = True) -> None:
 
     redraw_graph()
     n_sel = sum(1 for v in _series_selected.values() if v)
+    mode = _group_mode()
     if dpg.does_item_exist(STATUS_TEXT_TAG):
-        dpg.set_value(
-            STATUS_TEXT_TAG,
-            f"График: N {_current_number} - кривых в выборке "
-            f"{n_sel}/{len(_series_selected)} - "
-            f"номеров {len(_numbers)} (колесо мыши - смена номера)",
-        )
+        if mode == "msk":
+            msg = (
+                f"Режим msk: все кривые на одном графике "
+                f"({n_sel}/{len(_series_selected)})"
+            )
+        else:
+            msg = (
+                f"График: N {_current_number} - кривых "
+                f"{n_sel}/{len(_series_selected)} - "
+                f"номеров {len(_numbers)} (колесо - смена номера)"
+            )
+        dpg.set_value(STATUS_TEXT_TAG, msg)
 
 
 def cycle_number(delta: int) -> None:
@@ -129,19 +143,60 @@ def redraw_graph():
             dpg.add_text("(нет точек для графика)", parent=GRAPH_CONTAINER,
                          color=(140, 140, 140))
         return
-    gm = "msk"
-    if dpg.does_item_exist("pn_group_mode"):
-        gm = dpg.get_value("pn_group_mode") or "msk"
+
+    mode = _group_mode()
+    nfilter = None if mode == "msk" else (_current_number or None)
+
     render_graph(
         GRAPH_CONTAINER,
         _last_points,
         _last_meas if _last_meas is not None else pd.DataFrame(),
         _last_norms or [],
         _last_operators,
-        group_mode=gm,
+        group_mode=mode,
         height=320,
         selected_keys=selected_keys(),
-        number_filter=_current_number or None,
+        number_filter=nfilter,
+    )
+
+    if dpg.does_item_exist(BIG_WINDOW_TAG) and dpg.does_item_exist("pn_graph_big_container"):
+        try:
+            sh = dpg.get_viewport_client_height() or 800
+            h = max(400, int(sh * 0.70) - 80)
+        except Exception:
+            h = 500
+        from .PhaseNoise_Graph import X_AXIS_TAG_BIG, Y_AXIS_TAG_BIG
+        render_graph(
+            "pn_graph_big_container",
+            _last_points,
+            _last_meas if _last_meas is not None else pd.DataFrame(),
+            _last_norms or [],
+            _last_operators,
+            group_mode=mode,
+            height=h,
+            selected_keys=selected_keys(),
+            number_filter=nfilter,
+            plot_tag=PLOT_TAG_BIG,
+            x_tag=X_AXIS_TAG_BIG,
+            y_tag=Y_AXIS_TAG_BIG,
+        )
+
+
+def on_enlarge(*_):
+    if _last_points is None or _last_points.empty:
+        if dpg.does_item_exist(STATUS_TEXT_TAG):
+            dpg.set_value(STATUS_TEXT_TAG, "Нет данных для увеличенного графика")
+        return
+    mode = _group_mode()
+    nfilter = None if mode == "msk" else (_current_number or None)
+    open_enlarged_graph(
+        _last_points,
+        _last_meas if _last_meas is not None else pd.DataFrame(),
+        _last_norms or [],
+        _last_operators,
+        group_mode=mode,
+        selected_keys=selected_keys(),
+        number_filter=nfilter,
     )
 
 
@@ -173,7 +228,7 @@ def render_series_table(meas: pd.DataFrame, series: list[tuple[int, str]]):
         dpg.add_button(label="Все", width=70, callback=lambda: on_select_all(True))
         dpg.add_button(label="Снять все", width=90, callback=lambda: on_select_all(False))
         dpg.add_text(
-            f"  кривых: {len(series)} - номер графика: {_current_number or '-'}",
+            f"  кривых: {len(series)} - номер: {_current_number or '-'}",
             color=(150, 200, 255),
         )
 
@@ -226,9 +281,12 @@ def render_series_table(meas: pd.DataFrame, series: list[tuple[int, str]]):
 
 
 def _on_plot_wheel(sender, app_data, user_data):
-    if not dpg.does_item_exist(PLOT_TAG):
-        return
-    if not dpg.is_item_hovered(PLOT_TAG):
+    hovered = False
+    for tag in (PLOT_TAG, PLOT_TAG_BIG):
+        if dpg.does_item_exist(tag) and dpg.is_item_hovered(tag):
+            hovered = True
+            break
+    if not hovered:
         return
     if not _numbers:
         return
