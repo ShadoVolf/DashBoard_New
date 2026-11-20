@@ -27,7 +27,6 @@ from .PhaseNoise_Helpers import (
 from .PhaseNoise_Graph import build_graph
 from .PhaseNoise_Export import export_to_pdf
 from .PhaseNoise_Lookup import (
-    open_msk_lookup, open_measure_id_lookup, open_resonator_lookup,
     sync_lookup_table, check_lookup_actual, ensure_lookup_table,
 )
 
@@ -37,28 +36,31 @@ _suppress_cascade = False
 
 
 # ===================================================================
-# 1. Фильтр-бар (как в Archive)
+# 1. Фильтр-бар — callbacks сразу при создании (как в Archive)
 # ===================================================================
 def build_filter_bar():
-    # Основной каскад
     with dpg.group(horizontal=True):
         with dpg.group(width=180):
             dpg.add_text("Тип резонатора")
-            dpg.add_combo([], tag="pn_type", width=180)
+            dpg.add_combo([], tag="pn_type", width=180,
+                          callback=_on_type_change)
         with dpg.group(width=220):
             dpg.add_text("Спецификация")
-            dpg.add_combo([], tag="pn_spc", width=220)
+            dpg.add_combo([], tag="pn_spc", width=220,
+                          callback=_on_spc_change)
         with dpg.group(width=180):
             dpg.add_text("МСК")
-            dpg.add_combo([ALL_MSK_LABEL], tag="pn_msk", width=180)
+            dpg.add_combo([ALL_MSK_LABEL], tag="pn_msk", width=180,
+                          callback=_on_msk_change)
         with dpg.group(width=140):
             dpg.add_text("MeasureID")
-            dpg.add_combo([ALL_MEAS_LABEL], tag="pn_mid", width=140)
+            dpg.add_combo([ALL_MEAS_LABEL], tag="pn_mid", width=140,
+                          callback=_on_mid_change)
         with dpg.group(width=160):
             dpg.add_text("Номер")
-            dpg.add_combo([], tag="pn_number", width=160)
+            dpg.add_combo([], tag="pn_number", width=160,
+                          callback=_on_number_change)
 
-    # Поиск МСК по части
     with dpg.group(horizontal=True):
         with dpg.group(width=320):
             dpg.add_text("Поиск МСК по части номера")
@@ -75,7 +77,6 @@ def build_filter_bar():
             dpg.add_button(label="Очистить МСК", width=120,
                            callback=_on_clear_msk_search)
 
-    # Номера + кнопки загрузки
     with dpg.group(horizontal=True):
         with dpg.group(width=360):
             dpg.add_text("Номера (одиночный / список / диапазон)")
@@ -99,7 +100,7 @@ def build_filter_bar():
 
 
 def build_info_panel():
-    """Правая панель: график сверху, под ним спецификация ФШ + статистика + кнопки."""
+    """Правая панель: график, спецификация, статистика, действия."""
     dpg.add_text("График PN(Freq)", color=(180, 220, 255))
     with dpg.child_window(height=280, tag=GRAPH_CONTAINER, border=True):
         dpg.add_text("(график появится после <Загрузить>)",
@@ -117,14 +118,7 @@ def build_info_panel():
         dpg.add_text("- загрузите данные -", color=(140, 140, 140))
 
     dpg.add_separator()
-    dpg.add_text("Инструменты", color=(180, 220, 255))
-    dpg.add_button(label="Справочник МСК", width=-1, height=26,
-                   callback=_open_msk_lookup)
-    dpg.add_button(label="Справочник MeasureID", width=-1, height=26,
-                   callback=_open_mid_lookup)
-    dpg.add_button(label="Справочник номеров", width=-1, height=26,
-                   callback=_open_res_lookup)
-    dpg.add_spacer(height=4)
+    dpg.add_text("Действия", color=(180, 220, 255))
     dpg.add_button(label="Протокол PDF", width=-1, height=26,
                    callback=lambda: _on_pdf("protocol"))
     dpg.add_button(label="Экспорт (протокол+графики)", width=-1, height=26,
@@ -137,28 +131,39 @@ def build_info_panel():
     dpg.add_button(label="Закрыть", width=-1, height=26, callback=_on_close)
 
 
-def wire_callbacks():
-    """Callbacks подключаем ПОСЛЕ того, как все комбо созданы."""
-    dpg.configure_item("pn_type", callback=_on_type_change)
-    dpg.configure_item("pn_spc", callback=_on_spc_change)
-    dpg.configure_item("pn_msk", callback=_on_msk_change)
-    dpg.configure_item("pn_mid", callback=_on_mid_change)
-    dpg.configure_item("pn_number", callback=_on_number_change)
-
-
 def init_cascade():
     """Заполнение каскада при открытии + синхронизация lookup."""
     global _suppress_cascade
+
+    # --- справочник ---
     try:
         ensure_lookup_table()
         st = check_lookup_actual()
+        log.info(f"lookup status: {st}")
         if st.get("needs_full_rebuild") or st.get("needs_incremental"):
-            log.info(f"lookup sync needed: {st}")
-            sync_lookup_table(full_rebuild=st.get("needs_full_rebuild", False))
+            mode = "full" if st.get("needs_full_rebuild") else "incremental"
+            log.info(f"lookup sync starting ({mode})...")
+            if dpg.does_item_exist(STATUS_TEXT_TAG):
+                dpg.set_value(STATUS_TEXT_TAG, f"Синхронизация справочника ({mode})...")
+            res = sync_lookup_table(full_rebuild=bool(st.get("needs_full_rebuild")))
+            msg = (f"Справочник: {res.get('mode')} +{res.get('inserted')} "
+                   f"(всего {res.get('total')})")
+            log.info(msg)
+            if dpg.does_item_exist(STATUS_TEXT_TAG):
+                dpg.set_value(STATUS_TEXT_TAG, msg)
+        else:
+            if dpg.does_item_exist(STATUS_TEXT_TAG):
+                dpg.set_value(
+                    STATUS_TEXT_TAG,
+                    f"Справочник актуален ({st.get('lookup_count', 0)} строк)")
     except Exception as e:
-        log.warning(f"lookup bootstrap: {e}")
+        log.exception(f"lookup bootstrap error: {e}")
+        if dpg.does_item_exist(STATUS_TEXT_TAG):
+            dpg.set_value(STATUS_TEXT_TAG, f"Ошибка справочника: {e}")
 
+    # --- каскад ---
     types = get_resonator_types()
+    log.info(f"init_cascade types: {types[:10] if types else types}")
     dpg.configure_item("pn_type", items=types)
     if types:
         _suppress_cascade = True
@@ -168,19 +173,23 @@ def init_cascade():
             _suppress_cascade = False
         _on_type_change()
     else:
-        log.warning("init_cascade: типы резонаторов пусты")
+        log.warning("init_cascade: типы резонаторов пусты — каскад неактивен")
+        if dpg.does_item_exist(STATUS_TEXT_TAG):
+            dpg.set_value(STATUS_TEXT_TAG,
+                          "Нет типов резонаторов (specification.NameR пуст)")
 
 
 # ===================================================================
-# 2. Callbacks каскада (с suppress как в Archive)
+# 2. Callbacks каскада
 # ===================================================================
-def _on_type_change(*_):
+def _on_type_change(sender=None, app_data=None, user_data=None):
     if _suppress_cascade:
         return
     try:
         t = dpg.get_value("pn_type") or ""
         log.info(f"on_type_change: {t!r}")
         spcs = get_spc_by_type(t) if t else []
+        log.info(f"  spcs: {len(spcs)}")
         dpg.configure_item("pn_spc", items=spcs)
         dpg.set_value("pn_spc", spcs[0] if spcs else "")
         _on_spc_change()
@@ -188,22 +197,26 @@ def _on_type_change(*_):
         log.exception(f"on_type_change error: {e}")
 
 
-def _on_spc_change(*_):
+def _on_spc_change(sender=None, app_data=None, user_data=None):
     if _suppress_cascade:
         return
     try:
         s = dpg.get_value("pn_spc") or ""
         log.info(f"on_spc_change: {s!r}")
         if not s:
-            dpg.configure_item("pn_msk", items=[ALL_MSK_LABEL],
-                               default_value=ALL_MSK_LABEL)
-            dpg.configure_item("pn_mid", items=[ALL_MEAS_LABEL],
-                               default_value=ALL_MEAS_LABEL)
-            dpg.configure_item("pn_number", items=[], default_value="")
+            dpg.configure_item("pn_msk", items=[ALL_MSK_LABEL])
+            dpg.set_value("pn_msk", ALL_MSK_LABEL)
+            dpg.configure_item("pn_mid", items=[ALL_MEAS_LABEL])
+            dpg.set_value("pn_mid", ALL_MEAS_LABEL)
+            dpg.configure_item("pn_number", items=[])
+            dpg.set_value("pn_number", "")
             _fill_norms(None)
             return
-        msk_list = [ALL_MSK_LABEL] + get_msk_by_spc(s)
-        mid_list = [ALL_MEAS_LABEL] + [str(i) for i in get_measure_ids_by_spc(s)]
+        msks = get_msk_by_spc(s)
+        mids = get_measure_ids_by_spc(s)
+        log.info(f"  msks={len(msks)} mids={len(mids)}")
+        msk_list = [ALL_MSK_LABEL] + msks
+        mid_list = [ALL_MEAS_LABEL] + [str(i) for i in mids]
         dpg.configure_item("pn_msk", items=msk_list)
         dpg.set_value("pn_msk", ALL_MSK_LABEL)
         dpg.configure_item("pn_mid", items=mid_list)
@@ -214,7 +227,7 @@ def _on_spc_change(*_):
         log.exception(f"on_spc_change error: {e}")
 
 
-def _on_msk_change(*_):
+def _on_msk_change(sender=None, app_data=None, user_data=None):
     if _suppress_cascade:
         return
     try:
@@ -225,19 +238,20 @@ def _on_msk_change(*_):
             mids = get_measure_ids_by_msk(msk)
             mid_list = [ALL_MEAS_LABEL] + [str(i) for i in mids]
             dpg.configure_item("pn_mid", items=mid_list)
+            dpg.set_value("pn_mid", ALL_MEAS_LABEL)
         _refresh_numbers()
     except Exception as e:
         log.exception(f"on_msk_change error: {e}")
 
 
-def _on_mid_change(*_):
+def _on_mid_change(sender=None, app_data=None, user_data=None):
     if _suppress_cascade:
         return
     log.info(f"on_mid_change: {dpg.get_value('pn_mid')!r}")
     _refresh_numbers()
 
 
-def _on_number_change(*_):
+def _on_number_change(sender=None, app_data=None, user_data=None):
     if _suppress_cascade:
         return
     n = dpg.get_value("pn_number") or ""
@@ -263,7 +277,6 @@ def _refresh_numbers():
 
 
 def _on_msk_search(*_):
-    """Поиск МСК по части строки — заполняет комбо МСК."""
     q = (dpg.get_value("pn_msk_search") or "").strip()
     spc = dpg.get_value("pn_spc") or None
     if not q:
@@ -287,7 +300,7 @@ def _on_clear_msk_search(*_):
 
 
 # ===================================================================
-# 3. Нормы / спецификация + статистика
+# 3. Нормы / статистика
 # ===================================================================
 def _fill_norms(spc: str | None):
     dpg.delete_item(NORMS_GROUP, children_only=True)
@@ -314,7 +327,6 @@ def _fill_norms(spc: str | None):
 
 
 def _fill_stats(measurements: pd.DataFrame, norms: list[dict]):
-    """Заполнить блок статистики по отстройкам."""
     dpg.delete_item(STATS_GROUP, children_only=True)
     if measurements is None or measurements.empty or not norms:
         dpg.add_text("- нет данных -", parent=STATS_GROUP, color=(140, 140, 140))
@@ -352,39 +364,16 @@ def _fill_stats(measurements: pd.DataFrame, norms: list[dict]):
                 dpg.add_text(_fmt_num(st["cpk"]))
 
 
-# ===================================================================
-# 4. Справочники
-# ===================================================================
-def _open_msk_lookup():
-    def _pick(msk: str):
-        log.info(f"MSK picked: {msk!r}")
-        dpg.set_value("pn_msk", msk)
-        dpg.set_value("pn_mid", ALL_MEAS_LABEL)
-        _refresh_numbers()
-    open_msk_lookup(_pick)
-
-
-def _open_mid_lookup():
-    def _pick(mid: int):
-        log.info(f"MID picked: {mid!r}")
-        dpg.set_value("pn_mid", str(mid))
-        dpg.set_value("pn_msk", ALL_MSK_LABEL)
-        _refresh_numbers()
-    open_measure_id_lookup(_pick)
-
-
-def _open_res_lookup():
-    def _pick(n: str):
-        log.info(f"N picked: {n!r}")
-        dpg.set_value("pn_numbers_input", n)
-        _on_load()
-    open_resonator_lookup(_pick)
-
-
 def _on_sync_lookup(*_):
     try:
         dpg.set_value(STATUS_TEXT_TAG, "Синхронизация справочника...")
-        res = sync_lookup_table(full_rebuild=False)
+        try:
+            dpg.split_frame()
+        except Exception:
+            pass
+        st = check_lookup_actual()
+        full = bool(st.get("needs_full_rebuild"))
+        res = sync_lookup_table(full_rebuild=full)
         dpg.set_value(
             STATUS_TEXT_TAG,
             f"Справочник: mode={res.get('mode')} +{res.get('inserted')} "
@@ -395,7 +384,7 @@ def _on_sync_lookup(*_):
 
 
 # ===================================================================
-# 5. Загрузка
+# 4. Загрузка
 # ===================================================================
 def _on_load(*_):
     try:
@@ -478,7 +467,7 @@ def _on_load(*_):
 
 
 # ===================================================================
-# 6. Отрисовка таблицы и графика
+# 5. Отрисовка
 # ===================================================================
 def _render_table(df: pd.DataFrame):
     dpg.delete_item(TABLE_CONTAINER, children_only=True)
@@ -539,7 +528,7 @@ def _render_graph(fig):
 
 
 # ===================================================================
-# 7. Действия
+# 6. PDF / закрытие
 # ===================================================================
 def _on_pdf(mode: str, *_):
     try:
