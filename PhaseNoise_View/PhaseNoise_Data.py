@@ -149,28 +149,51 @@ def get_numbers(msk: str | None, measure_id: int | None, spc: str | None) -> lis
 
 
 def search_msk_partial(query: str, spc: str | None = None, limit: int = 200) -> list[str]:
+    """Поиск МСК по подстроке (как Archive search_archive_msk).
+
+    1) phaze_noise (основной источник, каскад тоже оттуда)
+    2) при пустом результате со speкой - повтор без Spc
+    3) справочник lookup - дополнительный источник
+    """
     q = (query or "").strip()
     if not q:
         return []
-    try:
-        from .PhaseNoise_Lookup import find_msk_by_partial
-        found = find_msk_by_partial(q, spc=spc, limit=limit)
-        if found:
-            return found[:limit]
-    except Exception as e:
-        log.warning(f"lookup partial MSK failed: {e}")
-    cond = ["`Delete` = 0", "MSK IS NOT NULL", "MSK LIKE :q"]
-    params = {"q": f"%{q}%"}
-    if spc:
-        cond.append("Spc = :s")
-        params["s"] = spc
-    df = _q(
-        f"SELECT DISTINCT MSK FROM `phaze_noise` WHERE {' AND '.join(cond)} "
-        f"ORDER BY MSK LIMIT {int(limit)}",
-        params, label="msk_partial_fallback")
-    if df.empty:
-        return []
-    return df["MSK"].dropna().astype(str).tolist()
+    limit = max(1, int(limit))
+    pat = f"%{q}%"
+
+    def _from_phaze(with_spc: bool) -> list[str]:
+        cond = ["`Delete` = 0", "MSK IS NOT NULL", "TRIM(MSK) <> ''", "MSK LIKE :q"]
+        params: dict = {"q": pat}
+        if with_spc and spc:
+            cond.append("Spc = :s")
+            params["s"] = spc
+        df = _q(
+            f"SELECT DISTINCT MSK FROM `phaze_noise` "
+            f"WHERE {' AND '.join(cond)} ORDER BY MSK LIMIT {limit}",
+            params,
+            label=f"msk_partial[{q}|spc={spc if with_spc else None}]",
+        )
+        if df.empty or "MSK" not in df.columns:
+            return []
+        return (
+            df["MSK"].dropna().astype(str).str.strip()
+            .replace("", pd.NA).dropna().unique().tolist()
+        )
+
+    found = _from_phaze(with_spc=True)
+    if not found and spc:
+        log.info(f"msk_partial: по Spc={spc!r} пусто, ищем без фильтра спеки")
+        found = _from_phaze(with_spc=False)
+    if not found:
+        try:
+            from .PhaseNoise_Lookup import find_msk_by_partial
+            found = find_msk_by_partial(q, spc=None, limit=limit) or []
+            found = [str(x).strip() for x in found if str(x).strip()]
+        except Exception as e:
+            log.warning(f"lookup partial MSK failed: {e}")
+
+    log.info(f"msk_partial '{q}': {len(found)} hits")
+    return found[:limit]
 
 
 def parse_numbers_input(raw: str) -> list[str]:
