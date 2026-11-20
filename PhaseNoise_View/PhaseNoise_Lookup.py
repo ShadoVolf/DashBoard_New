@@ -352,7 +352,7 @@ def add_pairs_to_lookup(pairs, engine=None):
 
 
 # =============================================================================
-# UI-диалоги
+# UI-диалоги (без height=-80 — падает в части версий DPG)
 # =============================================================================
 
 def _s(v) -> str:
@@ -396,8 +396,9 @@ class LookupDialog:
             dpg.add_text("Фильтр (МСК / N / Spc / ID):")
             dpg.add_input_text(tag=self.tag_search, width=-1,
                                callback=self._on_search)
-            dpg.add_listbox([], tag=self.tag_list,
-                            width=-1, height=-80, num_items=25)
+            # height фиксированный: height=-80 падает в DPG (SystemError)
+            dpg.add_listbox(["(загрузка...)"], tag=self.tag_list,
+                            width=-1, num_items=20)
             with dpg.group(horizontal=True):
                 dpg.add_button(label="Выбрать", callback=self._on_pick,
                                width=110)
@@ -424,14 +425,19 @@ class LookupDialog:
         else:
             items = [self.format_fn(r) for _, r in df.iterrows()]
             log.info(f"Lookup {self.title}: {len(items)} строк")
-        dpg.configure_item(self.tag_list, items=items,
-                           default_value=items[0])
+        if not dpg.does_item_exist(self.tag_list):
+            return
+        dpg.configure_item(self.tag_list, items=items)
+        try:
+            dpg.set_value(self.tag_list, items[0])
+        except Exception:
+            pass
 
     def _on_pick(self, *args):
         import dearpygui.dearpygui as dpg
         sel = dpg.get_value(self.tag_list)
         log.info(f"Lookup pick: {sel!r}")
-        if not sel or sel == "(нет данных)":
+        if not sel or sel in ("(нет данных)", "(загрузка...)"):
             return
         try:
             self.on_select(sel)

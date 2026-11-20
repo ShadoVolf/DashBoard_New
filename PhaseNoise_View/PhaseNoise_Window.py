@@ -4,12 +4,11 @@ import logging
 import dearpygui.dearpygui as dpg
 from Temperature_Measure import _layout
 from .PhaseNoise_Constants import (
-    WINDOW_TAG, GRAPH_CONTAINER, TABLE_CONTAINER, STATUS_TEXT_TAG,
+    WINDOW_TAG, TABLE_CONTAINER, STATUS_TEXT_TAG,
     INFO_PANEL_TAG,
 )
 from .PhaseNoise_UI import (
-    build_filter_bar, build_info_panel,
-    wire_callbacks, init_cascade,
+    build_filter_bar, build_info_panel, init_cascade,
 )
 
 log = logging.getLogger("PhaseNoise.Window")
@@ -46,10 +45,8 @@ def create_phase_noise_window(dpg_ctx=None):
 
     with dpg.window(label="Фазовые шумы", tag=WINDOW_TAG,
                     width=w, height=h, pos=(margin, margin), no_collapse=True):
-        # 1. Фильтр-бар сверху
         build_filter_bar()
 
-        # 2. Две колонки: слева таблица, справа график + нормы
         with dpg.group(horizontal=True):
             with dpg.child_window(width=left_w, height=-30, border=False):
                 dpg.add_text("Результаты", tag=STATUS_TEXT_TAG,
@@ -64,8 +61,7 @@ def create_phase_noise_window(dpg_ctx=None):
                                   tag=INFO_PANEL_TAG):
                 build_info_panel()
 
-    # callbacks и каскад после создания всех items
-    wire_callbacks()
+    # каскад + sync справочника после создания всех items
     init_cascade()
     _register_for_window_manager()
     log.info("Окно фазовых шумов создано")
