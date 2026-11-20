@@ -1,17 +1,13 @@
 """UI ФШ: каскад как в Архиве, график справа, спецификация под графиком."""
 
-import io
 import logging
-import os
-import tempfile
-import threading            # <-- добавлено
+import threading
 
 import dearpygui.dearpygui as dpg
 import pandas as pd
-import matplotlib.pyplot as plt
 
 from .PhaseNoise_Constants import (
-    GRAPH_CONTAINER, GRAPH_IMAGE_TAG, TABLE_CONTAINER,
+    GRAPH_CONTAINER, TABLE_CONTAINER,
     STATUS_TEXT_TAG, ALL_MSK_LABEL, ALL_MEAS_LABEL, WINDOW_TAG,
     NORMS_GROUP, STATS_GROUP, INFO_PANEL_TAG,
     LOOKUP_STATUS_TAG, LOOKUP_SYNC_STATE,    # <-- добавлено
@@ -26,7 +22,7 @@ from .PhaseNoise_Helpers import (
     build_summary_table, collect_norm_points,
     build_offset_stats, overall_yield, _fmt_num,
 )
-from .PhaseNoise_Graph import build_graph
+from .PhaseNoise_Graph import render_graph
 from .PhaseNoise_Export import export_to_pdf
 from .PhaseNoise_Lookup import sync_lookup_table, check_lookup_actual
 
@@ -509,14 +505,13 @@ def _on_load(*_):
                           "Выберите МСК / MeasureID / Номер или введите номера")
             return
 
-        log.info(f"on_load: meas rows = {len(meas)}")
         if meas.empty:
-            dpg.set_value(STATUS_TEXT_TAG, "Нет данных по фильтру")
+            dpg.set_value(STATUS_TEXT_TAG, "Данные не найдены")
             _render_table(pd.DataFrame())
             _fill_stats(pd.DataFrame(), [])
             return
 
-        spec_row = load_specification(s) or {}
+        spec_row = load_specification(s) if s else None
         norms = build_norms(spec_row)
         _fill_norms(s)
 
@@ -550,11 +545,12 @@ def _on_load(*_):
             int(m["ID"]): get_operator_fname(m.get("Operator") or "")
             for _, m in meas.iterrows()
         }
-        fig = build_graph(
+        render_graph(
+            GRAPH_CONTAINER,
             points, meas, norms, operators,
-            group_mode=dpg.get_value("pn_group_mode") or "msk")
-        _render_graph(fig)
-        plt.close(fig)
+            group_mode=dpg.get_value("pn_group_mode") or "msk",
+            height=260,
+        )
 
         dpg.set_value(
             STATUS_TEXT_TAG,
@@ -581,44 +577,6 @@ def _render_table(df: pd.DataFrame):
                 for h in headers:
                     v = row[h]
                     dpg.add_text("-" if pd.isna(v) else str(v))
-
-
-def _render_graph(fig):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    buf.seek(0)
-    png = buf.read()
-    buf.close()
-
-    if dpg.does_item_exist("pn_graph_texture"):
-        dpg.delete_item("pn_graph_texture")
-    if dpg.does_item_exist(GRAPH_IMAGE_TAG):
-        dpg.delete_item(GRAPH_IMAGE_TAG)
-
-    dpg.delete_item(GRAPH_CONTAINER, children_only=True)
-
-    try:
-        from PIL import Image
-        import numpy as np
-        img = Image.open(io.BytesIO(png)).convert("RGBA")
-        w, h = img.size
-        arr = (np.asarray(img, dtype=np.float32) / 255.0).flatten().tolist()
-        with dpg.texture_registry(show=False):
-            dpg.add_static_texture(w, h, arr, tag="pn_graph_texture")
-    except ImportError:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        tmp.write(png)
-        tmp.close()
-        try:
-            w, h, _c, data = dpg.load_image(tmp.name)
-            with dpg.texture_registry(show=False):
-                dpg.add_static_texture(w, h, data, tag="pn_graph_texture")
-        finally:
-            os.unlink(tmp.name)
-
-    dpg.add_image("pn_graph_texture", parent=GRAPH_CONTAINER,
-                  tag=GRAPH_IMAGE_TAG)
 
 
 def _on_pdf(mode: str, *_):
