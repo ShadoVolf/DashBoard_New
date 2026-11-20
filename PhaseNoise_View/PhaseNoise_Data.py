@@ -43,7 +43,7 @@ def get_resonator_types() -> list[str]:
     out = []
     for v in df["NameR"].tolist():
         s = str(v).strip()
-        if s and s not in ('""', "''"):
+        if s and s not in ('\"\"', "''"):
             out.append(s)
     log.info(f"Resonator types({len(out)}): {out[:8]}")
     return out
@@ -277,7 +277,39 @@ def load_phaze_noise(msk: str | None = None, measure_id: int | None = None,
 
 def load_phaze_noise_data(msk: str | None = None, measure_id: int | None = None,
                           n: str | None = None,
-                          measure_ids: list[int] | None = None) -> pd.DataFrame:
+                          measure_ids: list[int] | None = None,
+                          pairs: list[tuple] | None = None) -> pd.DataFrame:
+    """
+    Точки графика из phaze_noise_data.
+
+    Выбор:
+      - pairs: [(MeasureID, N), ...] — точный набор кривых
+      - measure_ids: все N по этим MeasureID
+      - measure_id / msk / n — одиночные фильтры
+    """
+    if pairs:
+        clean = []
+        for item in pairs:
+            try:
+                mid = int(item[0])
+                nn = str(item[1]).strip()
+            except (TypeError, ValueError, IndexError):
+                continue
+            if nn:
+                clean.append((mid, nn))
+        if not clean:
+            return pd.DataFrame()
+        parts = []
+        for mid, nn in clean:
+            safe_n = nn.replace("\\", "\\\\").replace("'", "''")
+            parts.append(f"({mid}, '{safe_n}')")
+        in_list = ",".join(parts)
+        return _q(
+            f"SELECT MeasureID, N, Freq, PN FROM `phaze_noise_data` "
+            f"WHERE (MeasureID, N) IN ({in_list}) "
+            f"ORDER BY MeasureID, N, ID",
+            label="load_data_by_pairs")
+
     if measure_ids:
         ids = [int(x) for x in measure_ids if x]
         if not ids:
@@ -285,7 +317,7 @@ def load_phaze_noise_data(msk: str | None = None, measure_id: int | None = None,
         placeholders = ",".join(str(i) for i in ids)
         return _q(
             f"SELECT MeasureID, N, Freq, PN FROM `phaze_noise_data` "
-            f"WHERE MeasureID IN ({placeholders}) ORDER BY MeasureID, ID",
+            f"WHERE MeasureID IN ({placeholders}) ORDER BY MeasureID, N, ID",
             label="load_data_by_ids")
 
     cond, params = [], {}
@@ -302,7 +334,7 @@ def load_phaze_noise_data(msk: str | None = None, measure_id: int | None = None,
         return pd.DataFrame()
     return _q(
         f"SELECT MeasureID, N, Freq, PN FROM `phaze_noise_data` "
-        f"WHERE {' AND '.join(cond)} ORDER BY MeasureID, ID",
+        f"WHERE {' AND '.join(cond)} ORDER BY MeasureID, N, ID",
         params, label="load_phaze_noise_data")
 
 
