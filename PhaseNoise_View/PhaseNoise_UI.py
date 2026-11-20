@@ -35,9 +35,6 @@ log = logging.getLogger("PhaseNoise.UI")
 _suppress_cascade = False
 
 
-# ===================================================================
-# 1. Фильтр-бар — callbacks сразу при создании (как в Archive)
-# ===================================================================
 def build_filter_bar():
     with dpg.group(horizontal=True):
         with dpg.group(width=180):
@@ -100,7 +97,6 @@ def build_filter_bar():
 
 
 def build_info_panel():
-    """Правая панель: график, спецификация, статистика, действия."""
     dpg.add_text("График PN(Freq)", color=(180, 220, 255))
     with dpg.child_window(height=280, tag=GRAPH_CONTAINER, border=True):
         dpg.add_text("(график появится после <Загрузить>)",
@@ -134,60 +130,76 @@ def build_info_panel():
 def init_cascade():
     """Заполнение каскада при открытии + синхронизация lookup."""
     global _suppress_cascade
+    print("[PhaseNoise] init_cascade start")
+    log.info("init_cascade start")
 
-    # --- справочник ---
     try:
+        print("[PhaseNoise] ensure_lookup_table...")
         ensure_lookup_table()
         st = check_lookup_actual()
+        print(f"[PhaseNoise] lookup status: {st}")
         log.info(f"lookup status: {st}")
         if st.get("needs_full_rebuild") or st.get("needs_incremental"):
             mode = "full" if st.get("needs_full_rebuild") else "incremental"
+            print(f"[PhaseNoise] lookup sync ({mode})...")
             log.info(f"lookup sync starting ({mode})...")
             if dpg.does_item_exist(STATUS_TEXT_TAG):
                 dpg.set_value(STATUS_TEXT_TAG, f"Синхронизация справочника ({mode})...")
             res = sync_lookup_table(full_rebuild=bool(st.get("needs_full_rebuild")))
             msg = (f"Справочник: {res.get('mode')} +{res.get('inserted')} "
                    f"(всего {res.get('total')})")
+            print(f"[PhaseNoise] {msg}")
             log.info(msg)
             if dpg.does_item_exist(STATUS_TEXT_TAG):
                 dpg.set_value(STATUS_TEXT_TAG, msg)
         else:
+            msg = f"Справочник актуален ({st.get('lookup_count', 0)} строк)"
+            print(f"[PhaseNoise] {msg}")
             if dpg.does_item_exist(STATUS_TEXT_TAG):
-                dpg.set_value(
-                    STATUS_TEXT_TAG,
-                    f"Справочник актуален ({st.get('lookup_count', 0)} строк)")
+                dpg.set_value(STATUS_TEXT_TAG, msg)
     except Exception as e:
+        print(f"[PhaseNoise] lookup bootstrap ERROR: {e}")
         log.exception(f"lookup bootstrap error: {e}")
         if dpg.does_item_exist(STATUS_TEXT_TAG):
             dpg.set_value(STATUS_TEXT_TAG, f"Ошибка справочника: {e}")
 
-    # --- каскад ---
-    types = get_resonator_types()
-    log.info(f"init_cascade types: {types[:10] if types else types}")
-    dpg.configure_item("pn_type", items=types)
-    if types:
-        _suppress_cascade = True
-        try:
-            dpg.set_value("pn_type", types[0])
-        finally:
-            _suppress_cascade = False
-        _on_type_change()
-    else:
-        log.warning("init_cascade: типы резонаторов пусты — каскад неактивен")
+    try:
+        types = get_resonator_types()
+        print(f"[PhaseNoise] types ({len(types)}): {types[:8]}")
+        log.info(f"init_cascade types: {types[:10] if types else types}")
+        if not dpg.does_item_exist("pn_type"):
+            print("[PhaseNoise] ERROR: pn_type combo missing")
+            log.error("pn_type combo missing")
+            return
+        dpg.configure_item("pn_type", items=types)
+        if types:
+            _suppress_cascade = True
+            try:
+                dpg.set_value("pn_type", types[0])
+            finally:
+                _suppress_cascade = False
+            _on_type_change()
+            print("[PhaseNoise] cascade filled")
+        else:
+            print("[PhaseNoise] WARN: no resonator types")
+            log.warning("init_cascade: типы резонаторов пусты")
+            if dpg.does_item_exist(STATUS_TEXT_TAG):
+                dpg.set_value(STATUS_TEXT_TAG,
+                              "Нет типов резонаторов (specification.NameR пуст)")
+    except Exception as e:
+        print(f"[PhaseNoise] cascade ERROR: {e}")
+        log.exception(f"cascade fill error: {e}")
         if dpg.does_item_exist(STATUS_TEXT_TAG):
-            dpg.set_value(STATUS_TEXT_TAG,
-                          "Нет типов резонаторов (specification.NameR пуст)")
+            dpg.set_value(STATUS_TEXT_TAG, f"Ошибка каскада: {e}")
 
 
-# ===================================================================
-# 2. Callbacks каскада
-# ===================================================================
 def _on_type_change(sender=None, app_data=None, user_data=None):
     if _suppress_cascade:
         return
     try:
         t = dpg.get_value("pn_type") or ""
         log.info(f"on_type_change: {t!r}")
+        print(f"[PhaseNoise] on_type_change: {t!r}")
         spcs = get_spc_by_type(t) if t else []
         log.info(f"  spcs: {len(spcs)}")
         dpg.configure_item("pn_spc", items=spcs)
@@ -195,6 +207,7 @@ def _on_type_change(sender=None, app_data=None, user_data=None):
         _on_spc_change()
     except Exception as e:
         log.exception(f"on_type_change error: {e}")
+        print(f"[PhaseNoise] on_type_change ERROR: {e}")
 
 
 def _on_spc_change(sender=None, app_data=None, user_data=None):
@@ -203,6 +216,7 @@ def _on_spc_change(sender=None, app_data=None, user_data=None):
     try:
         s = dpg.get_value("pn_spc") or ""
         log.info(f"on_spc_change: {s!r}")
+        print(f"[PhaseNoise] on_spc_change: {s!r}")
         if not s:
             dpg.configure_item("pn_msk", items=[ALL_MSK_LABEL])
             dpg.set_value("pn_msk", ALL_MSK_LABEL)
@@ -215,6 +229,7 @@ def _on_spc_change(sender=None, app_data=None, user_data=None):
         msks = get_msk_by_spc(s)
         mids = get_measure_ids_by_spc(s)
         log.info(f"  msks={len(msks)} mids={len(mids)}")
+        print(f"[PhaseNoise] msks={len(msks)} mids={len(mids)}")
         msk_list = [ALL_MSK_LABEL] + msks
         mid_list = [ALL_MEAS_LABEL] + [str(i) for i in mids]
         dpg.configure_item("pn_msk", items=msk_list)
@@ -225,6 +240,7 @@ def _on_spc_change(sender=None, app_data=None, user_data=None):
         _fill_norms(s)
     except Exception as e:
         log.exception(f"on_spc_change error: {e}")
+        print(f"[PhaseNoise] on_spc_change ERROR: {e}")
 
 
 def _on_msk_change(sender=None, app_data=None, user_data=None):
@@ -299,9 +315,6 @@ def _on_clear_msk_search(*_):
     _on_spc_change()
 
 
-# ===================================================================
-# 3. Нормы / статистика
-# ===================================================================
 def _fill_norms(spc: str | None):
     dpg.delete_item(NORMS_GROUP, children_only=True)
     if not spc:
@@ -366,26 +379,23 @@ def _fill_stats(measurements: pd.DataFrame, norms: list[dict]):
 
 def _on_sync_lookup(*_):
     try:
-        dpg.set_value(STATUS_TEXT_TAG, "Синхронизация справочника...")
+        print("[PhaseNoise] manual sync start")
+        dpg.set_value(STATUS_TEXT_TAG, "Синхронизация справочника (полная)...")
         try:
             dpg.split_frame()
         except Exception:
             pass
-        st = check_lookup_actual()
-        full = bool(st.get("needs_full_rebuild"))
-        res = sync_lookup_table(full_rebuild=full)
-        dpg.set_value(
-            STATUS_TEXT_TAG,
-            f"Справочник: mode={res.get('mode')} +{res.get('inserted')} "
-            f"(всего {res.get('total')})")
+        res = sync_lookup_table(full_rebuild=True)
+        msg = (f"Справочник: mode={res.get('mode')} +{res.get('inserted')} "
+               f"(всего {res.get('total')})")
+        print(f"[PhaseNoise] {msg}")
+        dpg.set_value(STATUS_TEXT_TAG, msg)
     except Exception as e:
+        print(f"[PhaseNoise] sync ERROR: {e}")
         log.exception(f"sync lookup: {e}")
         dpg.set_value(STATUS_TEXT_TAG, f"Ошибка синхронизации: {e}")
 
 
-# ===================================================================
-# 4. Загрузка
-# ===================================================================
 def _on_load(*_):
     try:
         s = dpg.get_value("pn_spc") or ""
@@ -466,9 +476,6 @@ def _on_load(*_):
         dpg.set_value(STATUS_TEXT_TAG, f"Ошибка: {e}")
 
 
-# ===================================================================
-# 5. Отрисовка
-# ===================================================================
 def _render_table(df: pd.DataFrame):
     dpg.delete_item(TABLE_CONTAINER, children_only=True)
     if df.empty:
@@ -489,7 +496,8 @@ def _render_table(df: pd.DataFrame):
 
 def _render_graph(fig):
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
     buf.seek(0)
     png = buf.read()
     buf.close()
@@ -509,9 +517,7 @@ def _render_graph(fig):
         arr = (np.asarray(img, dtype=np.float32) / 255.0).flatten().tolist()
         with dpg.texture_registry(show=False):
             dpg.add_static_texture(w, h, arr, tag="pn_graph_texture")
-        log.info(f"Graph texture (PIL): {w}x{h}")
     except ImportError:
-        log.warning("PIL недоступен — фолбэк на dpg.load_image")
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
         tmp.write(png)
         tmp.close()
@@ -519,7 +525,6 @@ def _render_graph(fig):
             w, h, _c, data = dpg.load_image(tmp.name)
             with dpg.texture_registry(show=False):
                 dpg.add_static_texture(w, h, data, tag="pn_graph_texture")
-            log.info(f"Graph texture (dpg): {w}x{h}")
         finally:
             os.unlink(tmp.name)
 
@@ -527,9 +532,6 @@ def _render_graph(fig):
                   tag=GRAPH_IMAGE_TAG)
 
 
-# ===================================================================
-# 6. PDF / закрытие
-# ===================================================================
 def _on_pdf(mode: str, *_):
     try:
         s = dpg.get_value("pn_spc") or ""
@@ -554,13 +556,19 @@ def _on_pdf(mode: str, *_):
             filepath=f"phase_noise_{mode}.pdf")
         dpg.set_value(STATUS_TEXT_TAG,
                       f"PDF сохранён: phase_noise_{mode}.pdf")
-        log.info(f"PDF exported: phase_noise_{mode}.pdf")
     except Exception as e:
         log.exception(f"PDF error: {e}")
         dpg.set_value(STATUS_TEXT_TAG, f"PDF ошибка: {e}")
 
 
 def _on_close(*_):
-    log.info("close window")
+    log.info("close window — delete")
+    print("[PhaseNoise] close/delete window")
     if dpg.does_item_exist(WINDOW_TAG):
-        dpg.configure_item(WINDOW_TAG, show=False)
+        try:
+            dpg.delete_item(WINDOW_TAG)
+        except Exception:
+            try:
+                dpg.configure_item(WINDOW_TAG, show=False)
+            except Exception:
+                pass

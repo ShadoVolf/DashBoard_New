@@ -27,15 +27,22 @@ def _register_for_window_manager():
 
 
 def create_phase_noise_window(dpg_ctx=None):
+    # если окно уже есть — показать и ПЕРЕЗАПУСТИТЬ каскад
     if dpg.does_item_exist(WINDOW_TAG):
+        log.info("Окно ФШ уже существует — show + init_cascade")
         dpg.configure_item(WINDOW_TAG, show=True)
         try:
             dpg.focus_item(WINDOW_TAG)
         except Exception:
             pass
+        try:
+            init_cascade()
+        except Exception as e:
+            log.exception(f"init_cascade on reopen: {e}")
         return
 
     log.info("Создание окна фазовых шумов")
+    print("[PhaseNoise] Создание окна...")
     sw, sh = _layout.screen_size()
     margin = 8
     w = max(1200, sw - margin * 2)
@@ -61,7 +68,17 @@ def create_phase_noise_window(dpg_ctx=None):
                                   tag=INFO_PANEL_TAG):
                 build_info_panel()
 
-    # каскад + sync справочника после создания всех items
-    init_cascade()
+    try:
+        init_cascade()
+    except Exception as e:
+        log.exception(f"init_cascade failed: {e}")
+        print(f"[PhaseNoise] init_cascade ERROR: {e}")
+        try:
+            if dpg.does_item_exist(STATUS_TEXT_TAG):
+                dpg.set_value(STATUS_TEXT_TAG, f"Ошибка инициализации: {e}")
+        except Exception:
+            pass
+
     _register_for_window_manager()
     log.info("Окно фазовых шумов создано")
+    print("[PhaseNoise] Окно создано")
