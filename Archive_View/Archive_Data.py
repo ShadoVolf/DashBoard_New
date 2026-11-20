@@ -51,6 +51,12 @@ _PARAM_ALIASES = {
     'Rmax_Rmin': 'Rmax/Rmin', 'RmaxRmin': 'Rmax/Rmin',
     'Tmax': 'extr_1', 'Tmin': 'extr_2',
     'TurnOver': 'TurnOver_1',
+    # NEW: фазовый шум — явные алиасы, чтобы не полагаться на fuzzy
+    'Shum': 'Shum',
+    'Shum1': 'Shum_1',
+    'Shum2': 'Shum_2',
+    'Shum3': 'Shum_3',
+    'Shum4': 'Shum_4',
 }
 # Если основная колонка psidata содержит NULL — берём значение из резервной.
 # Ключ — имя параметра как он приходит из спецификации, значение — резервная колонка.
