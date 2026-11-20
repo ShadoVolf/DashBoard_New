@@ -91,9 +91,9 @@ def set_current_number(number: str, update_combo: bool = True) -> None:
     if dpg.does_item_exist(STATUS_TEXT_TAG):
         dpg.set_value(
             STATUS_TEXT_TAG,
-            f"График: № {_current_number} · кривых в выборке "
-            f"{n_sel}/{len(_series_selected)} · "
-            f"номеров {len(_numbers)} (колесо мыши — смена номера)",
+            f"График: N {_current_number} - кривых в выборке "
+            f"{n_sel}/{len(_series_selected)} - "
+            f"номеров {len(_numbers)} (колесо мыши - смена номера)",
         )
 
 
@@ -173,7 +173,7 @@ def render_series_table(meas: pd.DataFrame, series: list[tuple[int, str]]):
         dpg.add_button(label="Все", width=70, callback=lambda: on_select_all(True))
         dpg.add_button(label="Снять все", width=90, callback=lambda: on_select_all(False))
         dpg.add_text(
-            f"  кривых: {len(series)} · номер графика: {_current_number or '—'}",
+            f"  кривых: {len(series)} - номер графика: {_current_number or '-'}",
             color=(150, 200, 255),
         )
 
@@ -197,7 +197,7 @@ def render_series_table(meas: pd.DataFrame, series: list[tuple[int, str]]):
                    policy=dpg.mvTable_SizingStretchProp,
                    scrollY=True, height=-1,
                    borders_innerH=True, borders_outerH=True):
-        dpg.add_table_column(label="✓", width_fixed=True, init_width_or_weight=36)
+        dpg.add_table_column(label="+", width_fixed=True, init_width_or_weight=36)
         dpg.add_table_column(label="MeasureID", width_fixed=True, init_width_or_weight=90)
         dpg.add_table_column(label="N")
         dpg.add_table_column(label="МСК")
