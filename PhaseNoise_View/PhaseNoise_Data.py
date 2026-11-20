@@ -1,4 +1,4 @@
-"""SQL-слой ФШ. Все ошибки логируются, не падают в UI."""
+"""SQL-слой ФШ. Каскад МСК/номеров — через справочник."""
 
 import logging
 import re
@@ -24,8 +24,6 @@ def _q(sql_str: str, params: dict | None = None, label: str = "") -> pd.DataFram
     try:
         df = pd.read_sql(text(sql_str), _engine(), params=params or {})
         log.debug(f"SQL[{label}] -> {len(df)} rows")
-        if not df.empty:
-            log.debug(f"SQL[{label}] cols={list(df.columns)}")
         return df
     except Exception as e:
         log.error(f"SQL[{label}] ERROR: {e}")
@@ -63,8 +61,22 @@ def get_spc_by_type(res_type: str) -> list[str]:
 
 
 def get_msk_by_spc(spc: str) -> list[str]:
+    """Список МСК по спеке — из справочника."""
     if not spc:
         return []
+    try:
+        from .PhaseNoise_Lookup import (
+            lookup_msk_by_spc, ensure_lookup_table, is_lookup_empty,
+        )
+        ensure_lookup_table()
+        if not is_lookup_empty():
+            found = lookup_msk_by_spc(spc)
+            if found:
+                log.debug(f"msk_by_spc[{spc}] lookup -> {len(found)}")
+                return found
+    except Exception as e:
+        log.warning(f"lookup msk_by_spc failed: {e}")
+
     df = _q(
         "SELECT DISTINCT MSK FROM `phaze_noise` "
         "WHERE Spc = :s AND `Delete` = 0 AND MSK IS NOT NULL "
@@ -77,6 +89,18 @@ def get_msk_by_spc(spc: str) -> list[str]:
 def get_measure_ids_by_spc(spc: str) -> list[int]:
     if not spc:
         return []
+    try:
+        from .PhaseNoise_Lookup import (
+            lookup_mids_by_spc, ensure_lookup_table, is_lookup_empty,
+        )
+        ensure_lookup_table()
+        if not is_lookup_empty():
+            found = lookup_mids_by_spc(spc)
+            if found:
+                return found
+    except Exception as e:
+        log.warning(f"lookup mids_by_spc failed: {e}")
+
     df = _q(
         "SELECT DISTINCT MeasureID FROM `phaze_noise` "
         "WHERE Spc = :s AND `Delete` = 0 AND MeasureID IS NOT NULL "
@@ -89,6 +113,18 @@ def get_measure_ids_by_spc(spc: str) -> list[int]:
 def get_measure_ids_by_msk(msk: str) -> list[int]:
     if not msk:
         return []
+    try:
+        from .PhaseNoise_Lookup import (
+            lookup_mids_by_msk, ensure_lookup_table, is_lookup_empty,
+        )
+        ensure_lookup_table()
+        if not is_lookup_empty():
+            found = lookup_mids_by_msk(msk)
+            if found:
+                return found
+    except Exception as e:
+        log.warning(f"lookup mids_by_msk failed: {e}")
+
     df = _q(
         "SELECT DISTINCT MeasureID FROM `phaze_noise` "
         "WHERE MSK = :m AND `Delete` = 0 AND MeasureID IS NOT NULL "
@@ -99,6 +135,18 @@ def get_measure_ids_by_msk(msk: str) -> list[int]:
 
 
 def get_numbers(msk: str | None, measure_id: int | None, spc: str | None) -> list[str]:
+    try:
+        from .PhaseNoise_Lookup import (
+            lookup_numbers, ensure_lookup_table, is_lookup_empty,
+        )
+        ensure_lookup_table()
+        if not is_lookup_empty():
+            found = lookup_numbers(msk=msk, measure_id=measure_id, spc=spc)
+            if found:
+                return found
+    except Exception as e:
+        log.warning(f"lookup numbers failed: {e}")
+
     cond = ["`Delete` = 0", "N IS NOT NULL"]
     params: dict = {}
     if spc:
@@ -119,24 +167,21 @@ def get_numbers(msk: str | None, measure_id: int | None, spc: str | None) -> lis
 
 
 def search_msk_partial(query: str, spc: str | None = None, limit: int = 200) -> list[str]:
-    """Поиск МСК по части номера. Сначала пробуем lookup, иначе прямой SQL."""
+    """Поиск МСК по части — только справочник (без тяжёлого запроса к phaze_noise)."""
     q = (query or "").strip()
     if not q:
         return []
     try:
-        from .PhaseNoise_Lookup import find_msk_by_partial, ensure_lookup_table, is_lookup_empty
+        from .PhaseNoise_Lookup import find_msk_by_partial, ensure_lookup_table
         ensure_lookup_table()
-        if not is_lookup_empty():
-            found = find_msk_by_partial(q, limit=limit)
-            if found:
-                if spc:
-                    # отфильтровать по спеке
-                    all_for_spc = set(get_msk_by_spc(spc))
-                    found = [m for m in found if m in all_for_spc]
-                return found[:limit]
+        found = find_msk_by_partial(q, spc=spc, limit=limit)
+        log.info(f"msk_partial '{q}' spc={spc!r} lookup -> {len(found)}")
+        if found:
+            return found[:limit]
     except Exception as e:
-        log.warning(f"lookup partial MSK failed, fallback SQL: {e}")
+        log.warning(f"lookup partial MSK failed: {e}")
 
+    # fallback только если справочник пуст/ошибка
     cond = ["`Delete` = 0", "MSK IS NOT NULL", "MSK LIKE :q"]
     params = {"q": f"%{q}%"}
     if spc:
@@ -145,14 +190,13 @@ def search_msk_partial(query: str, spc: str | None = None, limit: int = 200) -> 
     df = _q(
         f"SELECT DISTINCT MSK FROM `phaze_noise` WHERE {' AND '.join(cond)} "
         f"ORDER BY MSK LIMIT {int(limit)}",
-        params, label="msk_partial")
+        params, label="msk_partial_fallback")
     if df.empty:
         return []
     return df["MSK"].dropna().astype(str).tolist()
 
 
 def parse_numbers_input(raw: str) -> list[str]:
-    """Разбор ввода номеров: одиночный / список / диапазон."""
     if not raw or not str(raw).strip():
         return []
     text = str(raw).strip().upper().replace(";", ",").replace(" ", "")
@@ -163,7 +207,6 @@ def parse_numbers_input(raw: str) -> list[str]:
             a, _, b = p.partition("-")
             a, b = a.strip(), b.strip()
             if a and b:
-                # простой числовой диапазон или буквенно-цифровой префикс
                 m_a = re.match(r"^([A-Z]*)(\d+)$", a)
                 m_b = re.match(r"^([A-Z]*)(\d+)$", b)
                 if m_a and m_b and m_a.group(1) == m_b.group(1):
@@ -175,7 +218,6 @@ def parse_numbers_input(raw: str) -> list[str]:
                         result.append(f"{prefix}{i}")
                     continue
         result.append(p)
-    # уникальные с сохранением порядка
     seen = set()
     out = []
     for n in result:
@@ -189,9 +231,7 @@ def parse_numbers_input(raw: str) -> list[str]:
 def load_phaze_noise(msk: str | None = None, measure_id: int | None = None,
                      n: str | None = None,
                      numbers: list[str] | None = None) -> pd.DataFrame:
-    """Загрузка заголовков. Приоритет: numbers > measure_id > msk."""
     if numbers:
-        # через lookup если возможно
         try:
             from .PhaseNoise_Lookup import find_in_lookup, ensure_lookup_table
             ensure_lookup_table()
@@ -207,11 +247,9 @@ def load_phaze_noise(msk: str | None = None, measure_id: int | None = None,
         except Exception as e:
             log.warning(f"lookup numbers failed, fallback: {e}")
 
-        # fallback по N
         nums = [str(x).strip().upper() for x in numbers if x]
         if not nums:
             return pd.DataFrame()
-        # IN с параметрами неудобен — соберём безопасно
         in_list = ",".join(f"'{n.replace(chr(39), '')}'" for n in nums)
         return _q(
             f"SELECT * FROM `phaze_noise` WHERE `Delete` = 0 "
@@ -240,7 +278,6 @@ def load_phaze_noise(msk: str | None = None, measure_id: int | None = None,
 def load_phaze_noise_data(msk: str | None = None, measure_id: int | None = None,
                           n: str | None = None,
                           measure_ids: list[int] | None = None) -> pd.DataFrame:
-    """Точки графика. Поле Msk с маленькой 's' в таблице phaze_noise_data."""
     if measure_ids:
         ids = [int(x) for x in measure_ids if x]
         if not ids:
@@ -256,7 +293,7 @@ def load_phaze_noise_data(msk: str | None = None, measure_id: int | None = None,
         cond.append("MeasureID = :mid")
         params["mid"] = measure_id
     elif msk:
-        cond.append("Msk = :msk")  # поле с маленькой 's'!
+        cond.append("Msk = :msk")
         params["msk"] = msk
     if n:
         cond.append("N = :n")
@@ -285,7 +322,6 @@ def get_operator_fname(login: str) -> str:
     return "" if df.empty else str(df.iloc[0]["Fname"] or "")
 
 
-# ---------------------------------------------------------------- нормы
 def build_norms(spec_row: dict | None) -> list[dict]:
     if not spec_row:
         return []
@@ -328,7 +364,6 @@ def _is_true(v) -> bool:
     return str(v).lower() in ("1", "true", "да")
 
 
-# ---------------------------------------------------------------- lookup (старые GROUP_CONCAT для диалогов)
 def load_msk_lookup(query: str = "") -> pd.DataFrame:
     where = ["`Delete` = 0", "MSK IS NOT NULL"]
     params = {}
