@@ -290,6 +290,11 @@ def _build_graphs_pages(measurements, norms, group_mode, styles) -> list:
         points = load_phaze_noise_data(measure_ids=mids)
         if points.empty:
             continue
+        points = points[
+            points["N"].astype(str).str.strip().str.upper() == n.upper()
+        ]
+        if points.empty:
+            continue
 
         operators = {}
         for _, m in sub_meas.iterrows():
@@ -324,37 +329,35 @@ def _build_graphs_pages(measurements, norms, group_mode, styles) -> list:
     cell_w = page_w / 2 - 4 * mm
     cell_h = page_h / 3 - 6 * mm
 
+    def _cell(n: str | None, buf) -> Table:
+        if n is None or buf is None:
+            return Table([[""]], colWidths=[cell_w])
+        img = Image(buf, width=cell_w, height=cell_h, kind="proportional")
+        return Table(
+            [[Paragraph(f"N {n}", styles["small"])], [img]],
+            colWidths=[cell_w],
+        )
+
     for page_start in range(0, len(images), 6):
-        chunk = images[page_start: page_start + 6]
-        rows = []
-        row = []
-        for n, buf in chunk:
-            img = Image(buf, width=cell_w, height=cell_h, kind="proportional")
-            cell = [Paragraph(f"N {n}", styles["small"]), img]
-            row.append(cell)
-            if len(row) == 2:
-                rows.append(row)
-                row = []
-        if row:
-            while len(row) < 2:
-                row.append([Paragraph("", styles["small"])])
-            rows.append(row)
+        chunk = list(images[page_start: page_start + 6])
+        while len(chunk) % 2:
+            chunk.append((None, None))
 
         table_data = []
-        for r in rows:
-            table_data.append([
-                Table([[c[0]], [c[1]]], colWidths=[cell_w]) for c in r
-            ])
+        for i in range(0, len(chunk), 2):
+            n1, b1 = chunk[i]
+            n2, b2 = chunk[i + 1]
+            table_data.append([_cell(n1, b1), _cell(n2, b2)])
 
-        t = Table(table_data, colWidths=[page_w / 2, page_w / 2])
-        t.setStyle(TableStyle([
+        tbl = Table(table_data, colWidths=[page_w / 2, page_w / 2])
+        tbl.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("LEFTPADDING", (0, 0), (-1, -1), 2),
             ("RIGHTPADDING", (0, 0), (-1, -1), 2),
             ("TOPPADDING", (0, 0), (-1, -1), 2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
         ]))
-        flow.append(t)
+        flow.append(tbl)
         if page_start + 6 < len(images):
             flow.append(PageBreak())
 
