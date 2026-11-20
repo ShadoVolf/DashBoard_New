@@ -38,6 +38,7 @@ NO_RESONATOR    = "<любой>"
 
 STATUS_OK   = "Годен"
 STATUS_FAIL = "Брак"
+STATUS_NA   = "н/д"
 
 # Цвета точек норм (как Series3..Series6 в DFM)
 NORM_COLORS = ["teal", "blue", "green", "purple", "orange"]
