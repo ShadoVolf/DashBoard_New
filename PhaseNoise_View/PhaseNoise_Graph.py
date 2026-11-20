@@ -1,8 +1,8 @@
 """Построение графика ФШ нативным dpg.plot.
 
-X = отстройка, Гц (логарифмическая ось), 1 Гц .. 100 кГц.
-Y = PN, дБ/Гц.
-Линии серий без маркеров; точки только у норм.
+X = отстройка, Гц (логарифмическая ось).
+Масштаб X: если нет данных на 1 Гц — старт с 10 / 100 / ...
+Y = PN, дБ/Гц. Линии без маркеров; точки только у норм.
 """
 
 from __future__ import annotations
@@ -29,6 +29,8 @@ BIG_CONTAINER_TAG = "pn_graph_big_container"
 DEFAULT_X_MIN_HZ = 1.0
 DEFAULT_X_MAX_HZ = 100_000.0
 
+STANDARD_OFFSETS_HZ = [1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0]
+
 LINE_WEIGHT = 1.5
 NORM_MARKER_SIZE = 5.0
 
@@ -44,6 +46,25 @@ SERIES_COLORS = [
     (255, 140, 80, 255),
     (140, 140, 255, 255),
 ]
+
+
+def _x_limits_from_data(freqs: list[float],
+                        x_min_default: float = DEFAULT_X_MIN_HZ,
+                        x_max_default: float = DEFAULT_X_MAX_HZ) -> tuple[float, float]:
+    """Масштаб X по данным: старт с первой отстройки, где есть точки."""
+    if not freqs:
+        return max(x_min_default, 1e-12), max(x_max_default, x_min_default * 10)
+    data_min = min(freqs)
+    data_max = max(freqs)
+    start = data_min
+    for off in STANDARD_OFFSETS_HZ:
+        if data_min >= off * 0.9:
+            start = off
+        else:
+            break
+    lo = max(start, 1e-12)
+    hi = x_max_default if data_max < x_max_default else max(data_max, lo * 10)
+    return lo, hi
 
 
 def series_key(mid, n) -> str:
@@ -161,7 +182,6 @@ def render_graph(
         anti_aliased=True,
         no_menus=False,
     ):
-        # в режиме msk легенда не нужна (много кривых)
         if group_mode != "msk":
             dpg.add_plot_legend(location=dpg.mvPlot_Location_NorthEast)
         dpg.add_plot_axis(
@@ -189,6 +209,7 @@ def render_graph(
                 ]
 
             all_ys: list[float] = []
+            all_xs: list[float] = []
             for i, (mid, n) in enumerate(pairs):
                 sub = graph_df[
                     (graph_df["MeasureID"] == mid)
@@ -209,6 +230,7 @@ def render_graph(
                     ys.append(yv)
                 if not xs:
                     continue
+                all_xs.extend(xs)
                 all_ys.extend(ys)
 
                 m = meta.get(series_key(mid, n)) or meta.get(mid) or {}
@@ -251,7 +273,11 @@ def render_graph(
                         pass
                     all_ys.append(float(np_["value"]))
 
-            _apply_x_limits(x_tag, x_min_hz, x_max_hz)
+            if all_xs:
+                lo, hi = _x_limits_from_data(all_xs, x_min_hz, x_max_hz)
+                _apply_x_limits(x_tag, lo, hi)
+            else:
+                _apply_x_limits(x_tag, x_min_hz, x_max_hz)
             if all_ys:
                 ymin = min(all_ys)
                 ymax = max(all_ys)
@@ -445,7 +471,16 @@ def build_graph(
                            color=color, marker=marker, s=NORM_S, zorder=5)
 
     ax.set_xscale("log")
-    ax.set_xlim(DEFAULT_X_MIN_HZ, DEFAULT_X_MAX_HZ)
+    try:
+        xs_all = []
+        for line in ax.get_lines():
+            xd = line.get_xdata()
+            if xd is not None and len(xd):
+                xs_all.extend([float(v) for v in xd if v is not None and float(v) > 0])
+        lo, hi = _x_limits_from_data(xs_all)
+        ax.set_xlim(lo, hi)
+    except Exception:
+        ax.set_xlim(DEFAULT_X_MIN_HZ, DEFAULT_X_MAX_HZ)
     ax.set_xlabel("Отстройка, Гц", fontsize=8)
     ax.set_ylabel("PN, дБ/Гц", fontsize=8)
     if group_mode != "msk" and ax.get_legend_handles_labels()[0]:
