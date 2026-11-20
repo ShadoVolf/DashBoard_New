@@ -8,7 +8,6 @@ from .PhaseNoise_Constants import (
 
 
 def data_value_at_offset(meas_row: dict, offset: int) -> float | None:
-    """Аналог ветвлений if ShOT==1 -> Shum1, ... в PhazeNoise.cpp."""
     field = OFFSET_TO_FIELD.get(offset)
     if not field:
         return None
@@ -19,11 +18,6 @@ def data_value_at_offset(meas_row: dict, offset: int) -> float | None:
 
 
 def calc_status(data: float | None, vmin: float | None, vmax: float | None) -> str:
-    """
-    Аналог проверки в C++:
-        if ShMax!='no' and fabs(data) > ShMax -> Брак
-        if ShMin!='no' and fabs(data) < ShMin -> Брак
-    """
     if data is None:
         return STATUS_NA
     a = abs(data)
@@ -35,17 +29,13 @@ def calc_status(data: float | None, vmin: float | None, vmax: float | None) -> s
 
 
 def collect_norm_points(meas_row: dict, norms: list[dict]) -> list[dict]:
-    """
-    Возвращает список точек для наложения на график:
-        { "num", "offset", "value", "status", "min", "max", "marker_text" }
-    """
     pts = []
     for nm in norms:
         v = data_value_at_offset(meas_row, nm["offset"])
         st = calc_status(v, nm["min"], nm["max"])
         marker = (
             f"{nm['num']} {_fmt_hz(nm['offset'])}   "
-            f"{'-' if v is None else f'{v:0.2f}'}  {st}"
+            f"{'---' if v is None else f'{v:0.2f}'}  {st}"
         )
         pts.append({
             "num": nm["num"],
@@ -60,7 +50,6 @@ def collect_norm_points(meas_row: dict, norms: list[dict]) -> list[dict]:
 
 
 def build_summary_table(measurements: pd.DataFrame, norms: list[dict]) -> pd.DataFrame:
-    """Сводная таблица по отстройкам для UI/Excel/PDF."""
     rows = []
     for _, m in measurements.iterrows():
         row = {
@@ -83,7 +72,6 @@ def build_summary_table(measurements: pd.DataFrame, norms: list[dict]) -> pd.Dat
 
 
 def build_offset_stats(measurements: pd.DataFrame, norms: list[dict]) -> list[dict]:
-    """Статистика по каждой активной отстройке."""
     result = []
     if measurements is None or measurements.empty or not norms:
         return result
@@ -120,10 +108,7 @@ def build_offset_stats(measurements: pd.DataFrame, norms: list[dict]) -> list[di
         s = pd.Series(vals_raw, dtype=float)
         mean = float(s.mean())
         std = float(s.std(ddof=1)) if n >= 2 else 0.0
-        vmin = nm["min"]
-        vmax = nm["max"]
-        cpk = _calc_cpk(mean, std, vmin, vmax)
-
+        cpk = _calc_cpk(mean, std, nm["min"], nm["max"])
         result.append({
             "num": nm["num"],
             "offset": nm["offset"],
@@ -138,16 +123,13 @@ def build_offset_stats(measurements: pd.DataFrame, norms: list[dict]) -> list[di
             "n_fail": n_fail,
             "pct_good": 100.0 * n_good / n if n else None,
             "cpk": cpk,
-            "vmin": vmin,
-            "vmax": vmax,
+            "vmin": nm["min"],
+            "vmax": nm["max"],
         })
     return result
 
 
 def overall_yield(measurements: pd.DataFrame, norms: list[dict]) -> dict:
-    """
-    Общий выход годных: измерение годно, только если все активные нормы OK.
-    """
     if measurements is None or measurements.empty:
         return {"n_total": 0, "n_good": 0, "n_fail": 0, "pct_good": None}
     n_total = 0
@@ -196,8 +178,8 @@ def _fmt_hz(hz: int) -> str:
 
 def _fmt_num(v, digits: int = 2) -> str:
     if v is None or (isinstance(v, float) and math.isnan(v)):
-        return "-"
+        return "---"
     try:
         return f"{float(v):.{digits}f}"
     except (TypeError, ValueError):
-        return "-"
+        return "---"
