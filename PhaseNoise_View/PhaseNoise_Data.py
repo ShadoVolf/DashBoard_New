@@ -66,9 +66,9 @@ def get_msk_by_spc(spc: str) -> list[str]:
         return []
     try:
         from .PhaseNoise_Lookup import (
-            lookup_msk_by_spc, ensure_lookup_table, is_lookup_empty,
+            lookup_msk_by_spc, is_lookup_empty,
         )
-        ensure_lookup_table()
+
         if not is_lookup_empty():
             found = lookup_msk_by_spc(spc)
             if found:
@@ -91,9 +91,9 @@ def get_measure_ids_by_spc(spc: str) -> list[int]:
         return []
     try:
         from .PhaseNoise_Lookup import (
-            lookup_mids_by_spc, ensure_lookup_table, is_lookup_empty,
+            lookup_mids_by_spc,  is_lookup_empty,
         )
-        ensure_lookup_table()
+
         if not is_lookup_empty():
             found = lookup_mids_by_spc(spc)
             if found:
@@ -115,9 +115,9 @@ def get_measure_ids_by_msk(msk: str) -> list[int]:
         return []
     try:
         from .PhaseNoise_Lookup import (
-            lookup_mids_by_msk, ensure_lookup_table, is_lookup_empty,
+            lookup_mids_by_msk,  is_lookup_empty,
         )
-        ensure_lookup_table()
+
         if not is_lookup_empty():
             found = lookup_mids_by_msk(msk)
             if found:
@@ -137,9 +137,9 @@ def get_measure_ids_by_msk(msk: str) -> list[int]:
 def get_numbers(msk: str | None, measure_id: int | None, spc: str | None) -> list[str]:
     try:
         from .PhaseNoise_Lookup import (
-            lookup_numbers, ensure_lookup_table, is_lookup_empty,
+            lookup_numbers,  is_lookup_empty,
         )
-        ensure_lookup_table()
+
         if not is_lookup_empty():
             found = lookup_numbers(msk=msk, measure_id=measure_id, spc=spc)
             if found:
@@ -172,8 +172,8 @@ def search_msk_partial(query: str, spc: str | None = None, limit: int = 200) -> 
     if not q:
         return []
     try:
-        from .PhaseNoise_Lookup import find_msk_by_partial, ensure_lookup_table
-        ensure_lookup_table()
+        from .PhaseNoise_Lookup import find_msk_by_partial
+
         found = find_msk_by_partial(q, spc=spc, limit=limit)
         log.info(f"msk_partial '{q}' spc={spc!r} lookup -> {len(found)}")
         if found:
@@ -233,8 +233,8 @@ def load_phaze_noise(msk: str | None = None, measure_id: int | None = None,
                      numbers: list[str] | None = None) -> pd.DataFrame:
     if numbers:
         try:
-            from .PhaseNoise_Lookup import find_in_lookup, ensure_lookup_table
-            ensure_lookup_table()
+            from .PhaseNoise_Lookup import find_in_lookup
+
             _, mids, _ = find_in_lookup(numbers)
             if mids:
                 ids = sorted(mids)

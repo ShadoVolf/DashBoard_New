@@ -19,13 +19,62 @@ LOOKUP_TABLE = "phaze_noise_resonator_lookup"
 META_TABLE = "phaze_noise_resonator_lookup_meta"
 
 
-def _engine():
-    return create_engine(str(get_connection_string()))
+from sqlalchemy.engine import Engine
+
+_engine_cache: Engine | None = None
+
+
+def _engine() -> Engine:
+    global _engine_cache
+    if _engine_cache is None:
+        _engine_cache = create_engine(
+            str(get_connection_string()),
+            connect_args={
+                "connect_timeout": 5,
+                "read_timeout": 60,
+                "write_timeout": 60,
+            },
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=2,
+        )
+    return _engine_cache
+
+
+_ensured_tables: set[str] = set()
 
 
 def ensure_lookup_table(engine=None):
-    """Создаёт таблицы; при необходимости добавляет колонку spc."""
+    """Создаёт таблицы только если их реально нет (без DDL на существующих)."""
+    global _ensured_tables
     engine = engine or _engine()
+    if LOOKUP_TABLE in _ensured_tables:
+        return
+
+    # 1) Проверка через information_schema — DDL нет, metadata lock не ждём
+    with engine.connect() as conn:
+        exists = conn.execute(text(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema = DATABASE() AND table_name = :t"
+        ), {"t": LOOKUP_TABLE}).scalar() or 0
+        meta_exists = conn.execute(text(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema = DATABASE() AND table_name = :t"
+        ), {"t": META_TABLE}).scalar() or 0
+        col_exists = 0
+        if exists:
+            col_exists = conn.execute(text(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = :t "
+                "AND column_name = 'spc'"
+            ), {"t": LOOKUP_TABLE}).scalar() or 0
+
+    if exists and meta_exists and col_exists:
+        _ensured_tables.add(LOOKUP_TABLE)
+        return
+
+    # 2) DDL — только если реально надо. Сюда попадаем один раз на процесс.
+    log.info("ensure_lookup_table: creating/migrating")
     with engine.begin() as conn:
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS `{LOOKUP_TABLE}` (
@@ -44,21 +93,12 @@ def ensure_lookup_table(engine=None):
               DEFAULT CHARSET=cp1251
               COLLATE=cp1251_general_ci
         """))
-        # миграция: колонка spc для уже созданной таблицы
-        try:
-            cols = conn.execute(text(
-                f"SHOW COLUMNS FROM `{LOOKUP_TABLE}` LIKE 'spc'"
-            )).fetchall()
-            if not cols:
-                conn.execute(text(
-                    f"ALTER TABLE `{LOOKUP_TABLE}` "
-                    f"ADD COLUMN `spc` VARCHAR(128) DEFAULT NULL AFTER `msk`, "
-                    f"ADD KEY `idx_spc` (`spc`)"
-                ))
-                log.info("lookup: added column spc")
-        except Exception as e:
-            log.warning(f"lookup spc migration: {e}")
-
+        if exists and not col_exists:
+            conn.execute(text(
+                f"ALTER TABLE `{LOOKUP_TABLE}` "
+                f"ADD COLUMN `spc` VARCHAR(128) DEFAULT NULL AFTER `msk`, "
+                f"ADD KEY `idx_spc` (`spc`)"
+            ))
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS `{META_TABLE}` (
                 `id` TINYINT NOT NULL DEFAULT 1,
@@ -68,6 +108,22 @@ def ensure_lookup_table(engine=None):
                 PRIMARY KEY (`id`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8
         """))
+    _ensured_tables.add(LOOKUP_TABLE)
+
+
+def is_lookup_empty(engine=None):
+    """НЕ создаёт таблицу. Если её нет — считаем пустой."""
+    engine = engine or _engine()
+    try:
+        with engine.connect() as conn:
+            cnt = conn.execute(
+                text(f"SELECT COUNT(*) FROM `{LOOKUP_TABLE}`")
+            ).scalar()
+        return not cnt
+    except Exception as e:
+        log.debug(f"is_lookup_empty: {e}")
+        return True
+
 
 
 def _read_meta(engine):
@@ -102,14 +158,6 @@ def _write_meta(engine, last_max_id, row_count):
         })
 
 
-def is_lookup_empty(engine=None):
-    engine = engine or _engine()
-    ensure_lookup_table(engine)
-    with engine.connect() as conn:
-        cnt = conn.execute(
-            text(f"SELECT COUNT(*) FROM `{LOOKUP_TABLE}`")
-        ).scalar()
-    return not cnt
 
 
 def _scan_range(engine, start_id, end_id, chunk_size, progress_callback,
@@ -134,8 +182,6 @@ def _scan_range(engine, start_id, end_id, chunk_size, progress_callback,
 
 def fill_lookup_table(chunk_size=50_000, progress_callback=None):
     engine = _engine()
-    ensure_lookup_table(engine)
-
     with engine.begin() as conn:
         conn.execute(text(f"TRUNCATE TABLE `{LOOKUP_TABLE}`"))
 
@@ -172,7 +218,7 @@ def sync_lookup_table(full_rebuild=False, chunk_size=50_000,
                 "mode": "full"}
 
     engine = _engine()
-    ensure_lookup_table(engine)
+
     meta = _read_meta(engine)
     last_id = meta["last_max_id"]
 
@@ -233,7 +279,7 @@ def sync_lookup_table(full_rebuild=False, chunk_size=50_000,
 
 def check_lookup_actual():
     engine = _engine()
-    ensure_lookup_table(engine)
+
     meta = _read_meta(engine)
 
     with engine.connect() as conn:
@@ -276,7 +322,6 @@ def lookup_msk_by_spc(spc: str) -> list[str]:
     if not spc:
         return []
     engine = _engine()
-    ensure_lookup_table(engine)
     try:
         df = pd.read_sql(text(f"""
             SELECT DISTINCT msk FROM `{LOOKUP_TABLE}`
@@ -285,7 +330,7 @@ def lookup_msk_by_spc(spc: str) -> list[str]:
         """), engine, params={"s": spc})
         return df["msk"].dropna().astype(str).tolist()
     except Exception as e:
-        log.error(f"lookup_msk_by_spc: {e}")
+        log.debug(f"lookup_msk_by_spc: {e}")
         return []
 
 
@@ -293,7 +338,6 @@ def lookup_mids_by_spc(spc: str) -> list[int]:
     if not spc:
         return []
     engine = _engine()
-    ensure_lookup_table(engine)
     try:
         df = pd.read_sql(text(f"""
             SELECT DISTINCT measure_id FROM `{LOOKUP_TABLE}`
@@ -310,7 +354,6 @@ def lookup_mids_by_msk(msk: str) -> list[int]:
     if not msk:
         return []
     engine = _engine()
-    ensure_lookup_table(engine)
     try:
         df = pd.read_sql(text(f"""
             SELECT DISTINCT measure_id FROM `{LOOKUP_TABLE}`
@@ -326,7 +369,7 @@ def lookup_mids_by_msk(msk: str) -> list[int]:
 def lookup_numbers(msk: str | None = None, measure_id: int | None = None,
                    spc: str | None = None) -> list[str]:
     engine = _engine()
-    ensure_lookup_table(engine)
+
     cond = ["n_normalized IS NOT NULL"]
     params = {}
     if measure_id:
@@ -352,7 +395,7 @@ def lookup_numbers(msk: str | None = None, measure_id: int | None = None,
 
 def find_in_lookup(numbers, engine=None):
     engine = engine or _engine()
-    ensure_lookup_table(engine)
+
 
     numbers_list = [str(n).strip().upper() for n in numbers if n]
     if not numbers_list:
@@ -386,7 +429,7 @@ def find_msk_by_partial(query: str, spc: str | None = None,
                        limit: int = 200, engine=None) -> list[str]:
     """Поиск МСК по части — только справочник."""
     engine = engine or _engine()
-    ensure_lookup_table(engine)
+
     q = (query or "").strip()
     if not q:
         return []
@@ -413,7 +456,7 @@ def add_pairs_to_lookup(pairs, engine=None):
     if not pairs:
         return 0
     engine = engine or _engine()
-    ensure_lookup_table(engine)
+
 
     clean = set()
     for item in pairs:

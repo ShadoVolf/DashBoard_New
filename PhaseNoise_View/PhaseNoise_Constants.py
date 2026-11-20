@@ -41,3 +41,21 @@ STATUS_FAIL = "Брак"
 
 # Цвета точек норм (как Series3..Series6 в DFM)
 NORM_COLORS = ["teal", "blue", "green", "purple", "orange"]
+# --- Справочник: состояние и теги UI ---
+LOOKUP_STATUS_TAG = "phase_noise_lookup_status"
+
+# Общее состояние фоновой синхронизации (аналог _lookup_sync_state из Архива)
+LOOKUP_SYNC_STATE = {
+    "running": False,
+    "done": False,
+    "message": "",
+    "error": None,
+}
+# Цвета точек норм в формате RGBA (для dpg.plot)
+NORM_COLORS_RGBA = [
+    (0, 128, 128, 255),   # teal
+    (0, 0, 255, 255),     # blue
+    (0, 128, 0, 255),     # green
+    (128, 0, 128, 255),   # purple
+    (255, 165, 0, 255),   # orange
+]

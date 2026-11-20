@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import tempfile
+import threading            # <-- добавлено
 
 import dearpygui.dearpygui as dpg
 import pandas as pd
@@ -13,6 +14,7 @@ from .PhaseNoise_Constants import (
     GRAPH_CONTAINER, GRAPH_IMAGE_TAG, TABLE_CONTAINER,
     STATUS_TEXT_TAG, ALL_MSK_LABEL, ALL_MEAS_LABEL, WINDOW_TAG,
     NORMS_GROUP, STATS_GROUP, INFO_PANEL_TAG,
+    LOOKUP_STATUS_TAG, LOOKUP_SYNC_STATE,    # <-- добавлено
 )
 from .PhaseNoise_Data import (
     get_resonator_types, get_spc_by_type, get_msk_by_spc,
@@ -26,15 +28,34 @@ from .PhaseNoise_Helpers import (
 )
 from .PhaseNoise_Graph import build_graph
 from .PhaseNoise_Export import export_to_pdf
-from .PhaseNoise_Lookup import (
-    sync_lookup_table, check_lookup_actual, ensure_lookup_table,
-)
+from .PhaseNoise_Lookup import sync_lookup_table, check_lookup_actual
+
 
 log = logging.getLogger("PhaseNoise.UI")
 
 _suppress_cascade = False
 
+def _lookup_status_str(st: dict) -> str:
+    """Текст для индикатора справочника (как в Архиве)."""
+    last_sync = st.get("last_sync")
+    ls = last_sync.strftime("%Y-%m-%d %H:%M") if last_sync else "никогда"
+    if st.get("is_empty"):
+        return f"пуст (нужна полная пересборка, синхр.: {ls})"
+    if st.get("is_actual"):
+        return f"актуален, {st.get('lookup_count', 0):,} записей, синхр.: {ls}"
+    return (
+        f"нужна досинхр.: новых строк {st.get('new_phaze_rows', 0)}, "
+        f"всего {st.get('lookup_count', 0):,}, синхр.: {ls}"
+    )
 
+
+def _poll_sync_state(poll_cb):
+    """Универсальный опрос LOOKUP_SYNC_STATE через dpg.set_frame_callback."""
+    if LOOKUP_SYNC_STATE.get("done"):
+        poll_cb()
+        return
+    dpg.set_frame_callback(dpg.get_frame_count() + 10,
+                           lambda: _poll_sync_state(poll_cb))
 def build_filter_bar():
     with dpg.group(horizontal=True):
         with dpg.group(width=180):
@@ -116,59 +137,39 @@ def build_info_panel():
     dpg.add_separator()
     dpg.add_text("Действия", color=(180, 220, 255))
     dpg.add_button(label="Протокол PDF", width=-1, height=26,
-                   callback=lambda: _on_pdf("protocol"))
+                   callback=lambda s, a: _on_pdf("protocol"))
     dpg.add_button(label="Экспорт (протокол+графики)", width=-1, height=26,
-                   callback=lambda: _on_pdf("both"))
+                   callback=lambda s, a: _on_pdf("both"))
     dpg.add_button(label="Только графики PDF", width=-1, height=26,
-                   callback=lambda: _on_pdf("graphs"))
+                   callback=lambda s, a: _on_pdf("graphs"))
+
+    # ---- Справочник номеров: статус + 3 ручные команды ----
+    dpg.add_separator()
+    dpg.add_text("Справочник номеров", color=(180, 220, 255))
+    dpg.add_text("не проверен", tag=LOOKUP_STATUS_TAG,
+                 color=(150, 200, 255), wrap=400)
+    dpg.add_button(label="Проверить", width=-1, height=26,
+                   callback=lambda s, a: _on_lookup_check())
+    dpg.add_button(label="Досинхронизировать", width=-1, height=26,
+                   callback=lambda s, a: _on_lookup_sync(False))
+    dpg.add_button(label="Полная пересборка", width=-1, height=26,
+                   callback=lambda s, a: _on_lookup_sync(True))
+
     dpg.add_spacer(height=4)
-    dpg.add_button(label="Синхронизировать справочник", width=-1, height=26,
-                   callback=_on_sync_lookup)
     dpg.add_button(label="Закрыть", width=-1, height=26, callback=_on_close)
 
-
 def init_cascade():
-    """Заполнение каскада при открытии + синхронизация lookup."""
+    """Заполнение каскада при открытии. Синхронизация справочника — вручную."""
     global _suppress_cascade
     print("[PhaseNoise] init_cascade start")
     log.info("init_cascade start")
 
-    try:
-        print("[PhaseNoise] ensure_lookup_table...")
-        ensure_lookup_table()
-        st = check_lookup_actual()
-        print(f"[PhaseNoise] lookup status: {st}")
-        log.info(f"lookup status: {st}")
-        if st.get("needs_full_rebuild") or st.get("needs_incremental"):
-            mode = "full" if st.get("needs_full_rebuild") else "incremental"
-            print(f"[PhaseNoise] lookup sync ({mode})...")
-            log.info(f"lookup sync starting ({mode})...")
-            if dpg.does_item_exist(STATUS_TEXT_TAG):
-                dpg.set_value(STATUS_TEXT_TAG, f"Синхронизация справочника ({mode})...")
-            res = sync_lookup_table(full_rebuild=bool(st.get("needs_full_rebuild")))
-            msg = (f"Справочник: {res.get('mode')} +{res.get('inserted')} "
-                   f"(всего {res.get('total')})")
-            print(f"[PhaseNoise] {msg}")
-            log.info(msg)
-            if dpg.does_item_exist(STATUS_TEXT_TAG):
-                dpg.set_value(STATUS_TEXT_TAG, msg)
-        else:
-            msg = f"Справочник актуален ({st.get('lookup_count', 0)} строк)"
-            print(f"[PhaseNoise] {msg}")
-            if dpg.does_item_exist(STATUS_TEXT_TAG):
-                dpg.set_value(STATUS_TEXT_TAG, msg)
-    except Exception as e:
-        print(f"[PhaseNoise] lookup bootstrap ERROR: {e}")
-        log.exception(f"lookup bootstrap error: {e}")
-        if dpg.does_item_exist(STATUS_TEXT_TAG):
-            dpg.set_value(STATUS_TEXT_TAG, f"Ошибка справочника: {e}")
-
+    # 1. Сразу заполняем каскад — не ждём справочник
     try:
         types = get_resonator_types()
         print(f"[PhaseNoise] types ({len(types)}): {types[:8]}")
         log.info(f"init_cascade types: {types[:10] if types else types}")
         if not dpg.does_item_exist("pn_type"):
-            print("[PhaseNoise] ERROR: pn_type combo missing")
             log.error("pn_type combo missing")
             return
         dpg.configure_item("pn_type", items=types)
@@ -179,18 +180,19 @@ def init_cascade():
             finally:
                 _suppress_cascade = False
             _on_type_change()
-            print("[PhaseNoise] cascade filled")
         else:
-            print("[PhaseNoise] WARN: no resonator types")
-            log.warning("init_cascade: типы резонаторов пусты")
             if dpg.does_item_exist(STATUS_TEXT_TAG):
                 dpg.set_value(STATUS_TEXT_TAG,
                               "Нет типов резонаторов (specification.NameR пуст)")
     except Exception as e:
-        print(f"[PhaseNoise] cascade ERROR: {e}")
         log.exception(f"cascade fill error: {e}")
         if dpg.does_item_exist(STATUS_TEXT_TAG):
             dpg.set_value(STATUS_TEXT_TAG, f"Ошибка каскада: {e}")
+
+    # 2. Отложенно проверяем справочник (не блокирует каскад)
+    dpg.set_frame_callback(dpg.get_frame_count() + 15, _on_lookup_check)
+
+
 
 
 def _on_type_change(sender=None, app_data=None, user_data=None):
@@ -377,23 +379,110 @@ def _fill_stats(measurements: pd.DataFrame, norms: list[dict]):
                 dpg.add_text(_fmt_num(st["cpk"]))
 
 
-def _on_sync_lookup(*_):
-    try:
-        print("[PhaseNoise] manual sync start")
-        dpg.set_value(STATUS_TEXT_TAG, "Синхронизация справочника (полная)...")
+# ------------------------------------------------------------ справочник UI
+def _on_lookup_check(*_):
+    print("[PhaseNoise] >>> _on_lookup_check CALLED")
+    log.info("_on_lookup_check CALLED")
+    if LOOKUP_SYNC_STATE.get("running"):
+        if dpg.does_item_exist(STATUS_TEXT_TAG):
+            dpg.set_value(STATUS_TEXT_TAG, "Проверка/синхронизация уже идёт...")
+        return
+
+    LOOKUP_SYNC_STATE.update({
+        "running": True, "done": False,
+        "message": "Проверка...", "error": None,
+    })
+    if dpg.does_item_exist(LOOKUP_STATUS_TAG):
+        dpg.set_value(LOOKUP_STATUS_TAG, "Проверка...")
+
+    def _worker():
+        print("[PhaseNoise] worker(check) START")
+        log.info("worker(check) START")
         try:
-            dpg.split_frame()
-        except Exception:
-            pass
-        res = sync_lookup_table(full_rebuild=True)
-        msg = (f"Справочник: mode={res.get('mode')} +{res.get('inserted')} "
-               f"(всего {res.get('total')})")
-        print(f"[PhaseNoise] {msg}")
-        dpg.set_value(STATUS_TEXT_TAG, msg)
-    except Exception as e:
-        print(f"[PhaseNoise] sync ERROR: {e}")
-        log.exception(f"sync lookup: {e}")
-        dpg.set_value(STATUS_TEXT_TAG, f"Ошибка синхронизации: {e}")
+            st = check_lookup_actual()
+            print(f"[PhaseNoise] worker(check) DONE: {st}")
+            log.info(f"lookup check done: {st}")
+            LOOKUP_SYNC_STATE["message"] = _lookup_status_str(st)
+        except Exception as e:
+            print(f"[PhaseNoise] worker(check) ERROR: {e}")
+            log.exception(f"lookup check error: {e}")
+            LOOKUP_SYNC_STATE["error"] = str(e)
+        finally:
+            LOOKUP_SYNC_STATE["done"] = True
+            LOOKUP_SYNC_STATE["running"] = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+    print("[PhaseNoise] worker(check) thread started")
+
+    def _finish():
+        msg = LOOKUP_SYNC_STATE.get("message", "")
+        if LOOKUP_SYNC_STATE.get("error"):
+            msg = f"Ошибка проверки: {LOOKUP_SYNC_STATE['error']}"
+        if dpg.does_item_exist(LOOKUP_STATUS_TAG):
+            dpg.set_value(LOOKUP_STATUS_TAG, msg)
+        print(f"[PhaseNoise] check finish: {msg}")
+
+    _poll_sync_state(_finish)
+
+
+
+
+def _on_lookup_sync(full_rebuild: bool):
+    print(f"[PhaseNoise] >>> _on_lookup_sync CALLED full_rebuild={full_rebuild}")
+    log.info(f"_on_lookup_sync CALLED full_rebuild={full_rebuild}")
+    if LOOKUP_SYNC_STATE.get("running"):
+        if dpg.does_item_exist(STATUS_TEXT_TAG):
+            dpg.set_value(STATUS_TEXT_TAG, "Синхронизация уже идёт...")
+        return
+
+    mode = "full" if full_rebuild else "incremental"
+    LOOKUP_SYNC_STATE.update({
+        "running": True, "done": False,
+        "message": f"Синхронизация ({mode})...", "error": None,
+    })
+    if dpg.does_item_exist(LOOKUP_STATUS_TAG):
+        dpg.set_value(LOOKUP_STATUS_TAG, f"Синхронизация ({mode})...")
+    if dpg.does_item_exist(STATUS_TEXT_TAG):
+        dpg.set_value(STATUS_TEXT_TAG, f"Синхронизация справочника ({mode})...")
+
+    def _worker():
+        print(f"[PhaseNoise] worker(sync {mode}) START")
+        log.info(f"worker(sync {mode}) START")
+        try:
+            res = sync_lookup_table(full_rebuild=full_rebuild)
+            print(f"[PhaseNoise] worker(sync {mode}) DONE: {res}")
+            log.info(f"lookup sync done: {res}")
+            LOOKUP_SYNC_STATE["message"] = (
+                f"Готово ({res.get('mode')}): "
+                f"+{res.get('inserted')}, всего {res.get('total')}"
+            )
+        except Exception as e:
+            print(f"[PhaseNoise] worker(sync {mode}) ERROR: {e}")
+            log.exception(f"lookup sync error: {e}")
+            LOOKUP_SYNC_STATE["error"] = str(e)
+        finally:
+            LOOKUP_SYNC_STATE["done"] = True
+            LOOKUP_SYNC_STATE["running"] = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+    print(f"[PhaseNoise] worker(sync {mode}) thread started")
+
+    def _finish():
+        if LOOKUP_SYNC_STATE.get("error"):
+            msg = f"Ошибка синхронизации: {LOOKUP_SYNC_STATE['error']}"
+        else:
+            msg = LOOKUP_SYNC_STATE.get("message", "Готово")
+        if dpg.does_item_exist(LOOKUP_STATUS_TAG):
+            dpg.set_value(LOOKUP_STATUS_TAG, msg)
+        if dpg.does_item_exist(STATUS_TEXT_TAG):
+            dpg.set_value(STATUS_TEXT_TAG, msg)
+        print(f"[PhaseNoise] sync finish: {msg}")
+        try:
+            _on_type_change()
+        except Exception as e:
+            log.exception(f"refresh after sync: {e}")
+
+    _poll_sync_state(_finish)
 
 
 def _on_load(*_):
