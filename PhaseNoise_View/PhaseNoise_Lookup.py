@@ -2,18 +2,7 @@
 Справочник номеров резонаторов и МСК для ускорения поиска в ФШ.
 
 Таблица phaze_noise_resonator_lookup:
-    id            BIGINT PK
-    measure_id    INTEGER
-    n_normalized  CHAR(20)   UPPER(TRIM(N))
-    msk           VARCHAR(64)
-
-Индексы:
-    UNIQUE (measure_id, n_normalized)
-    KEY (n_normalized)
-    KEY (msk)
-    KEY (measure_id)
-
-Метаданные в phaze_noise_resonator_lookup_meta — инкрементальная синхронизация.
+    measure_id, n_normalized, msk, spc
 """
 
 from datetime import datetime
@@ -34,12 +23,8 @@ def _engine():
     return create_engine(str(get_connection_string()))
 
 
-# =============================================================================
-# DDL и метаданные
-# =============================================================================
-
 def ensure_lookup_table(engine=None):
-    """Создаёт таблицу-справочник и мета-таблицу, если их нет."""
+    """Создаёт таблицы; при необходимости добавляет колонку spc."""
     engine = engine or _engine()
     with engine.begin() as conn:
         conn.execute(text(f"""
@@ -48,15 +33,32 @@ def ensure_lookup_table(engine=None):
                 `measure_id` INTEGER(11) NOT NULL,
                 `n_normalized` CHAR(20) NOT NULL,
                 `msk` VARCHAR(64) DEFAULT NULL,
+                `spc` VARCHAR(128) DEFAULT NULL,
                 PRIMARY KEY (`id`),
                 UNIQUE KEY `uk_mid_n` (`measure_id`, `n_normalized`),
                 KEY `idx_n` (`n_normalized`),
                 KEY `idx_msk` (`msk`),
+                KEY `idx_spc` (`spc`),
                 KEY `idx_mid` (`measure_id`)
             ) ENGINE=InnoDB
               DEFAULT CHARSET=cp1251
               COLLATE=cp1251_general_ci
         """))
+        # миграция: колонка spc для уже созданной таблицы
+        try:
+            cols = conn.execute(text(
+                f"SHOW COLUMNS FROM `{LOOKUP_TABLE}` LIKE 'spc'"
+            )).fetchall()
+            if not cols:
+                conn.execute(text(
+                    f"ALTER TABLE `{LOOKUP_TABLE}` "
+                    f"ADD COLUMN `spc` VARCHAR(128) DEFAULT NULL AFTER `msk`, "
+                    f"ADD KEY `idx_spc` (`spc`)"
+                ))
+                log.info("lookup: added column spc")
+        except Exception as e:
+            log.warning(f"lookup spc migration: {e}")
+
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS `{META_TABLE}` (
                 `id` TINYINT NOT NULL DEFAULT 1,
@@ -100,10 +102,6 @@ def _write_meta(engine, last_max_id, row_count):
         })
 
 
-# =============================================================================
-# Заполнение / синхронизация
-# =============================================================================
-
 def is_lookup_empty(engine=None):
     engine = engine or _engine()
     ensure_lookup_table(engine)
@@ -116,14 +114,13 @@ def is_lookup_empty(engine=None):
 
 def _scan_range(engine, start_id, end_id, chunk_size, progress_callback,
                 progress_base, progress_total):
-    """INSERT IGNORE ... SELECT по диапазону ID из phaze_noise."""
     for start in range(start_id, end_id + 1, chunk_size):
         end = min(start + chunk_size, end_id + 1)
         with engine.begin() as conn:
             conn.execute(text(f"""
                 INSERT IGNORE INTO `{LOOKUP_TABLE}`
-                    (measure_id, n_normalized, msk)
-                SELECT DISTINCT MeasureID, UPPER(TRIM(N)), MSK
+                    (measure_id, n_normalized, msk, spc)
+                SELECT DISTINCT MeasureID, UPPER(TRIM(N)), MSK, Spc
                 FROM `phaze_noise`
                 WHERE ID >= :s AND ID < :e
                   AND `Delete` = 0
@@ -136,7 +133,6 @@ def _scan_range(engine, start_id, end_id, chunk_size, progress_callback,
 
 
 def fill_lookup_table(chunk_size=50_000, progress_callback=None):
-    """Полная пересборка справочника."""
     engine = _engine()
     ensure_lookup_table(engine)
 
@@ -169,7 +165,6 @@ def fill_lookup_table(chunk_size=50_000, progress_callback=None):
 
 def sync_lookup_table(full_rebuild=False, chunk_size=50_000,
                       progress_callback=None):
-    """Синхронизация справочника с phaze_noise."""
     if full_rebuild:
         res = fill_lookup_table(chunk_size, progress_callback)
         return {"inserted": res["inserted"],
@@ -180,6 +175,25 @@ def sync_lookup_table(full_rebuild=False, chunk_size=50_000,
     ensure_lookup_table(engine)
     meta = _read_meta(engine)
     last_id = meta["last_max_id"]
+
+    # если колонка spc пустая у старых строк — полная пересборка
+    try:
+        with engine.connect() as conn:
+            null_spc = conn.execute(text(
+                f"SELECT COUNT(*) FROM `{LOOKUP_TABLE}` "
+                f"WHERE spc IS NULL OR TRIM(spc) = ''"
+            )).scalar() or 0
+            total_rows = conn.execute(text(
+                f"SELECT COUNT(*) FROM `{LOOKUP_TABLE}`"
+            )).scalar() or 0
+        if total_rows and null_spc > total_rows * 0.5:
+            log.info("lookup: many rows without spc — full rebuild")
+            res = fill_lookup_table(chunk_size, progress_callback)
+            return {"inserted": res["inserted"],
+                    "total": res["total"],
+                    "mode": "full"}
+    except Exception as e:
+        log.warning(f"spc check: {e}")
 
     with engine.connect() as conn:
         r = conn.execute(text(
@@ -218,7 +232,6 @@ def sync_lookup_table(full_rebuild=False, chunk_size=50_000,
 
 
 def check_lookup_actual():
-    """Статус актуальности справочника."""
     engine = _engine()
     ensure_lookup_table(engine)
     meta = _read_meta(engine)
@@ -256,14 +269,88 @@ def check_lookup_actual():
 
 
 # =============================================================================
-# Поиск
+# Быстрые запросы из справочника
 # =============================================================================
 
+def lookup_msk_by_spc(spc: str) -> list[str]:
+    if not spc:
+        return []
+    engine = _engine()
+    ensure_lookup_table(engine)
+    try:
+        df = pd.read_sql(text(f"""
+            SELECT DISTINCT msk FROM `{LOOKUP_TABLE}`
+            WHERE spc = :s AND msk IS NOT NULL AND TRIM(msk) <> ''
+            ORDER BY msk
+        """), engine, params={"s": spc})
+        return df["msk"].dropna().astype(str).tolist()
+    except Exception as e:
+        log.error(f"lookup_msk_by_spc: {e}")
+        return []
+
+
+def lookup_mids_by_spc(spc: str) -> list[int]:
+    if not spc:
+        return []
+    engine = _engine()
+    ensure_lookup_table(engine)
+    try:
+        df = pd.read_sql(text(f"""
+            SELECT DISTINCT measure_id FROM `{LOOKUP_TABLE}`
+            WHERE spc = :s AND measure_id IS NOT NULL
+            ORDER BY measure_id
+        """), engine, params={"s": spc})
+        return df["measure_id"].dropna().astype(int).tolist()
+    except Exception as e:
+        log.error(f"lookup_mids_by_spc: {e}")
+        return []
+
+
+def lookup_mids_by_msk(msk: str) -> list[int]:
+    if not msk:
+        return []
+    engine = _engine()
+    ensure_lookup_table(engine)
+    try:
+        df = pd.read_sql(text(f"""
+            SELECT DISTINCT measure_id FROM `{LOOKUP_TABLE}`
+            WHERE msk = :m AND measure_id IS NOT NULL
+            ORDER BY measure_id
+        """), engine, params={"m": msk})
+        return df["measure_id"].dropna().astype(int).tolist()
+    except Exception as e:
+        log.error(f"lookup_mids_by_msk: {e}")
+        return []
+
+
+def lookup_numbers(msk: str | None = None, measure_id: int | None = None,
+                   spc: str | None = None) -> list[str]:
+    engine = _engine()
+    ensure_lookup_table(engine)
+    cond = ["n_normalized IS NOT NULL"]
+    params = {}
+    if measure_id:
+        cond.append("measure_id = :mid")
+        params["mid"] = int(measure_id)
+    elif msk:
+        cond.append("msk = :msk")
+        params["msk"] = msk
+    if spc:
+        cond.append("spc = :spc")
+        params["spc"] = spc
+    try:
+        df = pd.read_sql(text(f"""
+            SELECT DISTINCT n_normalized AS N FROM `{LOOKUP_TABLE}`
+            WHERE {' AND '.join(cond)}
+            ORDER BY n_normalized
+        """), engine, params=params)
+        return df["N"].dropna().astype(str).tolist()
+    except Exception as e:
+        log.error(f"lookup_numbers: {e}")
+        return []
+
+
 def find_in_lookup(numbers, engine=None):
-    """
-    Поиск в справочнике по списку номеров (уже нормализованных UPPER).
-    Возвращает (found_numbers_set, found_mids_set, pairs_list).
-    """
     engine = engine or _engine()
     ensure_lookup_table(engine)
 
@@ -273,7 +360,7 @@ def find_in_lookup(numbers, engine=None):
 
     try:
         sql = text(
-            f"SELECT n_normalized, measure_id, msk "
+            f"SELECT n_normalized, measure_id, msk, spc "
             f"FROM `{LOOKUP_TABLE}` "
             f"WHERE n_normalized IN :nums"
         ).bindparams(bindparam("nums", expanding=True))
@@ -295,21 +382,27 @@ def find_in_lookup(numbers, engine=None):
     return found_nums, found_mids, pairs
 
 
-def find_msk_by_partial(query: str, limit: int = 200, engine=None) -> list[str]:
-    """Поиск МСК по части строки (из справочника, быстро)."""
+def find_msk_by_partial(query: str, spc: str | None = None,
+                       limit: int = 200, engine=None) -> list[str]:
+    """Поиск МСК по части — только справочник."""
     engine = engine or _engine()
     ensure_lookup_table(engine)
     q = (query or "").strip()
     if not q:
         return []
     try:
-        df = pd.read_sql(text(f"""
-            SELECT DISTINCT msk
-            FROM `{LOOKUP_TABLE}`
-            WHERE msk IS NOT NULL AND msk LIKE :q
-            ORDER BY msk
-            LIMIT :lim
-        """), engine, params={"q": f"%{q}%", "lim": limit})
+        if spc:
+            df = pd.read_sql(text(f"""
+                SELECT DISTINCT msk FROM `{LOOKUP_TABLE}`
+                WHERE msk IS NOT NULL AND msk LIKE :q AND spc = :spc
+                ORDER BY msk LIMIT :lim
+            """), engine, params={"q": f"%{q}%", "spc": spc, "lim": limit})
+        else:
+            df = pd.read_sql(text(f"""
+                SELECT DISTINCT msk FROM `{LOOKUP_TABLE}`
+                WHERE msk IS NOT NULL AND msk LIKE :q
+                ORDER BY msk LIMIT :lim
+            """), engine, params={"q": f"%{q}%", "lim": limit})
         return df["msk"].dropna().astype(str).tolist()
     except Exception as e:
         log.error(f"find_msk_by_partial error: {e}")
@@ -317,7 +410,6 @@ def find_msk_by_partial(query: str, limit: int = 200, engine=None) -> list[str]:
 
 
 def add_pairs_to_lookup(pairs, engine=None):
-    """Добавить пары (measure_id, n_normalized, msk) — INSERT IGNORE."""
     if not pairs:
         return 0
     engine = engine or _engine()
@@ -325,19 +417,22 @@ def add_pairs_to_lookup(pairs, engine=None):
 
     clean = set()
     for item in pairs:
-        if len(item) == 2:
-            mid, n = item
-            msk = ""
-        else:
+        if len(item) >= 4:
+            mid, n, msk, spc = item[0], item[1], item[2], item[3]
+        elif len(item) == 3:
             mid, n, msk = item
+            spc = ""
+        else:
+            mid, n = item
+            msk, spc = "", ""
         try:
             mid_int = int(mid)
         except (TypeError, ValueError):
             continue
         n_str = str(n).strip().upper()
-        msk_str = str(msk or "").strip()
         if n_str and mid_int:
-            clean.add((mid_int, n_str, msk_str))
+            clean.add((mid_int, n_str, str(msk or "").strip(),
+                       str(spc or "").strip()))
 
     if not clean:
         return 0
@@ -345,163 +440,9 @@ def add_pairs_to_lookup(pairs, engine=None):
     with engine.begin() as conn:
         conn.execute(
             text(f"INSERT IGNORE INTO `{LOOKUP_TABLE}` "
-                 f"(measure_id, n_normalized, msk) VALUES (:mid, :n, :msk)"),
-            [{"mid": mid, "n": n, "msk": msk} for mid, n, msk in clean]
+                 f"(measure_id, n_normalized, msk, spc) "
+                 f"VALUES (:mid, :n, :msk, :spc)"),
+            [{"mid": a, "n": b, "msk": c, "spc": d}
+             for a, b, c, d in clean]
         )
     return len(clean)
-
-
-# =============================================================================
-# UI-диалоги (без height=-80 — падает в части версий DPG)
-# =============================================================================
-
-def _s(v) -> str:
-    if v is None:
-        return ""
-    try:
-        import pandas as pd
-        if pd.isna(v):
-            return ""
-    except Exception:
-        pass
-    return str(v)
-
-
-class LookupDialog:
-    """Универсальный диалог выбора."""
-
-    def __init__(self, *, title: str, tag_prefix: str,
-                 query_fn, format_fn, on_select,
-                 width: int = 1000, height: int = 600):
-        self.title = title
-        self.tag_win = f"{tag_prefix}_win"
-        self.tag_search = f"{tag_prefix}_search"
-        self.tag_list = f"{tag_prefix}_list"
-        self.query_fn = query_fn
-        self.format_fn = format_fn
-        self.on_select = on_select
-        self.width = width
-        self.height = height
-        log.info(f"LookupDialog init: {title}")
-        self._build()
-        self._reload()
-
-    def _build(self):
-        import dearpygui.dearpygui as dpg
-        if dpg.does_item_exist(self.tag_win):
-            dpg.delete_item(self.tag_win)
-        with dpg.window(label=self.title, tag=self.tag_win,
-                        width=self.width, height=self.height,
-                        pos=(80, 80)):
-            dpg.add_text("Фильтр (МСК / N / Spc / ID):")
-            dpg.add_input_text(tag=self.tag_search, width=-1,
-                               callback=self._on_search)
-            # height фиксированный: height=-80 падает в DPG (SystemError)
-            dpg.add_listbox(["(загрузка...)"], tag=self.tag_list,
-                            width=-1, num_items=20)
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="Выбрать", callback=self._on_pick,
-                               width=110)
-                dpg.add_button(label="Обновить", callback=self._on_search,
-                               width=110)
-                dpg.add_button(label="Отмена", callback=self._on_cancel,
-                               width=110)
-
-    def _on_search(self, *args):
-        self._reload()
-
-    def _reload(self):
-        import dearpygui.dearpygui as dpg
-        q = (dpg.get_value(self.tag_search) or "").strip()
-        log.info(f"Lookup reload: query={q!r}")
-        try:
-            df = self.query_fn(q)
-        except Exception as e:
-            log.exception(f"Lookup query error: {e}")
-            df = None
-        if df is None or df.empty:
-            log.warning(f"Lookup {self.title}: пустой результат")
-            items = ["(нет данных)"]
-        else:
-            items = [self.format_fn(r) for _, r in df.iterrows()]
-            log.info(f"Lookup {self.title}: {len(items)} строк")
-        if not dpg.does_item_exist(self.tag_list):
-            return
-        dpg.configure_item(self.tag_list, items=items)
-        try:
-            dpg.set_value(self.tag_list, items[0])
-        except Exception:
-            pass
-
-    def _on_pick(self, *args):
-        import dearpygui.dearpygui as dpg
-        sel = dpg.get_value(self.tag_list)
-        log.info(f"Lookup pick: {sel!r}")
-        if not sel or sel in ("(нет данных)", "(загрузка...)"):
-            return
-        try:
-            self.on_select(sel)
-        except Exception as e:
-            log.exception(f"on_select error: {e}")
-        try:
-            dpg.delete_item(self.tag_win)
-        except Exception:
-            pass
-
-    def _on_cancel(self, *args):
-        import dearpygui.dearpygui as dpg
-        log.info(f"Lookup cancel: {self.title}")
-        try:
-            dpg.delete_item(self.tag_win)
-        except Exception:
-            pass
-
-
-def open_msk_lookup(on_select):
-    from .PhaseNoise_Data import load_msk_lookup
-
-    def fmt(r):
-        return (f"{_s(r.get('MSK'))} | N={_s(r.get('N_list'))} | "
-                f"Spc={_s(r.get('Spc_list'))} | "
-                f"{_s(r.get('last_date'))} | cnt={_s(r.get('cnt'))}")
-
-    def cb(sel):
-        msk = sel.split(" | ")[0].strip()
-        on_select(msk)
-
-    LookupDialog(title="Справочник МСК", tag_prefix="pn_lookup_msk",
-                 query_fn=load_msk_lookup, format_fn=fmt, on_select=cb)
-
-
-def open_measure_id_lookup(on_select):
-    from .PhaseNoise_Data import load_measure_id_lookup
-
-    def fmt(r):
-        return (f"{_s(r.get('MeasureID'))} | MSK={_s(r.get('MSK_list'))} | "
-                f"N={_s(r.get('N_list'))} | "
-                f"Spc={_s(r.get('Spc_list'))} | "
-                f"{_s(r.get('last_date'))} | cnt={_s(r.get('cnt'))}")
-
-    def cb(sel):
-        mid = sel.split(" | ")[0].strip()
-        on_select(int(mid))
-
-    LookupDialog(title="Справочник MeasureID", tag_prefix="pn_lookup_mid",
-                 query_fn=load_measure_id_lookup, format_fn=fmt, on_select=cb)
-
-
-def open_resonator_lookup(on_select):
-    from .PhaseNoise_Data import load_resonator_lookup
-
-    def fmt(r):
-        return (f"{_s(r.get('N'))} | MSK={_s(r.get('MSK_list'))} | "
-                f"{_s(r.get('last_date'))} | cnt={_s(r.get('cnt'))}")
-
-    def cb(sel):
-        n = sel.split(" | ")[0].strip()
-        on_select(n)
-
-    LookupDialog(title="Справочник номеров резонаторов",
-                 tag_prefix="pn_lookup_n",
-                 query_fn=load_resonator_lookup,
-                 format_fn=fmt, on_select=cb)
