@@ -161,7 +161,9 @@ def render_graph(
         anti_aliased=True,
         no_menus=False,
     ):
-        dpg.add_plot_legend(location=dpg.mvPlot_Location_NorthEast)
+        # в режиме msk легенда не нужна (много кривых)
+        if group_mode != "msk":
+            dpg.add_plot_legend(location=dpg.mvPlot_Location_NorthEast)
         dpg.add_plot_axis(
             dpg.mvXAxis,
             label="Отстройка, Гц",
@@ -446,7 +448,7 @@ def build_graph(
     ax.set_xlim(DEFAULT_X_MIN_HZ, DEFAULT_X_MAX_HZ)
     ax.set_xlabel("Отстройка, Гц", fontsize=8)
     ax.set_ylabel("PN, дБ/Гц", fontsize=8)
-    if ax.get_legend_handles_labels()[0]:
+    if group_mode != "msk" and ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=7, loc="best",
                   facecolor="#2a2a2a", edgecolor="#555555",
                   labelcolor="#d0d0d0")
