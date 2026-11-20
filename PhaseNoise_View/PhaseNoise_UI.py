@@ -98,7 +98,9 @@ def build_filter_bar():
         with dpg.group(width=140):
             dpg.add_spacer(height=18)
             dpg.add_combo(["msk", "resonator_single", "resonator_multi"],
-                          default_value="msk", tag="pn_group_mode", width=140)
+                          default_value="msk", tag="pn_group_mode", width=140,
+                          callback=lambda s, a: series_ui.redraw_graph()
+                          if series_ui.get_numbers() else None)
         with dpg.group(width=110):
             dpg.add_spacer(height=18)
             dpg.add_button(label="Загрузить", width=110, callback=_on_load)
@@ -106,7 +108,10 @@ def build_filter_bar():
 
 
 def build_info_panel():
-    dpg.add_text("График PN(Freq)", color=(180, 220, 255))
+    with dpg.group(horizontal=True):
+        dpg.add_text("График PN(Freq)", color=(180, 220, 255))
+        dpg.add_spacer(width=12)
+        dpg.add_button(label="Увеличить", width=100, callback=lambda: series_ui.on_enlarge())
     with dpg.child_window(height=340, tag=GRAPH_CONTAINER, border=True):
         dpg.add_text("(график появится после <Загрузить>)", color=(120, 120, 120))
     dpg.add_separator()
