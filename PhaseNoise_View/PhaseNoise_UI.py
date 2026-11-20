@@ -222,7 +222,6 @@ def _on_number_change(sender=None, app_data=None, user_data=None):
     if series_ui.is_number_cb_suppressed():
         return
     n = dpg.get_value("pn_number") or ""
-    # если данные уже загружены — только сменить номер на графике
     if series_ui.get_numbers():
         if n:
             series_ui.set_current_number(n, update_combo=False)
@@ -279,8 +278,8 @@ def _fill_norms(spc: str | None):
     dpg.add_text(f"Spc: {spc}", parent=NORMS_GROUP, color=(150, 200, 255))
     for nm in norms:
         vmin, vmax = nm["min"], nm["max"]
-        vmin_s = f"{vmin:g}" if vmin is not None else "—"
-        vmax_s = f"{vmax:g}" if vmax is not None else "—"
+        vmin_s = f"{vmin:g}" if vmin is not None else "-"
+        vmax_s = f"{vmax:g}" if vmax is not None else "-"
         dpg.add_text(
             f"Норма {nm['num']}: отстройка {nm['offset']} Гц  min={vmin_s}  max={vmax_s} дБ/Гц",
             parent=NORMS_GROUP)
@@ -293,7 +292,7 @@ def _fill_stats(measurements: pd.DataFrame, norms: list[dict]):
         return
     oy = overall_yield(measurements, norms)
     pct = oy["pct_good"]
-    pct_s = f"{pct:.1f}%" if pct is not None else "—"
+    pct_s = f"{pct:.1f}%" if pct is not None else "-"
     dpg.add_text(
         f"Выборка: {oy['n_total']} | Годных: {oy['n_good']} ({pct_s}) | Брак: {oy['n_fail']}",
         parent=STATS_GROUP, color=(150, 220, 150))
@@ -302,7 +301,7 @@ def _fill_stats(measurements: pd.DataFrame, norms: list[dict]):
         return
     with dpg.table(parent=STATS_GROUP, header_row=True, resizable=True,
                    policy=dpg.mvTable_SizingStretchProp, scrollY=True, height=-1):
-        for col in ("Отстр.", "n", "mean", "σ", "min", "max", "med", "% годн.", "Cpk"):
+        for col in ("Отстр.", "n", "mean", "std", "min", "max", "med", "% годн.", "Cpk"):
             dpg.add_table_column(label=col)
         for st in stats:
             with dpg.table_row():
@@ -314,7 +313,7 @@ def _fill_stats(measurements: pd.DataFrame, norms: list[dict]):
                 dpg.add_text(_fmt_num(st["max"]))
                 dpg.add_text(_fmt_num(st["median"]))
                 pct = st["pct_good"]
-                dpg.add_text(f"{pct:.1f}" if pct is not None else "—")
+                dpg.add_text(f"{pct:.1f}" if pct is not None else "-")
                 dpg.add_text(_fmt_num(st["cpk"]))
 
 
@@ -399,8 +398,6 @@ def _on_load(*_):
         msk_val = msk if msk and msk != ALL_MSK_LABEL else None
         mid = int(mid_raw) if str(mid_raw).isdigit() else None
 
-        # Таблица: все измерения по МСК или MeasureID (номер не сужает выборку).
-        # Номер влияет только на то, какая кривая на графике (первый по умолчанию).
         if numbers:
             meas = load_phaze_noise(numbers=numbers)
         elif mid:
@@ -486,9 +483,9 @@ def _on_load(*_):
 
         dpg.set_value(
             STATUS_TEXT_TAG,
-            f"Загружено {len(meas)} изм. · {len(points)} точек · "
-            f"{len(series)} кривых · график № {series_ui.get_current_number() or '—'} "
-            f"(колесо мыши — смена номера)"
+            f"Загружено {len(meas)} изм. - {len(points)} точек - "
+            f"{len(series)} кривых - график N {series_ui.get_current_number() or '-'} "
+            f"(колесо мыши - смена номера)"
             + ("" if not points.empty else " (точек нет)")
         )
     except Exception as e:
