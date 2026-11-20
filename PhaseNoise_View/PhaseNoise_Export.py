@@ -38,21 +38,35 @@ _FONT_REG = False
 
 
 def _register_fonts() -> str:
+    """Регистрация шрифтов как в Temperature_Measure/Report.py."""
     global _FONT_REG
-    main = "Helvetica"
-    arial = _FONTS_DIR / "ArialRegular.ttf"
-    courier = _FONTS_DIR / "couriercyrillic.ttf"
-    try:
-        if arial.is_file():
-            if not _FONT_REG:
-                pdfmetrics.registerFont(TTFont("PN_Arial", str(arial)))
-            main = "PN_Arial"
-        if courier.is_file() and not _FONT_REG:
-            pdfmetrics.registerFont(TTFont("PN_Courier", str(courier)))
-        _FONT_REG = True
-    except Exception as e:
-        print(f"[PhaseNoise] font register: {e}")
-    return main
+    if not _FONT_REG:
+        # Report.py:
+        #   pdfmetrics.registerFont(TTFont('Courier', 'fonts\\couriercyrillic.ttf'))
+        #   pdfmetrics.registerFont(TTFont('Arial', 'fonts\\ArialRegular.ttf'))
+        arial_path = "fonts\\ArialRegular.ttf"
+        courier_path = "fonts\\couriercyrillic.ttf"
+        arial_abs = _FONTS_DIR / "ArialRegular.ttf"
+        courier_abs = _FONTS_DIR / "couriercyrillic.ttf"
+        try:
+            try:
+                pdfmetrics.registerFont(TTFont("Arial", arial_path))
+            except Exception:
+                if arial_abs.is_file():
+                    pdfmetrics.registerFont(TTFont("Arial", str(arial_abs)))
+                else:
+                    raise
+            try:
+                pdfmetrics.registerFont(TTFont("Courier", courier_path))
+            except Exception:
+                if courier_abs.is_file():
+                    pdfmetrics.registerFont(TTFont("Courier", str(courier_abs)))
+            _FONT_REG = True
+        except Exception as e:
+            print(f"[PhaseNoise] font register: {e}")
+            # если Report уже зарегистрировал Arial - ок
+            _FONT_REG = True
+    return "Arial"
 
 
 def _ensure_out_dir() -> Path:
