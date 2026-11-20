@@ -11,6 +11,43 @@ from .PhaseNoise_Norms import DEFAULT_OFFSETS, ensure_norms  # noqa: F401
 log = logging.getLogger("PhaseNoise.Data")
 _engine_cache = None
 
+from .PhaseNoise_Constants import NORM_DEFS, OFFSET_TO_FIELD
+
+# Куда в psidata пишем значения по порядку отстроек
+PSIDATA_TARGET_FIELDS = ["Shum", "Shum_1", "Shum_2", "Shum_3", "Shum_4"]
+
+
+def _get_offset_value(n_row, data_n: pd.DataFrame, offset: float) -> float | None:
+    """
+    Значение PN на отстройке `offset` для конкретного номера N.
+
+    1) Если offset — «стандартный» (есть в OFFSET_TO_FIELD) — берём
+       напрямую из phaze_noise (колонки Shum1/Shum3/Shum10/…).
+    2) Иначе (или если колонка пуста) — ищем в phaze_noise_data по Freq
+       ближайшую к `offset` (например, 30 Гц: 29.98 и 30.05 → 29.98).
+    """
+    # 1. Стандартная колонка phaze_noise
+    for std_off, col in OFFSET_TO_FIELD.items():
+        if abs(std_off - float(offset)) < 1e-6:
+            v = n_row.get(col)
+            if v is not None and not pd.isna(v):
+                return float(v)
+            break
+    # 2. Ближайший Freq из phaze_noise_data
+    if data_n is None or data_n.empty:
+        return None
+    try:
+        freqs = data_n["Freq"].astype(float).values
+    except Exception:
+        return None
+    if len(freqs) == 0:
+        return None
+    diffs = pd.Series(freqs).sub(float(offset)).abs()
+    idx = int(diffs.idxmin())
+    try:
+        return float(data_n.iloc[idx]["PN"])
+    except Exception:
+        return None
 
 def _engine():
     global _engine_cache
@@ -427,8 +464,169 @@ def load_measure_id_lookup(query: str = "") -> pd.DataFrame:
         params, label="lookup_mid")
 
 # PhaseNoise_Data.py  (добавить в конец файла)
+def save_psidata_for_measure(measure_id: int, psi_id: int | None = None) -> tuple[int, int]:
+    """
+    Для КАЖДОГО номера N в замере MeasureID пишет отдельную строку в psidata.
 
-def save_psidata_for_measure(measure_id: int, psi_id: int | None = None) -> bool:
+    Связь в БД:
+      phaze_noise.MeasureID  ==  phaze_noise_id.ID
+      phaze_noise_id.PSI_ID  —> psidata.Measure_ID
+
+    Отстройки:
+      - если спецификация замера задаёт нормы — берём их отстройки
+        (по возрастанию);
+      - иначе — стандартный набор (sorted(OFFSET_TO_FIELD.keys())),
+        проходим по нему и оставляем те отстройки, для которых есть данные.
+    Для каждой отстройки значение берётся по правилам _get_offset_value
+    и пишется в Shum / Shum_1 / Shum_2 / Shum_3 / Shum_4 ПОСЛЕДОВАТЕЛЬНО:
+    нет данных для отстройки — пропускаем, поле не занимаем.
+
+    Идентификация строки в psidata: (Measure_ID, N) — повторный вызов
+    обновляет существующие строки, дублей не создаёт.
+
+    Возвращает (сохранено, пропущено).
+    """
+    if not measure_id:
+        log.error("save_psidata_for_measure: measure_id не задан")
+        return 0, 0
+
+    # 1. PSI_ID (если не задан из UI)
+    if psi_id is None:
+        df_link = _q(
+            "SELECT PSI_ID FROM `phaze_noise_id` WHERE ID = :mid LIMIT 1",
+            {"mid": measure_id},
+            label="psi_id_by_measure",
+        )
+        if df_link.empty or pd.isna(df_link.iloc[0]["PSI_ID"]):
+            log.error(
+                "Не найден PSI_ID для MeasureID=%s в phaze_noise_id (колонка ID)",
+                measure_id,
+            )
+            return 0, 0
+        psi_id = int(df_link.iloc[0]["PSI_ID"])
+
+    # 2. Строки phaze_noise (по номеру N) и точки phaze_noise_data
+    df_n = load_phaze_noise(measure_id=measure_id)
+    if df_n.empty:
+        log.warning("Нет строк phaze_noise для MeasureID=%s", measure_id)
+        return 0, 0
+    df_data = load_phaze_noise_data(measure_id=measure_id)
+
+    # 3. Список отстроек
+    offset_list: list[float] | None = None
+    spc_name = None
+    if "Spc" in df_n.columns:
+        spc_vals = [v for v in df_n["Spc"].dropna().unique() if str(v).strip()]
+        if spc_vals:
+            spc_name = str(spc_vals[0])
+    if spc_name:
+        spec_row = load_specification(spc_name)
+        norms = build_norms(spec_row) if spec_row else []
+        if norms:
+            offset_list = sorted({
+                float(n["offset"]) for n in norms if n.get("offset") is not None
+            })
+    if not offset_list:
+        # Стандартный набор из констант
+        offset_list = sorted(float(k) for k in OFFSET_TO_FIELD.keys())
+
+    log.info(
+        "psidata: MeasureID=%s PSI_ID=%s offsets=%s",
+        measure_id, psi_id, offset_list,
+    )
+
+    # 4. По одной строке на уникальный N
+    if "N" not in df_n.columns:
+        log.error("В выборке phaze_noise нет колонки N")
+        return 0, 0
+    df_n = df_n.drop_duplicates(subset=["N"], keep="first")
+
+    saved = 0
+    skipped = 0
+
+    for _, n_row in df_n.iterrows():
+        n_raw = n_row.get("N")
+        if n_raw is None or pd.isna(n_raw):
+            skipped += 1
+            continue
+        n_num = str(n_raw).strip()
+        if not n_num:
+            skipped += 1
+            continue
+
+        msk = n_row.get("MSK")
+        spc = n_row.get("Spc")
+
+        # Данные phaze_noise_data только для этого N
+        if not df_data.empty and "N" in df_data.columns:
+            data_n = df_data[df_data["N"].astype(str).str.strip() == n_num]
+        else:
+            data_n = pd.DataFrame()
+
+        # Собираем значения по отстройкам (макс. 5)
+        target_values: dict[str, float] = {}
+        for off in offset_list:
+            if len(target_values) >= len(PSIDATA_TARGET_FIELDS):
+                break
+            val = _get_offset_value(n_row, data_n, off)
+            if val is None:
+                continue
+            target_values[PSIDATA_TARGET_FIELDS[len(target_values)]] = val
+
+        if not target_values:
+            log.info("psidata: N=%s нет данных ни по одной отстройке", n_num)
+            skipped += 1
+            continue
+
+        # UPSERT по (Measure_ID, N)
+        try:
+            with _engine().begin() as conn:
+                row_id = conn.execute(
+                    text(
+                        "SELECT ID FROM `psidata` "
+                        "WHERE `Measure_ID` = :mid AND `N` = :n LIMIT 1"
+                    ),
+                    {"mid": psi_id, "n": n_num},
+                ).scalar()
+
+                payload: dict = dict(target_values)
+                if msk is not None and not pd.isna(msk):
+                    payload["MSK"] = str(msk)
+                if spc is not None and not pd.isna(spc):
+                    payload["Spc"] = str(spc)
+
+                if row_id is not None:
+                    set_clause = ", ".join(f"`{k}` = :{k}" for k in payload)
+                    conn.execute(
+                        text(
+                            f"UPDATE `psidata` SET {set_clause} "
+                            f"WHERE `ID` = :row_id"
+                        ),
+                        {"row_id": int(row_id), **payload},
+                    )
+                    log.info("psidata: UPDATE ID=%s N=%s", row_id, n_num)
+                else:
+                    payload["Measure_ID"] = psi_id
+                    payload["N"] = n_num
+                    cols = list(payload.keys())
+                    sql = (
+                        f"INSERT INTO `psidata` "
+                        f"({', '.join(f'`{c}`' for c in cols)}) "
+                        f"VALUES ({', '.join(':' + c for c in cols)})"
+                    )
+                    conn.execute(text(sql), payload)
+                    log.info("psidata: INSERT N=%s", n_num)
+            saved += 1
+        except Exception as e:
+            log.error("psidata: ошибка для N=%s: %s", n_num, e)
+            skipped += 1
+
+    log.info(
+        "psidata: MeasureID=%s сохранено=%s пропущено=%s",
+        measure_id, saved, skipped,
+    )
+    return saved, skipped
+def save_psidata_for_measur_1(measure_id: int, psi_id: int | None = None) -> bool:
     """
     Записывает данные фазового шума из phaze_noise_data в таблицу psidata
     для указанного MeasureID.

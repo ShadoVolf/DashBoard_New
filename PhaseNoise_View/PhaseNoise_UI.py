@@ -27,12 +27,62 @@ from . import PhaseNoise_SeriesUI as series_ui
 from .PhaseNoise_Export import export_to_pdf
 from .PhaseNoise_Lookup import sync_lookup_table, check_lookup_actual
 
-
+# Кэш последних загруженных измерений — используется кнопкой «Добавить в ПСИ»,
+# когда в pn_mid выбран «все», но по факту загружен один замер.
+_last_loaded_meas: pd.DataFrame | None = None
 log = logging.getLogger("PhaseNoise.UI")
 
 _suppress_cascade = False
 
+def _resolve_measure_id_for_psi() -> int | None:
+    """
+    Определяет MeasureID для записи в ПСИ.
+    Приоритеты:
+      1) конкретное значение в комбобоксе pn_mid;
+      2) если в выборке ровно один MeasureID — его;
+      3) если несколько — MeasureID текущего номера
+         (series_ui.get_current_number() или pn_number).
+    Возвращает int или None, если однозначно определить нельзя.
+    """
+    # 1) Комбобокс
+    mid_str = dpg.get_value("pn_mid") or ""
+    if mid_str and mid_str != ALL_MEAS_LABEL:
+        try:
+            return int(mid_str)
+        except (TypeError, ValueError):
+            pass
 
+    # 2–3) Загруженные данные
+    meas = _last_loaded_meas
+    if meas is None or meas.empty or "MeasureID" not in meas:
+        return None
+
+    mids = [m for m in meas["MeasureID"].dropna().unique()]
+    if not mids:
+        return None
+    if len(mids) == 1:
+        try:
+            return int(mids[0])
+        except (TypeError, ValueError):
+            return None
+
+    cur_n = None
+    try:
+        cur_n = series_ui.get_current_number()
+    except Exception:
+        pass
+    if not cur_n:
+        cur_n = dpg.get_value("pn_number") or ""
+    if cur_n and "N" in meas:
+        row = meas[meas["N"] == cur_n]
+        if not row.empty:
+            mid_v = row.iloc[0].get("MeasureID")
+            if mid_v is not None and not pd.isna(mid_v):
+                try:
+                    return int(mid_v)
+                except (TypeError, ValueError):
+                    return None
+    return None
 def _lookup_status_str(st: dict) -> str:
     last_sync = st.get("last_sync")
     ls = last_sync.strftime("%Y-%m-%d %H:%M") if last_sync else "никогда"
@@ -107,8 +157,89 @@ def build_filter_bar():
     dpg.add_separator()
 
 # PhaseNoise_UI.py  (добавить новую функцию)
+def _on_add_to_psi(*_):
+    """
+    Обработчик кнопки «Добавить в ПСИ».
+    MeasureID берётся через _resolve_measure_id_for_psi:
+      - из комбобокса pn_mid, если выбран конкретный;
+      - иначе из загруженных данных (один замер / текущий номер).
+    PSI_ID — опционально из pn_psi_id_override.
+    Далее в save_psidata_for_measure выполняется:
+      MeasureID → ID (phaze_noise) → PSI_ID (phaze_noise_id) → запись в psidata.
+    """
+    mid = _resolve_measure_id_for_psi()
+    if mid is None:
+        dpg.set_value(
+            STATUS_TEXT_TAG,
+            "Не выбран MeasureID. Выберите MeasureID в фильтре "
+            "или загрузите так, чтобы в выборке был ровно один замер.",
+        )
+        return
 
-def _on_add_to_psi():
+    psi_id_str = (dpg.get_value("pn_psi_id_override") or "").strip()
+    psi_id: int | None = None
+    if psi_id_str:
+        try:
+            psi_id = int(psi_id_str)
+        except ValueError:
+            dpg.set_value(STATUS_TEXT_TAG, "Некорректный ID замера ПСИ")
+            return
+
+    # Импорт внутри функции — чтобы не было циклических зависимостей
+    from .PhaseNoise_Data import save_psidata_for_measure
+
+    ok = save_psidata_for_measure(mid, psi_id)
+    if ok:
+        target = f"PSI_ID={psi_id}" if psi_id else "PSI_ID из phaze_noise_id"
+        dpg.set_value(
+            STATUS_TEXT_TAG,
+            f"Данные добавлены в ПСИ (MeasureID={mid}, {target})",
+        )
+    else:
+        dpg.set_value(STATUS_TEXT_TAG, "Не удалось добавить данные в ПСИ")
+def _on_add_to_psi_2():
+    """
+    Обработчик кнопки «Добавить в ПСИ».
+    1. Берёт выбранный MeasureID из pn_mid.
+    2. Опционально берёт psi_id из pn_psi_id_override (переопределение).
+    3. Вызывает save_psidata_for_measure — там:
+         MeasureID → ID в phaze_noise → PSI_ID в phaze_noise_id
+         → запись в psidata с Measure_ID == PSI_ID.
+    """
+    mid_str = dpg.get_value("pn_mid")
+    if not mid_str or mid_str == ALL_MEAS_LABEL:
+        dpg.set_value(STATUS_TEXT_TAG, "Не выбран MeasureID")
+        return
+
+    try:
+        mid = int(mid_str)
+    except ValueError:
+        dpg.set_value(STATUS_TEXT_TAG, "Некорректный MeasureID")
+        return
+
+    # Необязательное переопределение PSI_ID из поля ввода
+    psi_id_str = (dpg.get_value("pn_psi_id_override") or "").strip()
+    psi_id: int | None = None
+    if psi_id_str:
+        try:
+            psi_id = int(psi_id_str)
+        except ValueError:
+            dpg.set_value(STATUS_TEXT_TAG, "Некорректный ID замера ПСИ")
+            return
+
+    # Импорт внутри функции — чтобы не было циклических зависимостей
+    from .PhaseNoise_Data import save_psidata_for_measure
+
+    ok = save_psidata_for_measure(mid, psi_id)
+    if ok:
+        target = f"PSI_ID={psi_id}" if psi_id else "PSI_ID из phaze_noise_id"
+        dpg.set_value(
+            STATUS_TEXT_TAG,
+            f"Данные добавлены в ПСИ (MeasureID={mid}, {target})",
+        )
+    else:
+        dpg.set_value(STATUS_TEXT_TAG, "Не удалось добавить данные в ПСИ")
+def _on_add_to_psi_1():
     """
     Считывает текущий MeasureID (из комбобокса pn_mid),
     опционально – ID замера ПСИ из поля pn_psi_id_override,
@@ -452,8 +583,116 @@ def _on_lookup_sync(full_rebuild: bool):
 
     _poll_sync_state(_finish)
 
-
 def _on_load(*_):
+    global _last_loaded_meas
+    try:
+        s = dpg.get_value("pn_spc") or ""
+        msk = dpg.get_value("pn_msk") or ""
+        mid_raw = dpg.get_value("pn_mid") or ""
+        n = dpg.get_value("pn_number") or ""
+        numbers = parse_numbers_input(dpg.get_value("pn_numbers_input") or "")
+
+        msk_val = msk if msk and msk != ALL_MSK_LABEL else None
+        mid = int(mid_raw) if str(mid_raw).isdigit() else None
+
+        if numbers:
+            meas = load_phaze_noise(numbers=numbers)
+        elif mid:
+            meas = load_phaze_noise(None, mid, None)
+        elif msk_val:
+            meas = load_phaze_noise(msk_val, None, None)
+        elif n:
+            meas = load_phaze_noise(None, None, n)
+        else:
+            dpg.set_value(STATUS_TEXT_TAG,
+                          "Выберите МСК / MeasureID / Номер или введите номера")
+            return
+
+        if meas.empty:
+            _last_loaded_meas = None
+            dpg.set_value(STATUS_TEXT_TAG, "Данные не найдены")
+            series_ui.render_series_table(pd.DataFrame(), [])
+            _fill_stats(pd.DataFrame(), [])
+            return
+
+        spec_row = load_specification(s) if s else None
+        norms = ensure_norms(build_norms(spec_row))
+        _fill_norms(s, norms)
+
+        if dpg.get_value("pn_only_good") and norms:
+            good_ids = [
+                row["ID"] for _, row in meas.iterrows()
+                if all(p["status"] != "Брак"
+                       for p in collect_norm_points(row.to_dict(), norms))
+            ]
+            meas = meas[meas["ID"].isin(good_ids)]
+            if meas.empty:
+                _last_loaded_meas = None
+                dpg.set_value(STATUS_TEXT_TAG, "Годных нет")
+                series_ui.render_series_table(pd.DataFrame(), [])
+                _fill_stats(pd.DataFrame(), [])
+                return
+
+        _fill_stats(meas, norms)
+        _last_loaded_meas = meas
+
+        pairs = []
+        for _, m in meas.iterrows():
+            mid_v = m.get("MeasureID")
+            n_v = m.get("N")
+            if mid_v is None or (isinstance(mid_v, float) and pd.isna(mid_v)):
+                continue
+            try:
+                pairs.append((int(mid_v), str(n_v or "").strip()))
+            except (TypeError, ValueError):
+                continue
+        pairs = list(dict.fromkeys(pairs))
+        mids = sorted({p[0] for p in pairs})
+
+        points = load_phaze_noise_data(pairs=pairs) if pairs else pd.DataFrame()
+        if points.empty and mids:
+            points = load_phaze_noise_data(measure_ids=mids)
+
+        log.info(f"on_load: points={len(points)} mids={len(mids)} pairs={len(pairs)}")
+
+        operators = {}
+        for _, m in meas.iterrows():
+            if "ID" not in m or pd.isna(m.get("ID")):
+                continue
+            try:
+                operators[int(m["ID"])] = get_operator_fname(m.get("Operator") or "")
+            except (TypeError, ValueError):
+                pass
+
+        series = list_series_from_points(points) if not points.empty else list(pairs)
+
+        prefer = (n or "").strip()
+        series_ui.store_load(points, meas, norms, operators, series,
+                             current_number=prefer or None)
+        cur = series_ui.get_current_number()
+        nums = series_ui.get_numbers()
+        if nums and dpg.does_item_exist("pn_number"):
+            dpg.configure_item("pn_number", items=nums)
+            if cur:
+                series_ui.set_current_number(cur, update_combo=True)
+
+        series_ui.render_series_table(meas, series)
+        series_ui.ensure_wheel_handler()
+        if not points.empty:
+            series_ui.redraw_graph()
+
+        dpg.set_value(
+            STATUS_TEXT_TAG,
+            f"Загружено {len(meas)} изм. - {len(points)} точек - "
+            f"{len(series)} кривых - график N {series_ui.get_current_number() or '-'} "
+            f"(колесо мыши - смена номера)"
+            + ("" if not points.empty else " (точек нет)")
+        )
+    except Exception as e:
+        log.exception(f"on_load error: {e}")
+        dpg.set_value(STATUS_TEXT_TAG, f"Ошибка: {e}")
+
+def _on_load_1(*_):
     try:
         s = dpg.get_value("pn_spc") or ""
         msk = dpg.get_value("pn_msk") or ""
