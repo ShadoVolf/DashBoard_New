@@ -25,14 +25,18 @@ _engine_cache: Engine | None = None
 
 
 def _engine() -> Engine:
+    """
+    mysql-connector-python (mysql+mysqlconnector://) не принимает
+    read_timeout / write_timeout — отсюда ошибка
+    «неизвестный аргумент read timeout» при проверке справочника.
+    Поддерживается connection_timeout (сек).
+    """
     global _engine_cache
     if _engine_cache is None:
         _engine_cache = create_engine(
             str(get_connection_string()),
             connect_args={
-                "connect_timeout": 5,
-                "read_timeout": 60,
-                "write_timeout": 60,
+                "connection_timeout": 10,
             },
             pool_pre_ping=True,
             pool_size=5,
@@ -125,7 +129,6 @@ def is_lookup_empty(engine=None):
         return True
 
 
-
 def _read_meta(engine):
     with engine.connect() as conn:
         row = conn.execute(text(
@@ -156,8 +159,6 @@ def _write_meta(engine, last_max_id, row_count):
             "mid": int(last_max_id or 0),
             "cnt": int(row_count or 0),
         })
-
-
 
 
 def _scan_range(engine, start_id, end_id, chunk_size, progress_callback,
@@ -396,7 +397,6 @@ def lookup_numbers(msk: str | None = None, measure_id: int | None = None,
 def find_in_lookup(numbers, engine=None):
     engine = engine or _engine()
 
-
     numbers_list = [str(n).strip().upper() for n in numbers if n]
     if not numbers_list:
         return set(), set(), []
@@ -456,7 +456,6 @@ def add_pairs_to_lookup(pairs, engine=None):
     if not pairs:
         return 0
     engine = engine or _engine()
-
 
     clean = set()
     for item in pairs:
