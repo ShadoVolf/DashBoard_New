@@ -107,7 +107,7 @@ def build_filter_bar():
 
 def build_info_panel():
     dpg.add_text("График PN(Freq)", color=(180, 220, 255))
-    with dpg.child_window(height=280, tag=GRAPH_CONTAINER, border=True):
+    with dpg.child_window(height=340, tag=GRAPH_CONTAINER, border=True):
         dpg.add_text("(график появится после <Загрузить>)", color=(120, 120, 120))
     dpg.add_separator()
     dpg.add_text("Спецификация ФШ", color=(180, 220, 255))
@@ -150,6 +150,10 @@ def init_cascade():
     except Exception as e:
         log.exception(f"cascade fill error: {e}")
     dpg.set_frame_callback(dpg.get_frame_count() + 15, _on_lookup_check)
+    try:
+        series_ui.ensure_wheel_handler()
+    except Exception:
+        pass
 
 
 def _on_type_change(sender=None, app_data=None, user_data=None):
@@ -215,7 +219,15 @@ def _on_mid_change(sender=None, app_data=None, user_data=None):
 def _on_number_change(sender=None, app_data=None, user_data=None):
     if _suppress_cascade:
         return
-    if dpg.get_value("pn_number"):
+    if series_ui.is_number_cb_suppressed():
+        return
+    n = dpg.get_value("pn_number") or ""
+    # если данные уже загружены — только сменить номер на графике
+    if series_ui.get_numbers():
+        if n:
+            series_ui.set_current_number(n, update_combo=False)
+        return
+    if n:
         _on_load()
 
 
@@ -387,12 +399,19 @@ def _on_load(*_):
         msk_val = msk if msk and msk != ALL_MSK_LABEL else None
         mid = int(mid_raw) if str(mid_raw).isdigit() else None
 
+        # Таблица: все измерения по МСК или MeasureID (номер не сужает выборку).
+        # Номер влияет только на то, какая кривая на графике (первый по умолчанию).
         if numbers:
             meas = load_phaze_noise(numbers=numbers)
-        elif mid or msk_val or n:
-            meas = load_phaze_noise(msk_val, mid, n or None)
+        elif mid:
+            meas = load_phaze_noise(None, mid, None)
+        elif msk_val:
+            meas = load_phaze_noise(msk_val, None, None)
+        elif n:
+            meas = load_phaze_noise(None, None, n)
         else:
-            dpg.set_value(STATUS_TEXT_TAG, "Выберите МСК / MeasureID / Номер или введите номера")
+            dpg.set_value(STATUS_TEXT_TAG,
+                          "Выберите МСК / MeasureID / Номер или введите номера")
             return
 
         if meas.empty:
@@ -449,14 +468,27 @@ def _on_load(*_):
                 pass
 
         series = list_series_from_points(points) if not points.empty else list(pairs)
-        series_ui.store_load(points, meas, norms, operators, series)
+
+        prefer = (n or "").strip()
+        series_ui.store_load(points, meas, norms, operators, series,
+                             current_number=prefer or None)
+        cur = series_ui.get_current_number()
+        nums = series_ui.get_numbers()
+        if nums and dpg.does_item_exist("pn_number"):
+            dpg.configure_item("pn_number", items=nums)
+            if cur:
+                series_ui.set_current_number(cur, update_combo=True)
+
         series_ui.render_series_table(meas, series)
+        series_ui.ensure_wheel_handler()
         if not points.empty:
             series_ui.redraw_graph()
 
         dpg.set_value(
             STATUS_TEXT_TAG,
-            f"Загружено {len(meas)} изм. · {len(points)} точек · {len(series)} кривых"
+            f"Загружено {len(meas)} изм. · {len(points)} точек · "
+            f"{len(series)} кривых · график № {series_ui.get_current_number() or '—'} "
+            f"(колесо мыши — смена номера)"
             + ("" if not points.empty else " (точек нет)")
         )
     except Exception as e:
@@ -475,8 +507,12 @@ def _on_pdf(mode: str, *_):
         mid = int(mid_raw) if str(mid_raw).isdigit() else None
         if numbers:
             meas = load_phaze_noise(numbers=numbers)
+        elif mid:
+            meas = load_phaze_noise(None, mid, None)
+        elif msk_val:
+            meas = load_phaze_noise(msk_val, None, None)
         else:
-            meas = load_phaze_noise(msk_val, mid, n or None)
+            meas = load_phaze_noise(None, None, n or None)
         if meas.empty:
             dpg.set_value(STATUS_TEXT_TAG, "Нечего экспортировать")
             return
