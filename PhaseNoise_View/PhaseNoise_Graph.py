@@ -1,4 +1,4 @@
-"""Построение графика ФШ, воспроизводящее оформление C++ Chart1."""
+"""Построение графика ФШ — тёмная тема, тонкие линии, размер под панель."""
 
 import matplotlib
 matplotlib.use("Agg")
@@ -6,6 +6,28 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 from .PhaseNoise_Constants import NORM_COLORS, STATUS_FAIL
 from .PhaseNoise_Helpers import collect_norm_points
+
+# размер под правую панель (~400px ширины)
+FIG_W = 5.2
+FIG_H = 3.4
+LINE_W = 0.8
+MARKER_S = 6
+NORM_S = 28
+
+
+def _apply_dark(ax, fig):
+    bg = "#1e1e1e"
+    fg = "#d0d0d0"
+    grid_c = "#404040"
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.tick_params(colors=fg, labelsize=8)
+    ax.xaxis.label.set_color(fg)
+    ax.yaxis.label.set_color(fg)
+    ax.title.set_color(fg)
+    for spine in ax.spines.values():
+        spine.set_color("#555555")
+    ax.grid(True, which="both", color=grid_c, alpha=0.6, linewidth=0.5)
 
 
 def build_graph(
@@ -15,108 +37,87 @@ def build_graph(
     operator_names: dict[int, str] | None = None,
     group_mode: str = "msk",
 ) -> plt.Figure:
-    """
-    graph_df:      DataFrame [MeasureID, N, Freq, PN]
-    measurements:  DataFrame заголовков phaze_noise
-    norms:         список норм из build_norms()
-    operator_names: dict MeasureID -> ФИО оператора
-    group_mode:
-        "msk"               — все измерения одной МСК на одном графике;
-        "resonator_single"  — все измерения одного резонатора на одном графике;
-        "resonator_multi"   — отдельный subplot на каждое измерение.
-    """
     operator_names = operator_names or {}
     meta = measurements.set_index("ID").to_dict("index") if not measurements.empty else {}
 
     if group_mode == "resonator_multi" and not graph_df.empty:
         ids = list(graph_df["MeasureID"].dropna().unique())
+        n = max(1, len(ids))
         fig, axes = plt.subplots(
-            nrows=len(ids), ncols=1, figsize=(10, 3 + 2.5 * len(ids)), sharex=True
+            nrows=n, ncols=1,
+            figsize=(FIG_W, max(2.2, 1.8 * n)),
+            sharex=True,
         )
-        if len(ids) == 1:
+        if n == 1:
             axes = [axes]
         for ax, mid in zip(axes, ids):
-            _draw_one(ax, graph_df[graph_df["MeasureID"] == mid], meta.get(mid, {}),
-                      norms, operator_names.get(mid, ""))
-        axes[-1].set_xlabel("Frequency, Hz")
-        fig.tight_layout()
+            _apply_dark(ax, fig)
+            _draw_one(ax, graph_df[graph_df["MeasureID"] == mid],
+                      meta.get(mid, {}), norms, operator_names.get(mid, ""))
+        axes[-1].set_xlabel("Frequency, Hz", fontsize=8)
+        fig.tight_layout(pad=0.4)
         return fig
 
-    fig, ax = plt.subplots(figsize=(11, 6.5))
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    _apply_dark(ax, fig)
     if not graph_df.empty:
         for mid, sub in graph_df.groupby("MeasureID"):
             m = meta.get(mid, {})
-            _draw_series(ax, sub, m, norms, operator_names.get(mid, ""), multi=True)
+            _draw_series(ax, sub, m, norms, operator_names.get(mid, ""),
+                         multi=True)
     ax.set_xscale("log")
-    ax.set_xlabel("Frequency, Hz")
-    ax.set_ylabel("dB/Hz")
-    ax.grid(True, which="both", alpha=0.3)
-    fig.tight_layout()
+    ax.set_xlabel("Frequency, Hz", fontsize=8)
+    ax.set_ylabel("dB/Hz", fontsize=8)
+    fig.tight_layout(pad=0.4)
     return fig
 
 
 def _draw_one(ax, sub, m, norms, operator_name):
     _draw_series(ax, sub, m, norms, operator_name, multi=False)
     ax.set_xscale("log")
-    ax.set_ylabel("dB/Hz")
+    ax.set_ylabel("dB/Hz", fontsize=8)
 
 
 def _draw_series(ax, sub, meas_row, norms, operator_name, multi: bool):
-    """Рисует одну линию измерения (Series2) и точки норм (Series3..)."""
-    label = f"МСК {meas_row.get('MSK','')} / № {meas_row.get('N','')}" if multi else None
+    label = (f"МСК {meas_row.get('MSK', '')} / № {meas_row.get('N', '')}"
+             if multi else None)
 
-    # Основная кривая — мелкие точки, как Series2 (PointsSeries, красные)
+    # тонкая линия + мелкие маркеры
     if not sub.empty:
-        ax.scatter(sub["Freq"], sub["PN"], s=4, color="red",
-                   label=label, zorder=3)
+        ordered = sub.sort_values("Freq")
+        ax.plot(ordered["Freq"], ordered["PN"],
+                color="#ff5555", linewidth=LINE_W, alpha=0.9,
+                label=label, zorder=3)
+        ax.scatter(ordered["Freq"], ordered["PN"],
+                   s=MARKER_S, color="#ff7777", linewidths=0, zorder=4)
 
-    # Точки норм
     norm_points = collect_norm_points(meas_row, norms)
     for np_ in norm_points:
         if np_["value"] is None:
             continue
         color = NORM_COLORS[(np_["num"] - 1) % len(NORM_COLORS)]
-        marker = "o" if np_["status"] != STATUS_FAIL else "X"
+        marker = "o" if np_["status"] != STATUS_FAIL else "x"
         ax.scatter([np_["offset"]], [np_["value"]],
-                   color=color, marker=marker, s=60, zorder=5,
+                   color=color, marker=marker, s=NORM_S, zorder=5,
                    label=None if multi else np_["marker_text"])
 
-    # Заголовки как в Chart1 (Title/SubTitle/Foot/SubFoot)
-    title = f"№ {meas_row.get('N','')}"
-    subtitle = "   ".join(p["marker_text"] for p in norm_points) if not multi else ""
     if not multi:
-        ax.set_title(title, fontsize=11, loc="left")
-        if subtitle:
-            ax.text(0.5, 1.02, subtitle, transform=ax.transAxes,
-                    ha="center", fontsize=9)
-        foot = (
-            f"Дата {meas_row.get('_Date_','')} {meas_row.get('_Time_','')}   "
-            f"Выполнил {operator_name or meas_row.get('Operator','')}   "
-            f"Идентификатор замера {meas_row.get('MeasureID','')}"
-        )
-        subfoot = (
-            f"МСК {meas_row.get('MSK','')}   {meas_row.get('Spc','')}   "
-            f"ID {meas_row.get('PSI_ID','')}"
-        )
-        ax.text(0.0, -0.08, foot, transform=ax.transAxes, fontsize=8, color="dimgray")
-        ax.text(0.0, -0.13, subfoot, transform=ax.transAxes, fontsize=8, color="dimgray")
-        # Нормы в подписи
-        norm_lines = [
-            f"Норма {p['num']} отстройка {p['offset']}Гц >{p['min']}dB/Hz"
-            for p in norm_points if p["min"] is not None
-        ]
-        for i, line in enumerate(norm_lines):
-            ax.text(0.0, -0.18 - 0.045 * i, line, transform=ax.transAxes,
-                    fontsize=8, color="dimgray")
-
-    if not multi:
-        ax.legend(fontsize=8, loc="best")
+        title = f"№ {meas_row.get('N', '')}"
+        ax.set_title(title, fontsize=9, loc="left", color="#d0d0d0")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7, loc="best",
+                      facecolor="#2a2a2a", edgecolor="#555555",
+                      labelcolor="#d0d0d0")
     else:
-        ax.legend(fontsize=8, loc="best")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7, loc="best",
+                      facecolor="#2a2a2a", edgecolor="#555555",
+                      labelcolor="#d0d0d0")
 
 
-def fig_to_png_bytes(fig: plt.Figure) -> bytes:
+def fig_to_png_bytes(fig) -> bytes:
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
     buf.seek(0)
     return buf.read()
