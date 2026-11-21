@@ -421,9 +421,30 @@ def _on_save(sender=None, app_data=None, user_data=None):
         traceback.print_exc()
 
 
+
+def _register_for_window_manager():
+    """Регистрация в меню «Окна» (как PhaseNoise / Assistant)."""
+    try:
+        from window_manager import register, rebuild_menu
+        register(WIN_TAG, "Коррекция выбросов ТЧХ", create_temp_outlier_window)
+        try:
+            rebuild_menu()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[TOC] window_manager недоступен: {e}", flush=True)
+
 def create_temp_outlier_window():
     if dpg.does_item_exist(WIN_TAG):
-        dpg.focus_item(WIN_TAG)
+        try:
+            dpg.configure_item(WIN_TAG, show=True)
+        except Exception:
+            pass
+        try:
+            dpg.focus_item(WIN_TAG)
+        except Exception:
+            pass
+        _register_for_window_manager()
         return
 
     try:

@@ -15,6 +15,12 @@ except ImportError as _e:
     print(f"[Virtual_Measure] module not available: {_e}")
     create_virtual_measure_window = None
 
+try:
+    from TempOutlier_Correction import create_temp_outlier_window
+except ImportError as _e:
+    print(f"[TempOutlier_Correction] module not available: {_e}")
+    create_temp_outlier_window = None
+
 # Создание главного меню
 def create_main_menu(dpg):
     # Защита от повторного создания
@@ -51,6 +57,13 @@ def create_main_menu(dpg):
                     tag="PhaseNoise_Menu",
                     user_data=dpg,
                 )
+                if create_temp_outlier_window is not None:
+                    dpg.add_menu_item(
+                        label="Коррекция выбросов ТЧХ",
+                        callback=show_temp_outlier,
+                        tag="TempOutlier_Menu",
+                        user_data=dpg,
+                    )
 
         # === НОВОЕ: пункт верхнего уровня «Ассистент» ===
         dpg.add_menu_item(
@@ -262,6 +275,20 @@ def show_virtual_measure(sender=None, data=None):
         print(f"[Virtual_Measure] error: {e}")
         import traceback
         traceback.print_exc()
+
+
+def show_temp_outlier(sender=None, data=None, dpg=None):
+    """Открыть окно коррекции выбросов температурных кривых."""
+    if create_temp_outlier_window is None:
+        print("[TempOutlier_Correction] module not loaded")
+        return
+    try:
+        create_temp_outlier_window()
+    except Exception as e:
+        print(f"[TempOutlier_Correction] error: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 def show_assistant(sender=None, data=None, dpg_mod=None):
     """Открыть окно ассистента (20 %×80 %, слева, под user-окном)."""
