@@ -31,11 +31,14 @@ def set_nn_options(opts: Dict[str, Any]) -> None:
 
 def open_settings_window() -> None:
     if dpg.does_item_exist(SETTINGS_WIN):
-        dpg.focus_item(SETTINGS_WIN)
+        try:
+            dpg.focus_item(SETTINGS_WIN)
+        except Exception:
+            pass
         return
 
     labels = {
-        "use_isolation_forest": "Isolation Forest / autoencoder outlier score",
+        "use_isolation_forest": "Isolation Forest outlier score",
         "use_autoencoder": "Autoencoder anomaly detection",
         "use_tcn_restore": "TCN / seq2seq curve restore",
         "use_failure_classifier": "Failure type classifier (stand / single / noise)",
@@ -45,8 +48,8 @@ def open_settings_window() -> None:
     with dpg.window(
         label="TOC - настройки NN",
         tag=SETTINGS_WIN,
-        width=480,
-        height=320,
+        width=500,
+        height=340,
         modal=False,
     ):
         dpg.add_text("Нейросетевые методы (все отключены по умолчанию)")
@@ -60,9 +63,9 @@ def open_settings_window() -> None:
             )
         dpg.add_separator()
         dpg.add_text(
-            "При включении алгоритмы подключаются в build_corrected_temps "
-            "(hooks). Без моделей - классика: MAD + consensus + регрессия.",
-            wrap=450,
+            "При включении методы подключаются в build_corrected_temps. "
+            "Без моделей: MAD + consensus + регрессия.",
+            wrap=470,
         )
         with dpg.group(horizontal=True):
             dpg.add_button(label="Применить", callback=_on_apply, width=120)
