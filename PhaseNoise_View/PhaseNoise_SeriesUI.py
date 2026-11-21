@@ -14,6 +14,10 @@ from .PhaseNoise_Graph import (
     unique_numbers_from_points, PLOT_TAG, PLOT_TAG_BIG,
     open_enlarged_graph, BIG_WINDOW_TAG,
 )
+from .PhaseNoise_Filter import apply_curve_filter, FILTER_NONE
+
+_filtered_cache_mode: str = FILTER_NONE
+_filtered_cache_points: pd.DataFrame | None = None
 
 log = logging.getLogger("PhaseNoise.SeriesUI")
 
@@ -29,8 +33,58 @@ _current_number: str = ""
 _wheel_registered = False
 _suppress_number_cb = False
 
-
 def store_load(points, meas, norms, operators, series, current_number: str | None = None):
+    global _last_points, _last_meas, _last_norms, _last_operators
+    global _series_selected, _numbers, _current_number
+    global _filtered_cache_mode, _filtered_cache_points
+
+    _last_meas = meas
+    _last_norms = norms or []
+    _last_points = points
+    _last_operators = operators or {}
+    _series_selected = {series_key(mid, n): True for mid, n in series}
+
+    _filtered_cache_mode = FILTER_NONE
+    _filtered_cache_points = None
+
+    nums = unique_numbers_from_points(points) if points is not None and not points.empty else []
+    if not nums and meas is not None and not meas.empty and "N" in meas.columns:
+        nums = sorted(
+            {str(x).strip() for x in meas["N"].dropna().astype(str) if str(x).strip()},
+            key=str.upper,
+        )
+    _numbers = nums
+
+    if current_number and str(current_number).strip() in {n for n in _numbers}:
+        _current_number = str(current_number).strip()
+    elif current_number:
+        cu = str(current_number).strip().upper()
+        match = next((n for n in _numbers if n.upper() == cu), None)
+        _current_number = match or (_numbers[0] if _numbers else "")
+    else:
+        _current_number = _numbers[0] if _numbers else ""
+
+def _get_display_points() -> pd.DataFrame | None:
+    global _filtered_cache_mode, _filtered_cache_points
+    if _last_points is None or _last_points.empty:
+        return _last_points
+
+    mode = FILTER_NONE
+    if dpg.does_item_exist("pn_filter_mode"):
+        mode = dpg.get_value("pn_filter_mode") or FILTER_NONE
+
+    if mode == FILTER_NONE:
+        return _last_points
+
+    if _filtered_cache_mode == mode and _filtered_cache_points is not None:
+        return _filtered_cache_points
+
+    _filtered_cache_points = apply_curve_filter(_last_points, mode)
+    _filtered_cache_mode = mode
+    return _filtered_cache_points
+
+
+def store_load_1(points, meas, norms, operators, series, current_number: str | None = None):
     global _last_points, _last_meas, _last_norms, _last_operators
     global _series_selected, _numbers, _current_number
 
@@ -133,8 +187,54 @@ def cycle_number(delta: int) -> None:
 def is_number_cb_suppressed() -> bool:
     return _suppress_number_cb
 
-
 def redraw_graph():
+    global _last_meas, _last_norms, _last_operators, _current_number
+    pts = _get_display_points()
+    if pts is None or pts.empty:
+        if dpg.does_item_exist(GRAPH_CONTAINER):
+            dpg.delete_item(GRAPH_CONTAINER, children_only=True)
+            dpg.add_text("(нет точек для графика)", parent=GRAPH_CONTAINER,
+                         color=(140, 140, 140))
+        return
+
+    mode = _group_mode()
+    nfilter = None if mode == "msk" else (_current_number or None)
+
+    render_graph(
+        GRAPH_CONTAINER,
+        pts,
+        _last_meas if _last_meas is not None else pd.DataFrame(),
+        _last_norms or [],
+        _last_operators,
+        group_mode=mode,
+        height=320,
+        selected_keys=selected_keys(),
+        number_filter=nfilter,
+    )
+
+    if dpg.does_item_exist(BIG_WINDOW_TAG) and dpg.does_item_exist("pn_graph_big_container"):
+        try:
+            sh = dpg.get_viewport_client_height() or 800
+            h = max(400, int(sh * 0.70) - 80)
+        except Exception:
+            h = 500
+        from .PhaseNoise_Graph import X_AXIS_TAG_BIG, Y_AXIS_TAG_BIG
+        render_graph(
+            "pn_graph_big_container",
+            pts,
+            _last_meas if _last_meas is not None else pd.DataFrame(),
+            _last_norms or [],
+            _last_operators,
+            group_mode=mode,
+            height=h,
+            selected_keys=selected_keys(),
+            number_filter=nfilter,
+            plot_tag=PLOT_TAG_BIG,
+            x_tag=X_AXIS_TAG_BIG,
+            y_tag=Y_AXIS_TAG_BIG,
+        )
+
+def redraw_graph_1():
     global _last_points, _last_meas, _last_norms, _last_operators
     global _current_number
     if _last_points is None or _last_points.empty:
@@ -181,8 +281,25 @@ def redraw_graph():
             y_tag=Y_AXIS_TAG_BIG,
         )
 
-
 def on_enlarge(*_):
+    pts = _get_display_points()
+    if pts is None or pts.empty:
+        if dpg.does_item_exist(STATUS_TEXT_TAG):
+            dpg.set_value(STATUS_TEXT_TAG, "Нет данных для увеличенного графика")
+        return
+    mode = _group_mode()
+    nfilter = None if mode == "msk" else (_current_number or None)
+    open_enlarged_graph(
+        pts,
+        _last_meas if _last_meas is not None else pd.DataFrame(),
+        _last_norms or [],
+        _last_operators,
+        group_mode=mode,
+        selected_keys=selected_keys(),
+        number_filter=nfilter,
+    )
+
+def on_enlarge_1(*_):
     if _last_points is None or _last_points.empty:
         if dpg.does_item_exist(STATUS_TEXT_TAG):
             dpg.set_value(STATUS_TEXT_TAG, "Нет данных для увеличенного графика")

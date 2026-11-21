@@ -26,6 +26,7 @@ from .PhaseNoise_Graph import render_graph, list_series_from_points
 from . import PhaseNoise_SeriesUI as series_ui
 from .PhaseNoise_Export import export_to_pdf
 from .PhaseNoise_Lookup import sync_lookup_table, check_lookup_actual
+from .PhaseNoise_Filter import FILTER_MODES, FILTER_NONE
 
 # Кэш последних загруженных измерений — используется кнопкой «Добавить в ПСИ»,
 # когда в pn_mid выбран «все», но по факту загружен один замер.
@@ -151,6 +152,16 @@ def build_filter_bar():
                           default_value="msk", tag="pn_group_mode", width=140,
                           callback=lambda s, a: series_ui.redraw_graph()
                           if series_ui.get_numbers() else None)
+        with dpg.group(width=155):
+            dpg.add_spacer(height=18)
+            dpg.add_combo(
+                FILTER_MODES,
+                default_value=FILTER_NONE,
+                tag="pn_filter_mode",
+                width=155,
+                callback=lambda s, a: series_ui.redraw_graph()
+                if series_ui.get_numbers() else None,
+            )
         with dpg.group(width=110):
             dpg.add_spacer(height=18)
             dpg.add_button(label="Загрузить", width=110, callback=_on_load)
@@ -158,6 +169,57 @@ def build_filter_bar():
 
 # PhaseNoise_UI.py  (добавить новую функцию)
 def _on_add_to_psi(*_):
+    """
+    Обработчик кнопки «Добавить в ПСИ».
+    Если отмечен чекбокс «Сохранять в ПСИ обработанные данные», в save_psidata_for_measure
+    передаётся активный режим фильтрации из pn_filter_mode.
+    """
+    mid = _resolve_measure_id_for_psi()
+    if mid is None:
+        dpg.set_value(
+            STATUS_TEXT_TAG,
+            "Не выбран MeasureID. Выберите MeasureID в фильтре "
+            "или загрузите так, чтобы в выборке был ровно один замер.",
+        )
+        return
+
+    psi_id_str = (dpg.get_value("pn_psi_id_override") or "").strip()
+    psi_id: int | None = None
+    if psi_id_str:
+        try:
+            psi_id = int(psi_id_str)
+        except ValueError:
+            dpg.set_value(STATUS_TEXT_TAG, "Некорректный ID замера ПСИ")
+            return
+
+    use_filtered = bool(
+        dpg.does_item_exist("pn_psi_use_filtered")
+        and dpg.get_value("pn_psi_use_filtered")
+    )
+    filter_mode = FILTER_NONE
+    if use_filtered and dpg.does_item_exist("pn_filter_mode"):
+        filter_mode = dpg.get_value("pn_filter_mode") or FILTER_NONE
+
+    from .PhaseNoise_Data import save_psidata_for_measure
+
+    saved, skipped = save_psidata_for_measure(
+        mid, psi_id=psi_id, filter_mode=filter_mode
+    )
+    if saved > 0:
+        target = f"PSI_ID={psi_id}" if psi_id else "PSI_ID из phaze_noise_id"
+        src_note = f", фильтр: {filter_mode}" if filter_mode != FILTER_NONE else ""
+        dpg.set_value(
+            STATUS_TEXT_TAG,
+            f"Добавлено в ПСИ: {saved} шт. (пропущено: {skipped}, "
+            f"MeasureID={mid}, {target}{src_note})",
+        )
+    else:
+        dpg.set_value(
+            STATUS_TEXT_TAG,
+            f"Не удалось добавить данные в ПСИ (MeasureID={mid}, пропущено: {skipped})",
+        )
+
+def _on_add_to_psi_1(*_):
     """
     Обработчик кнопки «Добавить в ПСИ».
     MeasureID берётся через _resolve_measure_id_for_psi:
@@ -302,6 +364,11 @@ def build_info_panel():
         width=-1,
         height=26,
         callback=_on_add_to_psi,
+    )
+    dpg.add_checkbox(
+        label="Сохранять в ПСИ обработанные данные",
+        tag="pn_psi_use_filtered",
+        default_value=False,
     )
     dpg.add_input_text(
         tag="pn_psi_id_override",
