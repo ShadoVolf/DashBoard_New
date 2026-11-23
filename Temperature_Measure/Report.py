@@ -2173,6 +2173,218 @@ def _build_combined_footer_table(data_df, spc_map, stats_df,
     return table, total_good, total_bad
 
 
+
+def create_simple_otk_protocol(data_df, status_df, view_data, tu_data,
+                               presentation_params, spc_row,
+                               measure_id, filename="simple_otk.pdf",
+                               measure_protokol_id=None,
+                               protokol_n=None):
+    """
+    Простой ОТК-протокол на базе предъявительского.
+
+    Отличия от предъявительского (create_presentation_protocol):
+      - Заголовок: «Протокол измерения резонаторов № {protokol_n}»
+      - Нет строки «Договор № … для организации …»
+      - В таблице только нормы ТУ (без норм ОТК / ПСИ)
+      - В заключении нет формулировки про передачу / предъявление ВП
+    """
+    from reportlab.lib.pagesizes import landscape
+
+    page_w, page_h = landscape(A4)
+    margin = 12 * mm
+    usable_w = page_w - 2 * margin
+    n = len(presentation_params)
+    if n == 0:
+        raise ValueError("Нет параметров для протокола")
+
+    story = []
+
+    # ======================= 1. ШАПКА =======================
+    logo_path = os.path.join('Pictures', 'Morion_Logo.png')
+    if os.path.exists(logo_path):
+        logo_img = Image(logo_path, width=12 * mm, height=12 * mm)
+    else:
+        logo_img = Spacer(1, 1)
+
+    logo_p = Paragraph('<b>АО "Морион"</b>',
+                       ParagraphStyle('PLogo', fontName='Arial', fontSize=13, leading=15, leftIndent=5))
+
+    left_block = Table([[logo_img, logo_p]], colWidths=[14 * mm, None])
+    left_block.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('TOPPADDING', (0, 0), (-1, -1), 0),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+    ]))
+
+    # Номер протокола — из аргумента или из measure_protokol_id / measure_id
+    pn = protokol_n
+    if pn is None:
+        pn = measure_protokol_id if measure_protokol_id is not None else measure_id
+    title_p = Paragraph(
+        f"Протокол измерения резонаторов № <b>{pn}</b><br/>от ________________",
+        ParagraphStyle('PHTitle', fontName='Arial', fontSize=11, leading=14, alignment=TA_CENTER)
+    )
+
+    qr_data = str(measure_protokol_id) if measure_protokol_id else str(measure_id)
+    try:
+        qr_img = Image(generate_qr_code(qr_data), width=16 * mm, height=16 * mm)
+    except Exception:
+        qr_img = Spacer(1, 1)
+
+    qr_text = Paragraph(qr_data, ParagraphStyle('QRText', fontName='Arial', fontSize=8, alignment=TA_CENTER))
+
+    qr_block = Table([[qr_img], [qr_text]], colWidths=[18 * mm])
+    qr_block.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('TOPPADDING', (0, 0), (-1, -1), 0),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+    ]))
+
+    top = Table([[left_block, title_p, qr_block]],
+                colWidths=[usable_w * 0.33, usable_w * 0.40, usable_w * 0.27])
+    top.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+        ('ALIGN', (1, 0), (1, 0), 'CENTER'),
+        ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    story.append(top)
+    story.append(Spacer(1, 3 * mm))
+
+    # Шапка без договора и заказчика
+    header_text = f"""
+    Испытания изделий: <b>{view_data.get('Spc_Text', '—')}</b> на соответствие требованиям технических условий <b>{view_data.get('TU', '—')}</b><br/>
+    Кварцевые резонаторы изготовлены в эквиваленте типа <b>{view_data.get('TGK', '—')}</b><br/>
+    Внешний вид и маркировка соответствуют ТУ, посторонние частицы отсутствуют.<br/>
+    МСК № <b>{view_data.get('MSK', '—')}</b> &nbsp;&nbsp;&nbsp;&nbsp; Дата изготовления <b>{view_data.get('Date', '—')}</b>
+    """
+    header_style = ParagraphStyle('HeaderText', fontName='Arial', fontSize=9.5, leading=11.5, spaceAfter=3)
+    story.append(Paragraph(header_text, header_style))
+    story.append(Spacer(1, 2 * mm))
+
+    # ======================= 2. ТАБЛИЦА (только нормы ТУ) =======================
+    w_num = 45
+    w_res = 55
+    w_param = (usable_w - w_num - w_res) / n
+    col_widths = [w_num, w_res] + [w_param] * n
+
+    HDR_H = 120
+    s_center = _cs(7)
+    s_header = _cs(6.5)
+    s_header_left = ParagraphStyle('SHL', fontName='Arial', fontSize=6.5, leading=8, alignment=TA_CENTER,
+                                   wordWrap='CJK')
+
+    rows = []
+
+    # Row 0 — заголовки параметров
+    r0 = [_RotText("№№", w_num, HDR_H, bold=True),
+          _RotText("№ резонатора", w_res, HDR_H, bold=True)]
+    for p in presentation_params:
+        title = (f"{p['name']}, {p['units']}" if p.get('units') else p['name'])
+        r0.append(_RotText(title, w_param, HDR_H, bold=True))
+    rows.append(r0)
+
+    # Row 1 — Нормы ТУ (не более)
+    r1 = [Paragraph("<b>Нормы ТУ</b>", s_header_left),
+          Paragraph("<b>не более</b>", s_header_left)]
+    for p in presentation_params:
+        r1.append(Paragraph(_fnum(p['max_tu']), s_center))
+    rows.append(r1)
+
+    # Row 2 — Нормы ТУ (не менее)
+    r2 = ["", Paragraph("<b>не менее</b>", s_header_left)]
+    for p in presentation_params:
+        r2.append(Paragraph(_fnum(p['min_tu']), s_center))
+    rows.append(r2)
+
+    # Row 3 — № п.п. требований ТУ
+    tu_name = tu_data.get('tu_name', '') or ''
+    label_tu = (f"<b>№ п.п. требований<br/>ТУ {tu_name}</b>" if tu_name else "<b>№ п.п. требований ТУ</b>")
+    r3 = [Paragraph(label_tu, s_header_left), Spacer(1, 1)]
+    for p in presentation_params:
+        r3.append(Paragraph(p['norm_p'] or "—", s_header))
+    rows.append(r3)
+
+    # Row 4 — № п.п. методов контроля
+    r4 = [Paragraph("<b>№ п.п. методов<br/>контроля</b>", s_header_left), Spacer(1, 1)]
+    for p in presentation_params:
+        r4.append(Paragraph(p['cntrl'] or "—", s_header))
+    rows.append(r4)
+
+    header_rows = len(rows)
+
+    # Данные
+    for idx, (_, dr) in enumerate(data_df.iterrows(), 1):
+        row = [Paragraph(str(idx), s_center), Paragraph(str(dr.get('Numbers', '')), s_center)]
+        for p in presentation_params:
+            v = dr.get(p['param']) if p['param'] in data_df.columns else None
+            row.append(Paragraph(_fnum(v, 3), s_center))
+        rows.append(row)
+
+    table = Table(rows, colWidths=col_widths, repeatRows=header_rows)
+    styles = [
+        ('FONTNAME', (0, 0), (-1, -1), 'Arial'),
+        ('GRID', (0, 0), (-1, -1), 0.4, colors.black),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 2),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+        ('TOPPADDING', (0, 0), (-1, -1), 1),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E8E8E8')),
+        ('BACKGROUND', (0, 1), (-1, 2), colors.HexColor('#F5F5F5')),
+        ('SPAN', (0, 1), (0, 2)),  # «Нормы ТУ» на 2 строки
+    ]
+    # SPAN для строк № п.п.
+    styles.append(('SPAN', (0, 3), (1, 3)))
+    styles.append(('SPAN', (0, 4), (1, 4)))
+
+    table.setStyle(TableStyle(styles))
+    story.append(table)
+    story.append(Spacer(1, 8 * mm))
+
+    # ======================= 3. ПОДПИСИ (заключение убрано) =======================
+    concl = ParagraphStyle('PC', fontName='Arial', fontSize=9.5, leading=12, alignment=TA_LEFT)
+    sig_data = [
+        [Paragraph("Представитель ОТК", concl), Spacer(1, 1), Spacer(1, 1), Spacer(1, 1)],
+        [Spacer(1, 1), Paragraph("______________________", concl), Paragraph("______________________", concl),
+         Paragraph("Дата __________", concl)],
+        [Spacer(1, 1), Paragraph("<font size=7>подпись</font>", concl),
+         Paragraph("<font size=7>инициалы, фамилия</font>", concl), Spacer(1, 1)],
+    ]
+    sig_tbl = Table(sig_data, colWidths=[usable_w * 0.20, usable_w * 0.25, usable_w * 0.30, usable_w * 0.25])
+    sig_tbl.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'BOTTOM'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+    ]))
+    story.append(sig_tbl)
+
+    # ======================= 5. BUILD =======================
+    def _footer(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont('Arial', 8)
+        canvas.setFillColor(colors.HexColor('#555555'))
+        canvas.drawRightString(page_w - margin, 5 * mm, f"Лист {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+    path = Options.get_measure_protokol_path() + "\\" + filename
+    doc = SimpleDocTemplate(
+        path, pagesize=landscape(A4),
+        leftMargin=margin, rightMargin=margin,
+        topMargin=8 * mm, bottomMargin=10 * mm)
+    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+    return path
+
+
 def create_psi_protocol(data_df, status_df, view_data, tu_data,
                         presentation_params, spc_row,
                         measure_id, filename="psi.pdf",
