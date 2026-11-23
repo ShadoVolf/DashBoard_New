@@ -38,6 +38,8 @@ import dearpygui.dearpygui as dpg
 from . import db as doc_db
 from .seed import seed_all
 from .seed import seed_all
+from .seed_phasenoise import seed_phasenoise_docs
+
 try:
     from .seed_assistant import seed_assistant_docs
 except Exception:
@@ -488,6 +490,7 @@ def _create_main_window():
         doc_db.ensure_tables()
         seed_all()
         seed_assistant_docs()
+        seed_phasenoise_docs()
     except Exception as e:
         print(f"[Documentation] init error: {e}")
 
@@ -1232,6 +1235,7 @@ def create_documentation_window():
         doc_db.ensure_tables()
         seed_all()
         seed_assistant_docs()
+        seed_phasenoise_docs()
     except Exception as e:
         print(f"[Documentation] init error: {e}")
 
