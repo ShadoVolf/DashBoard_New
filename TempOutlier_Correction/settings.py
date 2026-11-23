@@ -8,7 +8,6 @@ import dearpygui.dearpygui as dpg
 
 SETTINGS_WIN = "toc_settings_window"
 
-# default flags
 DEFAULT_NN: Dict[str, bool] = {
     "use_isolation_forest": False,
     "use_autoencoder": False,
@@ -36,7 +35,6 @@ def open_settings_window() -> None:
         return
 
     labels = {
-        "use_isolation_forest": "Isolation Forest / autoencoder outlier score",
         "use_autoencoder": "Autoencoder anomaly detection",
         "use_tcn_restore": "TCN / seq2seq curve restore",
         "use_failure_classifier": "Failure type classifier (stand / single / noise)",
@@ -46,8 +44,6 @@ def open_settings_window() -> None:
     with dpg.window(
         label="TOC - настройки NN",
         tag=SETTINGS_WIN,
-        width=480,
-        height=320,
         modal=False,
     ):
         dpg.add_text("Нейросетевые методы (все отключены по умолчанию)")
@@ -61,9 +57,6 @@ def open_settings_window() -> None:
             )
         dpg.add_separator()
         dpg.add_text(
-            "При включении алгоритмы подключаются в build_corrected_temps "
-            "(hooks). Без моделей - классика: MAD + consensus + регрессия.",
-            wrap=450,
         )
         with dpg.group(horizontal=True):
             dpg.add_button(label="Применить", callback=_on_apply, width=120)
