@@ -63,6 +63,11 @@ class MEASURE_DATA:
     '''
     control_rk_correction_f_table = None
 
+    '''
+        Содержит таблицу коррекции R/Q для контрольных образцов типа RK
+    '''
+    control_rk_correction_rq_table = None
+
     # Содержит статус возможности использования контрольных образцов
     control_rk_status = False
 
@@ -273,6 +278,16 @@ class MEASURE_DATA:
     @staticmethod
     def get_control_RK_corection_f_table():
         return MEASURE_DATA.control_rk_correction_f_table
+
+    # Запоминает протокол коррекции R/Q для контрольных образцов RK
+    @staticmethod
+    def set_control_RK_corection_rq_table(value):
+        MEASURE_DATA.control_rk_correction_rq_table = value
+
+    # Возвращает протокол коррекции R/Q для контрольных образцов RK
+    @staticmethod
+    def get_control_RK_corection_rq_table():
+        return MEASURE_DATA.control_rk_correction_rq_table
 
     # Вовращает статус использования контрольных образцов
     @staticmethod

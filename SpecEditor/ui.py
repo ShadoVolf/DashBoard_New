@@ -463,6 +463,8 @@ def _tab_corrections():
             _row_kv("Коррекция C1 (физ.)",    "physical_C1_correction")
             _row_kv("Коррекция точности",     "F_correction")
             _row_kv("Коррекция ТЧХ",          "TCH_correction")
+            _row_kv("Коррекция R (по RK)",    "R_correction")
+            _row_kv("Коррекция Q (по RK)",    "Q_correction")
             _row_kv("FL расчётное",           "FL_Num")
             _row_kv("FL расчётное (вирт.)",   "FL_Num_Virt")
 

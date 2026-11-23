@@ -919,6 +919,8 @@ def prepare_print_func(df, temp=True, sorted='Positions'):
         'Operator': operator, 'Full_Msk': msk, 'PMI': msk_pmi,
         'TCH_Type': spc['TCH_Approx_Type'],
         'TCH_correction': cor_tch, 'F_correction': cor_f,
+        'R_correction': bool(spc['R_correction']) if 'R_correction' in spc.index else False,
+        'Q_correction': bool(spc['Q_correction']) if 'Q_correction' in spc.index else False,
     }
     print_data, print_headers = prepare_print(data, data_status)
     result_df = result_df.merge(

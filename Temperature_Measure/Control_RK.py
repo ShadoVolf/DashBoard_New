@@ -485,6 +485,184 @@ def calculate_corrections(main_df):
     return main_df_corrected, numbers
 
 
+def calculate_rq_corrections(main_df, correct_r=True, correct_q=True):
+    """
+    Коррекция R и/или Q по контрольным резонаторам типа RK.
+
+    Логика:
+      1. Берём измеренные R/Q контрольных образцов.
+      2. Сравниваем с эталонными значениями из таблицы control_rk.
+      3. Усредняем разницу (с отбрасыванием выбросов по IQR).
+      4. Сдвигаем R/Q всех изделий в круге на эту величину.
+
+    Параметры:
+      main_df   — датафрейм результатов текущего круга
+      correct_r — применять коррекцию R
+      correct_q — применять коррекцию Q
+
+    Возвращает:
+      (main_df_corrected, numbers)
+    """
+    data = MEASURE_DATA.get_control_data_RK()
+    if not data:
+        print("Нет данных контрольных образцов RK — коррекция R/Q пропущена")
+        return main_df, []
+
+    control_measurements_df = data['Result']
+    numbers = control_measurements_df['Numbers'].tolist()
+    reference_measurements_df = load_control_rk_value(numbers)
+
+    merged_control = pd.merge(
+        control_measurements_df,
+        reference_measurements_df.rename(columns={'N': 'Numbers'}),
+        on='Numbers',
+        suffixes=('_meas', '_ref')
+    )
+
+    # Подбор имён колонок R/Q в эталоне и в измерениях
+    def _pick_col(df, candidates):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    r_meas_col = _pick_col(merged_control, ['R_meas', 'R'])
+    r_ref_col = _pick_col(merged_control, ['R_ref', 'R_etalon', 'R_et', 'Rs', 'R0'])
+    # если merge не добавил суффиксы (колонка только в одном df)
+    if r_meas_col is None and 'R' in control_measurements_df.columns:
+        # R только в измерениях — подтянем эталон вручную
+        if 'R' in reference_measurements_df.columns:
+            merged_control = merged_control.merge(
+                reference_measurements_df[['N', 'R']].rename(columns={'N': 'Numbers', 'R': 'R_ref'}),
+                on='Numbers', how='left'
+            )
+            r_meas_col = 'R'
+            r_ref_col = 'R_ref'
+        elif 'R' in merged_control.columns and 'R_ref' not in merged_control.columns:
+            # ambiguous
+            pass
+
+    q_meas_col = _pick_col(merged_control, ['Q_meas', 'Q'])
+    q_ref_col = _pick_col(merged_control, ['Q_ref', 'Q_etalon', 'Q_et', 'Qs', 'Q0'])
+    if q_meas_col is None and 'Q' in control_measurements_df.columns:
+        if 'Q' in reference_measurements_df.columns:
+            merged_control = merged_control.merge(
+                reference_measurements_df[['N', 'Q']].rename(columns={'N': 'Numbers', 'Q': 'Q_ref'}),
+                on='Numbers', how='left'
+            )
+            q_meas_col = 'Q'
+            q_ref_col = 'Q_ref'
+
+    # Пересчёт на случай, когда после первого merge уже есть R_meas/R_ref
+    if r_meas_col is None:
+        r_meas_col = _pick_col(merged_control, ['R_meas', 'R'])
+    if r_ref_col is None:
+        r_ref_col = _pick_col(merged_control, ['R_ref', 'R_etalon', 'R_et'])
+    if q_meas_col is None:
+        q_meas_col = _pick_col(merged_control, ['Q_meas', 'Q'])
+    if q_ref_col is None:
+        q_ref_col = _pick_col(merged_control, ['Q_ref', 'Q_etalon', 'Q_et'])
+
+    print(f"Колонки R: meas={r_meas_col}, ref={r_ref_col}; Q: meas={q_meas_col}, ref={q_ref_col}")
+
+    def remove_outliers_iqr(series):
+        s = series.dropna()
+        if s.empty:
+            return series.notna() * False  # всё False
+        Q1 = s.quantile(0.25)
+        Q3 = s.quantile(0.75)
+        IQR = Q3 - Q1
+        if IQR == 0:
+            return series.notna()
+        lower = Q1 - 1.5 * IQR
+        upper = Q3 + 1.5 * IQR
+        return series.between(lower, upper)
+
+    main_df_corrected = main_df.copy()
+    delta_R_mean = 0.0
+    delta_Q_mean = 0.0
+
+    if correct_r:
+        if r_meas_col and r_ref_col and r_meas_col in merged_control.columns and r_ref_col in merged_control.columns:
+            merged_control['delta_R'] = (
+                pd.to_numeric(merged_control[r_meas_col], errors='coerce')
+                - pd.to_numeric(merged_control[r_ref_col], errors='coerce')
+            )
+            mask_r = remove_outliers_iqr(merged_control['delta_R'])
+            filtered_r = merged_control.loc[mask_r, 'delta_R']
+            delta_R_mean = float(filtered_r.mean()) if len(filtered_r) else 0.0
+            if pd.isna(delta_R_mean):
+                delta_R_mean = 0.0
+            print(f"Средняя поправка delta_R = {delta_R_mean:.6g} (n={len(filtered_r)})")
+            table = tabulate(
+                merged_control[['Numbers', r_meas_col, r_ref_col, 'delta_R']].rename(
+                    columns={r_meas_col: 'R_meas', r_ref_col: 'R_ref'}
+                ),
+                headers='keys', tablefmt='grid', showindex=False
+            )
+            print(table)
+            if 'R' in main_df_corrected.columns:
+                main_df_corrected['R_cor'] = pd.to_numeric(main_df_corrected['R'], errors='coerce') - delta_R_mean
+                main_df_corrected['delta_R'] = delta_R_mean
+                # Применяем скорректированное значение как рабочее R
+                main_df_corrected['R'] = main_df_corrected['R_cor']
+            else:
+                print("ВНИМАНИЕ: в result_df нет колонки R — коррекция R не применена к изделиям")
+        else:
+            print("ВНИМАНИЕ: не найдены колонки R meas/ref для коррекции R")
+            correct_r = False
+
+    if correct_q:
+        if q_meas_col and q_ref_col and q_meas_col in merged_control.columns and q_ref_col in merged_control.columns:
+            merged_control['delta_Q'] = (
+                pd.to_numeric(merged_control[q_meas_col], errors='coerce')
+                - pd.to_numeric(merged_control[q_ref_col], errors='coerce')
+            )
+            mask_q = remove_outliers_iqr(merged_control['delta_Q'])
+            filtered_q = merged_control.loc[mask_q, 'delta_Q']
+            delta_Q_mean = float(filtered_q.mean()) if len(filtered_q) else 0.0
+            if pd.isna(delta_Q_mean):
+                delta_Q_mean = 0.0
+            print(f"Средняя поправка delta_Q = {delta_Q_mean:.6g} (n={len(filtered_q)})")
+            table = tabulate(
+                merged_control[['Numbers', q_meas_col, q_ref_col, 'delta_Q']].rename(
+                    columns={q_meas_col: 'Q_meas', q_ref_col: 'Q_ref'}
+                ),
+                headers='keys', tablefmt='grid', showindex=False
+            )
+            print(table)
+            if 'Q' in main_df_corrected.columns:
+                main_df_corrected['Q_cor'] = pd.to_numeric(main_df_corrected['Q'], errors='coerce') - delta_Q_mean
+                main_df_corrected['delta_Q'] = delta_Q_mean
+                main_df_corrected['Q'] = main_df_corrected['Q_cor']
+            else:
+                print("ВНИМАНИЕ: в result_df нет колонки Q — коррекция Q не применена к изделиям")
+        else:
+            print("ВНИМАНИЕ: не найдены колонки Q meas/ref для коррекции Q")
+            correct_q = False
+
+    # Сохраняем протокол для отчёта
+    try:
+        MEASURE_DATA.set_control_RK_corection_rq_table(merged_control)
+    except Exception:
+        # метод может быть добавлен позже в measure_data_class
+        if not hasattr(MEASURE_DATA, 'control_rk_correction_rq_table'):
+            MEASURE_DATA.control_rk_correction_rq_table = None
+        MEASURE_DATA.control_rk_correction_rq_table = merged_control
+
+    cols_show = ['Numbers']
+    if 'R' in main_df_corrected.columns:
+        cols_show += [c for c in ['R', 'delta_R', 'R_cor'] if c in main_df_corrected.columns]
+    if 'Q' in main_df_corrected.columns:
+        cols_show += [c for c in ['Q', 'delta_Q', 'Q_cor'] if c in main_df_corrected.columns]
+    if len(cols_show) > 1:
+        print('Коррекция R/Q применена к кругу:')
+        print(tabulate(main_df_corrected[cols_show], headers='keys', tablefmt='grid', showindex=False))
+
+    return main_df_corrected, numbers
+
+
+
 def find_temperature_correction_rk(T_center):
     print("Расчет коррекции тип RK")
     data = MEASURE_DATA.get_control_data_RK()

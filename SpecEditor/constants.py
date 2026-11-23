@@ -136,6 +136,8 @@ LABELS = {
     "INVERT_Rc_RB": "Инвертировать Rc/Rb",
     "TCH_correction": "ТЧХ коррекция",
     "F_correction": "Точность настройки коррекция",
+    "R_correction": "Коррекция R (по RK)",
+    "Q_correction": "Коррекция Q (по RK)",
     "FL_Num": "FL расчётное",
     "FL_Num_Virt": "FL расчётное коррекция",
     # Физические коррекции
@@ -255,7 +257,8 @@ COLUMN_SECTION = {
         "AVG_C0", "W2200_CL", "KH7700_CL", "TTS100_CL",
         "Tint", "TintValue",
         "physical_R_Correction", "physical_C0_correction", "physical_C1_correction",
-        "F_correction", "TCH_correction", "FL_Num", "FL_Num_Virt",
+        "F_correction", "TCH_correction", "R_correction", "Q_correction",
+        "FL_Num", "FL_Num_Virt",
         "Fmax_int", "Fmax_int_Min", "Fmax_int_Max",
         "Fmin_int", "Fmin_int_Min", "Fmin_int_Max",
         "F_int", "Fint_Min", "Fint_Max",

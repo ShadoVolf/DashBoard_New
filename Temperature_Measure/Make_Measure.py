@@ -10,12 +10,30 @@ from tabulate import tabulate
 
 from Options import get_connection_string
 from Temperature_Measure.Control_RK import find_temperature_correction, \
-    find_temperature_correction_network, calculate_corrections, calculate_temperature_correction
+    find_temperature_correction_network, calculate_corrections, calculate_temperature_correction, \
+    calculate_rq_corrections
 from Temperature_Measure.measure_data_class import MEASURE_DATA
 
 
 # Параметры, которые зависят от температурного профиля.
 # В режиме одной точки они не вычисляются и не проверяются по спецификации.
+
+def _spc_flag(row, name, default=False):
+    """Безопасно читает булевый флаг спецификации (колонка может отсутствовать)."""
+    try:
+        if name not in row.index:
+            return default
+        v = row[name]
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return default
+        if isinstance(v, (bool, int, float)):
+            return bool(v)
+        s = str(v).strip().lower()
+        return s in ("1", "true", "t", "yes", "y", "да")
+    except Exception:
+        return default
+
+
 TEMP_DEPENDENT_PARAMS = {
     'Fmin', 'Fmax', 'F_min_int', 'F_max_int', 'Fptp', 'Fptp/2',
     'ABS(Fmax, Fmin)',
@@ -930,6 +948,14 @@ def process_measure(slot):
         else:
             result_df['KO_F'] = 0
 
+
+        # Коррекция R и Q по контрольным образцам типа RK
+        if not single_point and len(MEASURE_DATA.get_control_data_RK()) > 0:
+            do_r = _spc_flag(row, 'R_correction')
+            do_q = _spc_flag(row, 'Q_correction')
+            if do_r or do_q:
+                print(f'Коррекция R/Q по контрольным RK: R={do_r}, Q={do_q}')
+                result_df, _ = calculate_rq_corrections(result_df, correct_r=do_r, correct_q=do_q)
         result_df = add_additional_columns(result_df, temps_dict['load_type'], temps_dict['fl_num'],
                                            row['F_correction'], row['TCH_Approx_Type'])
         result_df = check_and_add_columns(result_df, fill_value=0)
@@ -1004,6 +1030,14 @@ def process_measure(slot):
                 print('Таблица коррекции температуры (датчик тип RK)')
                 temp_correction, numbers = find_temperature_correction_network(temps_dict['t_nastr'])
                 result_df, numbers = calculate_corrections(result_df)
+                # Коррекция R и Q по контрольным образцам типа RK
+                if len(MEASURE_DATA.get_control_data_RK()) > 0:
+                    do_r = _spc_flag(row, 'R_correction')
+                    do_q = _spc_flag(row, 'Q_correction')
+                    if do_r or do_q:
+                        print(f'Коррекция R/Q по контрольным RK (K.O.): R={do_r}, Q={do_q}')
+                        result_df, _ = calculate_rq_corrections(result_df, correct_r=do_r, correct_q=do_q)
+
 
     return measure_slot_index + 1
 
@@ -1135,6 +1169,14 @@ def process_measure_1(slot):
         else:
             result_df['KO_F'] = 0
 
+
+        # Коррекция R и Q по контрольным образцам типа RK
+        if not single_point and len(MEASURE_DATA.get_control_data_RK()) > 0:
+            do_r = _spc_flag(row, 'R_correction')
+            do_q = _spc_flag(row, 'Q_correction')
+            if do_r or do_q:
+                print(f'Коррекция R/Q по контрольным RK: R={do_r}, Q={do_q}')
+                result_df, _ = calculate_rq_corrections(result_df, correct_r=do_r, correct_q=do_q)
         result_df = add_additional_columns(result_df, temps_dict['load_type'], temps_dict['fl_num'],
                                            row['F_correction'], row['TCH_Approx_Type'])
         result_df = check_and_add_columns(result_df, fill_value=0)
@@ -1209,6 +1251,14 @@ def process_measure_1(slot):
                 print('Таблица коррекции температуры (датчик тип RK)')
                 temp_correction, numbers = find_temperature_correction_network(temps_dict['t_nastr'])
                 result_df, numbers = calculate_corrections(result_df)
+                # Коррекция R и Q по контрольным образцам типа RK
+                if len(MEASURE_DATA.get_control_data_RK()) > 0:
+                    do_r = _spc_flag(row, 'R_correction')
+                    do_q = _spc_flag(row, 'Q_correction')
+                    if do_r or do_q:
+                        print(f'Коррекция R/Q по контрольным RK (K.O.): R={do_r}, Q={do_q}')
+                        result_df, _ = calculate_rq_corrections(result_df, correct_r=do_r, correct_q=do_q)
+
 
     return measure_slot_index + 1
 

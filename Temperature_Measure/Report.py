@@ -168,10 +168,14 @@ def format_header_content(view_data):
     elif view_data['PMI'] == 2:
         spc_name = 'SMD ' + spc_name
     corr_type_str = ''
-    if view_data['F_correction']:
+    if view_data.get('F_correction'):
         corr_type_str = corr_type_str + ' Точность настройки'
-    if view_data['TCH_correction']:
+    if view_data.get('TCH_correction'):
         corr_type_str = corr_type_str + '  ТЧХ'
+    if view_data.get('R_correction'):
+        corr_type_str = corr_type_str + '  R'
+    if view_data.get('Q_correction'):
+        corr_type_str = corr_type_str + '  Q'
     if corr_type_str == '':
         corr_type_str = 'Нет'
     data = [
