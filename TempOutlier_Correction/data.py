@@ -366,6 +366,47 @@ def next_measure_id() -> int:
     return int(r or 1)
 
 
+
+def _table_columns(table: str) -> list:
+    """Realnye kolonki tablicy v tekushchej BDs."""
+    eng = _get_engine()
+    try:
+        with eng.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t "
+                    "ORDER BY ORDINAL_POSITION"
+                ),
+                {"t": table},
+            ).fetchall()
+        return [str(r[0]) for r in rows]
+    except Exception as e:
+        print(f"[TOC] _table_columns({table}): {e}", flush=True)
+        return []
+
+
+def _align_df_to_table(df: pd.DataFrame, table: str) -> pd.DataFrame:
+    """Ostavit tolko kolonki, kotorye est' v tablice. Ubrat F_method i t.p."""
+    if df is None or df.empty:
+        return df
+    cols = _table_columns(table)
+    if not cols:
+        # fallback: ubrat sluzhebnye
+        drop = [c for c in df.columns if str(c).endswith("_method")
+                or str(c) in ("ID", "id", "RecordId", "RecordID")]
+        out = df.drop(columns=drop, errors="ignore")
+        return out
+    keep = [c for c in df.columns if c in cols]
+    missing = [c for c in cols if c not in df.columns
+               and c not in ("ID", "id", "RecordId", "RecordID", "AUTO_INCREMENT")]
+    out = df[keep].copy()
+    # NaN for optional missing non-PK columns is not added - DB defaults
+    print(f"[TOC] align {table}: keep={len(keep)} drop={len(df.columns)-len(keep)}",
+          flush=True)
+    return out
+
+
 def save_corrected_measure(
     psi_rows: pd.DataFrame,
     temp_rows: pd.DataFrame,
@@ -400,6 +441,14 @@ def save_corrected_measure(
         for pk in ("ID", "id", "RecordId", "RecordID"):
             if pk in df.columns:
                 df.drop(columns=[pk], inplace=True, errors="ignore")
+        # sluzhebnye kolonki korrekcii
+        drop_extra = [c for c in df.columns if str(c).endswith("_method")]
+        if drop_extra:
+            df.drop(columns=drop_extra, inplace=True, errors="ignore")
+
+    psi = _align_df_to_table(psi, _main())
+    if not temps.empty:
+        temps = _align_df_to_table(temps, _temps())
 
     with eng.begin() as conn:
         psi.to_sql(_main(), con=conn, if_exists="append", index=False, method="multi")

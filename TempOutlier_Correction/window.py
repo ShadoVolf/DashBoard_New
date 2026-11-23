@@ -970,7 +970,7 @@ def _refresh_summary(measure_id: int, temps_override: Optional[pd.DataFrame] = N
         borders_innerV=True,
         borders_outerV=True,
         scrollY=True,
-        height=280,
+        height=-1,
         policy=dpg.mvTable_SizingStretchProp,
     ):
         for c in cols:
@@ -1186,7 +1186,7 @@ def create_temp_outlier_window():
 
                 dpg.add_separator()
                 dpg.add_text("Сводная таблица (метрики по температурам)")
-                with dpg.child_window(tag=SUMMARY_CONTAINER, height=220, border=False):
+                with dpg.child_window(tag=SUMMARY_CONTAINER, height=-1, border=False):
                     pass
 
     handler = "toc_wheel_handler"
