@@ -5,7 +5,8 @@ from sqlalchemy import create_engine, text, bindparam
 import Options
 
 from Temperature_Measure.Report import (
-    create_presentation_protocol, create_psi_protocol, open_pdf, generate_filename
+    create_presentation_protocol, create_psi_protocol, create_simple_otk_protocol,
+    open_pdf, generate_filename
 )
 from Archive_View.Archive_Data import (
     load_specification, load_tu_parameters_for_spec, build_presentation_params,
@@ -136,6 +137,7 @@ def print_custom_protocol(measure_id: int, selected_numbers: list[str],
     spc_map = _prepare_spc_map(spc_map)
     # --- Фильтрация годных по нормам ---
     mapped = rename_fields_to_parameters(df)
+    use_tu_norms = psi_type in ('ОТКп', 'ОТК_простой', 'ОТК-простой')
     good_mask = pd.Series(True, index=mapped.index)
     for p in presentation_params:
         if not p['has_norm']:
@@ -144,10 +146,22 @@ def print_custom_protocol(measure_id: int, selected_numbers: list[str],
         if col is None:
             continue
         vals = pd.to_numeric(mapped[col], errors='coerce')
-        if p['has_max'] and p['max_otk'] is not None:
-            good_mask &= (vals <= float(p['max_otk']))
-        if p['has_min'] and p['min_otk'] is not None:
-            good_mask &= (vals >= float(p['min_otk']))
+        if use_tu_norms:
+            if p.get('max_tu') is not None:
+                try:
+                    good_mask &= (vals <= float(p['max_tu']))
+                except (TypeError, ValueError):
+                    pass
+            if p.get('min_tu') is not None:
+                try:
+                    good_mask &= (vals >= float(p['min_tu']))
+                except (TypeError, ValueError):
+                    pass
+        else:
+            if p['has_max'] and p['max_otk'] is not None:
+                good_mask &= (vals <= float(p['max_otk']))
+            if p['has_min'] and p['min_otk'] is not None:
+                good_mask &= (vals >= float(p['min_otk']))
         good_mask &= vals.notna()
 
     df_good = df[good_mask].copy()
@@ -205,6 +219,13 @@ def print_custom_protocol(measure_id: int, selected_numbers: list[str],
             tu_data=tu_data, presentation_params=presentation_params,
             spc_row=spc_row, measure_id=measure_id,
             filename=filename, measure_protokol_id=mp_id)
+    elif psi_type in ('ОТКп', 'ОТК_простой', 'ОТК-простой'):
+        path = create_simple_otk_protocol(
+            data_df=data_df, status_df=status_df, view_data=view_data,
+            tu_data=tu_data, presentation_params=presentation_params,
+            spc_row=spc_row, measure_id=measure_id,
+            filename=filename, measure_protokol_id=mp_id,
+            protokol_n=protokol_n)
     else:
         path = create_psi_protocol(
             data_df=data_df, status_df=status_df, view_data=view_data,
@@ -252,7 +273,7 @@ def print_archived_protocol(protokol_id: int):
         v = p_info.get('psi_type')
         if v is not None and not pd.isna(v) and str(v).strip():
             psi_type = str(v).strip()
-    if psi_type not in ('ПСИ', 'ОТК', 'Паспорт'):
+    if psi_type not in ('ПСИ', 'ОТК', 'Паспорт', 'ОТКп', 'ОТК_простой', 'ОТК-простой'):
         psi_type = 'ОТК'
 
     # 2. Номера из архива
@@ -343,6 +364,13 @@ def print_archived_protocol(protokol_id: int):
             tu_data=tu_data, presentation_params=presentation_params,
             spc_row=spc_row, measure_id=measure_id,
             filename=filename, measure_protokol_id=protokol_id)
+    elif psi_type in ('ОТКп', 'ОТК_простой', 'ОТК-простой'):
+        path = create_simple_otk_protocol(
+            data_df=data_df, status_df=status_df, view_data=view_data,
+            tu_data=tu_data, presentation_params=presentation_params,
+            spc_row=spc_row, measure_id=measure_id,
+            filename=filename, measure_protokol_id=protokol_id,
+            protokol_n=protokol_n)
     else:
         path = create_psi_protocol(
             data_df=data_df, status_df=status_df, view_data=view_data,

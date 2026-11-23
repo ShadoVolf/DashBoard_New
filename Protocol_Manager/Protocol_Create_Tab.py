@@ -529,24 +529,27 @@ def _build_create_tab():
                 _build_pm_info_panel()
 
     with dpg.group(horizontal=True):
-        dpg.add_button(label="Печать ПСИ", width=170, height=42,
+        dpg.add_button(label="Печать ПСИ", width=150, height=42,
                        callback=lambda: _on_print_click("ПСИ"))
         dpg.add_button(label="Печать Предъявительский (ОТК)",
-                       width=250, height=42,
+                       width=230, height=42,
                        callback=lambda: _on_print_click("ОТК"))
+        dpg.add_button(label="Печать простой ОТК",
+                       width=180, height=42,
+                       callback=lambda: _on_print_click("ОТКп"))
         dpg.add_button(
             label="Печать паспорта",
-            width=250,
+            width=180,
             height=42,
             callback=lambda: _on_print_passport_click("ПСИ")  # для паспорта всегда ПСИ
         )
-        dpg.add_spacer(width=20)
-        dpg.add_button(label="Выбрать все", width=140, height=42,
+        dpg.add_spacer(width=12)
+        dpg.add_button(label="Выбрать все", width=120, height=42,
                        callback=_pm_select_all)
-        dpg.add_button(label="Снять все", width=140, height=42,
+        dpg.add_button(label="Снять все", width=120, height=42,
                        callback=_pm_clear_selection)
         dpg.add_button(label="Установить даты (выбранные)",
-                       width=240, height=42,
+                       width=220, height=42,
                        callback=_open_create_dates_dialog)
 
 

@@ -317,22 +317,72 @@ def create_spc_map_otk(spc_map, row):
 
 
 # загружает MAP для таблицы спецификаций
+# Параметры фазовых шумов (Shum…Shum4). Есть в spc_map_table для
+# спецификаций/отчётов, но не измеряются в Temperature_Measure и
+# отсутствуют в psidata_map_table — при разбраковке их нужно игнорировать.
+PHASE_NOISE_PARAMS = {
+    'Shum', 'Shum1', 'Shum2', 'Shum3', 'Shum4',
+}
+
+
 def load_spc_map(row):
+    """Загружает активные параметры спецификации из spc_map_table.
+
+    Параметры фазовых шумов (Shum…Shum4) исключаются: они не участвуют
+    в обработке Temperature_Measure и не маппятся в psidata.
+    Доступ к колонкам Use/Max/Min — безопасный (нет KeyError, если
+    колонки ещё нет в specification).
+    """
     engine = create_engine(str(get_connection_string()))
 
     sql = "Select * from `spc_map_table` order by `ID`"
     spc_map = pd.read_sql(sql, engine)
-    filtered_spc = spc_map[spc_map.apply(lambda x: row[x['Use']] == 1, axis=1)]
 
-    result_df = filtered_spc.apply(
-        lambda spc_row: pd.Series({
-            'Parameter': spc_row['Parameter_Name'],
-            'Max': float(row[spc_row['Max']]) if row[spc_row['Max']] != 'no' else None,
-            'Min': float(row[spc_row['Min']]) if row[spc_row['Min']] != 'no' else None,
-            'Code': str(int(spc_row['Code']))
-        }),
-        axis=1
-    )
+    def _is_enabled(x):
+        use_col = x.get('Use')
+        if not use_col or use_col not in row.index:
+            return False
+        try:
+            return row[use_col] == 1
+        except Exception:
+            return False
+
+    filtered_spc = spc_map[spc_map.apply(_is_enabled, axis=1)].copy()
+
+    # Не использовать фазовые шумы в модуле температурных измерений
+    before = len(filtered_spc)
+    filtered_spc = filtered_spc[
+        ~filtered_spc['Parameter_Name'].isin(PHASE_NOISE_PARAMS)
+        & ~filtered_spc['Parameter_Name'].astype(str).str.startswith('Shum')
+    ]
+    excluded = before - len(filtered_spc)
+    if excluded:
+        print(f'Исключены параметры фазовых шумов (Shum*) из разбраковки ТИ: {excluded}')
+
+    def _bound(col_name):
+        if not col_name or col_name not in row.index:
+            return None
+        v = row[col_name]
+        if v is None or v == 'no':
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    if filtered_spc.empty:
+        result_df = pd.DataFrame(columns=['Parameter', 'Max', 'Min', 'Code'])
+    else:
+        result_df = filtered_spc.apply(
+            lambda spc_row: pd.Series({
+                'Parameter': spc_row['Parameter_Name'],
+                'Max': _bound(spc_row['Max']),
+                'Min': _bound(spc_row['Min']),
+                'Code': str(int(spc_row['Code'])) if pd.notna(spc_row['Code']) else '',
+            }),
+            axis=1
+        )
+
     print('Спецификация ПСИ на изделие')
     print(tabulate(
         result_df,

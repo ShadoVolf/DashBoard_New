@@ -23,105 +23,50 @@ from .Archive_Data import (
     rename_fields_to_parameters, apply_rounding,
     build_archive_status_df,
     resolve_param_column, log_missing_params,   # ← добавить
+    set_include_shum,                           # NEW
 )
 from .Archive_Helpers import _current_psi_type, _load_spc_map_for_display
 # ============================================================
 # Экранная замена спецсимволов
 # ============================================================
-# DearPyGui со шрифтом по умолчанию не имеет глифов для этих символов
-# и рисует '?'. Для PDF/Excel замена НЕ применяется.
 _SCREEN_SAFE_TABLE = {
-    # указатели / маркеры
-    '\u25bc': '>>',   # ▼
-    '\u25b2': '<<',   # ▲
-    '\u25b6': '>',    # ▶
-    '\u25c0': '<',    # ◀
-    '\u25aa': '*',    # ▪
-    '\u25a0': '*',    # ■
-    # математика
-    '\u00b1': '+/-',  # ±
-    '\u00d7': 'x',    # ×
-    '\u00f7': '/',    # ÷
-    '\u2265': '>=',   # ≥
-    '\u2264': '<=',   # ≤
-    '\u2260': '!=',   # ≠
-    '\u2248': '~',    # ≈
-    '\u2261': '=',    # ≡
-    '\u221e': 'inf',  # ∞
-    '\u221a': 'sqrt', # √
-    '\u2211': 'sum',  # ∑
-    '\u2202': 'd',    # ∂
-    '\u2205': 'empty',# ∅
-    '\u2212': '-',    # − (минус)
-    # единицы
-    '\u00b0': ' deg', # °
-    '\u00b5': 'u',    # µ
-    '\u03bc': 'u',    # μ
-    '\u03a9': 'Ohm',  # Ω
-    '\u2126': 'Ohm',  # Ω (Ohm sign)
-    '\u2103': ' C',   # ℃
-    '\u2109': ' F',   # ℉
-    # пунктуация
-    '\u2013': '-',    # –
-    '\u2014': '-',    # —
-    '\u2018': "'",    # '
-    '\u2019': "'",    # '
-    '\u201c': '"',    # "
-    '\u201d': '"',    # "
-    '\u00ab': '"',    # «
-    '\u00bb': '"',    # »
-    '\u2026': '...',  # …
-    '\u00b7': '.',    # ·
-    '\u22c5': '.',    # ⋅
-    '\u00a0': ' ',    # NBSP
-    # стрелки
-    '\u2192': '->',   # →
-    '\u2190': '<-',   # ←
-    '\u2191': '^',    # ↑
-    '\u2193': 'v',    # ↓
-    # верхние/нижние индексы
+    '\u25bc': '>>',   '\u25b2': '<<',   '\u25b6': '>',    '\u25c0': '<',
+    '\u25aa': '*',    '\u25a0': '*',
+    '\u00b1': '+/-',  '\u00d7': 'x',    '\u00f7': '/',
+    '\u2265': '>=',   '\u2264': '<=',   '\u2260': '!=',
+    '\u2248': '~',    '\u2261': '=',    '\u221e': 'inf',
+    '\u221a': 'sqrt', '\u2211': 'sum',  '\u2202': 'd',
+    '\u2205': 'empty','\u2212': '-',
+    '\u00b0': ' deg', '\u00b5': 'u',    '\u03bc': 'u',
+    '\u03a9': 'Ohm',  '\u2126': 'Ohm',  '\u2103': ' C',   '\u2109': ' F',
+    '\u2013': '-',    '\u2014': '-',
+    '\u2018': "'",    '\u2019': "'",    '\u201c': '"',    '\u201d': '"',
+    '\u00ab': '"',    '\u00bb': '"',    '\u2026': '...',
+    '\u00b7': '.',    '\u22c5': '.',    '\u00a0': ' ',
+    '\u2192': '->',   '\u2190': '<-',   '\u2191': '^',    '\u2193': 'v',
     '\u00b9': '^1', '\u00b2': '^2', '\u00b3': '^3',
     '\u2070': '^0', '\u2074': '^4', '\u2075': '^5',
     '\u2076': '^6', '\u2077': '^7', '\u2078': '^8',
     '\u2079': '^9', '\u207b': '^-',
     '\u2080': '_0', '\u2081': '_1', '\u2082': '_2',
     '\u2083': '_3', '\u2084': '_4', '\u2085': '_5',
-    '\u2086': '_6', '\u2087': '_7', '\u2088': '_8',
-    '\u2089': '_9',
-    # греческий (нижний регистр, если попадётся)
+    '\u2086': '_6', '\u2087': '_7', '\u2088': '_8', '\u2089': '_9',
     '\u03b1': 'a', '\u03b2': 'b', '\u03b3': 'g', '\u03b4': 'd',
     '\u03b5': 'e', '\u03b6': 'z', '\u03b7': 'h', '\u03b8': 'th',
     '\u03bb': 'l', '\u03bd': 'v', '\u03be': 'x', '\u03c0': 'pi',
     '\u03c1': 'r', '\u03c3': 's', '\u03c4': 't', '\u03c6': 'f',
     '\u03c7': 'ch', '\u03c8': 'ps', '\u03c9': 'w',
     '\u0394': 'Delta', '\u03a3': 'Sigma', '\u03a6': 'Phi',
-    '\u03a8': 'Psi', '\u03a0': 'Pi', '\u0398': 'Theta',
-    '\u039b': 'Lambda',
-# буллеты, галочки, геометрические маркеры
-    '\u2022': '*',     # •
-    '\u2023': '>',     # ‣
-    '\u2043': '-',     # ⁃
-    '\u2713': '+',     # ✓
-    '\u2714': '+',     # ✔
-    '\u2717': 'x',     # ✗
-    '\u2718': 'x',     # ✘
-    '\u2610': '[ ]',   # ☐
-    '\u2611': '[v]',   # ☑
-    '\u2612': '[x]',   # ☒
-    '\u25cf': '*',     # ●
-    '\u25cb': 'o',     # ○
-    '\u25c6': '*',     # ◆
-    '\u25c7': '<>',    # ◇
-    '\u2217': '*',     # ∗
+    '\u03a8': 'Psi', '\u03a0': 'Pi', '\u0398': 'Theta', '\u039b': 'Lambda',
+    '\u2022': '*', '\u2023': '>', '\u2043': '-',
+    '\u2713': '+', '\u2714': '+', '\u2717': 'x', '\u2718': 'x',
+    '\u2610': '[ ]', '\u2611': '[v]', '\u2612': '[x]',
+    '\u25cf': '*', '\u25cb': 'o', '\u25c6': '*', '\u25c7': '<>', '\u2217': '*',
 }
 
 
 def _screen_safe(v) -> str:
-    """Строка с ASCII-заменой спецсимволов (для показа в DearPyGui).
-
-    Cyrillic и обычный ASCII проходят без изменений. Заменяются только
-    символы, которых заведомо нет в шрифте DearPyGui.
-    """
+    """Строка с ASCII-заменой спецсимволов (для показа в DearPyGui)."""
     if v is None:
         return ''
     try:
@@ -156,14 +101,8 @@ def _on_history_export(sender=None, data=None):
     export_history_to_excel()
 
 # ------------------------------------------------------- тип протокола
-
 def _apply_psi_type_from_df(df: pd.DataFrame):
-    """Установить тип протокола из загруженных данных.
-
-    Приоритет:
-      1. Поле `psi_type` в psidata (если содержит 'ПСИ' или 'ОТК');
-      2. Иначе — 'ОТК'.
-    """
+    """Установить тип протокола из загруженных данных."""
     if not dpg.does_item_exist('archive_psi_type_combo'):
         return
     psi_type = 'ОТК'
@@ -182,6 +121,27 @@ def _on_psi_type_changed(sender=None, data=None):
         _fill_table(df)
     spc_name = dpg.get_value('archive_spc_combo') or ''
     _fill_norms(spc_name)
+
+
+# ------------------------------------------------------- видимость Shum
+# NEW: единая точка проверки, включена ли галочка Shum*
+def _shum_visible() -> bool:
+    return (dpg.does_item_exist('archive_shum_check')
+            and bool(dpg.get_value('archive_shum_check')))
+
+
+# NEW: переключение галочки — обновляет глобальный флаг в Archive_Data
+# и перерисовывает таблицу + нормы. Протоколы подхватят флаг автоматически,
+# так как и они, и UI используют load_spc_map_for_archive().
+def _on_shum_check_changed(sender=None, data=None):
+    set_include_shum(_shum_visible())
+
+    df = dpg.get_item_user_data(WINDOW_TAG)
+    if df is not None and not df.empty:
+        _fill_table(df)
+    spc_name = dpg.get_value('archive_spc_combo') or ''
+    _fill_norms(spc_name)
+
 
 # ---------------------------------------------------------------- фильтр-бар
 def _build_filter_bar():
@@ -295,7 +255,7 @@ def _build_info_panel():
     from .Archive_Print import (
         print_archive_protocol, print_archive_test_protocol,
         print_archive_presentation_protocol, print_archive_temperatures,
-        print_archive_protocol_selected, print_archive_msk_label,  # <-- Добавьте это
+        print_archive_protocol_selected, print_archive_msk_label,
     )
     dpg.add_text("Информация о записи", color=(180, 220, 255))
     dpg.add_separator()
@@ -330,33 +290,24 @@ def _build_info_panel():
     # ---- Протоколы ----
     dpg.add_separator()
     with dpg.collapsing_header(label="Протоколы", default_open=True):
-        # 1. Оставляем без изменений
         dpg.add_button(label='Печать всех протоколов', width=-1, height=28,
                        tag='archive_print_button',
                        callback=lambda s, a: print_archive_protocol())
         dpg.add_button(label='Тестовый протокол', width=-1, height=28,
                        tag='archive_test_print_button',
                        callback=lambda s, a: print_archive_test_protocol())
-
-        # 2. Измененный предъявительский (ОТК)
         dpg.add_button(label='Предъявительский протокол (ОТК)',
                        width=-1, height=28,
                        tag='archive_presentation_button',
                        callback=lambda s, a: print_archive_presentation_protocol())
-
-        # 3. Новый протокол ПСИ
         dpg.add_button(label='Протокол ПСИ (Приемо-сдаточный)',
                        width=-1, height=28,
                        tag='archive_psi_button',
                        callback=lambda s, a: print_archive_psi_protocol())
-
-        # 4. Новая этикетка МСК
         dpg.add_button(label='Печать этикетки МСК',
                        width=-1, height=28,
                        tag='archive_label_button',
                        callback=lambda s, a: print_archive_msk_label())
-
-        # 5. Оставляем без изменений
         dpg.add_button(label='Распечатка (температуры)',
                        width=-1, height=28,
                        tag='archive_print_temps_button',
@@ -372,6 +323,10 @@ def _build_info_panel():
     with dpg.collapsing_header(label="Данные", default_open=False):
         dpg.add_checkbox(label='Коэффициенты полинома',
                          tag='archive_coeff_check', default_value=False)
+        # NEW: галочка отображения норм и данных по Shum*
+        dpg.add_checkbox(label='Параметры шума (Shum)',
+                         tag='archive_shum_check', default_value=False,
+                         callback=_on_shum_check_changed)
         dpg.add_button(label='Экспорт в Excel', width=-1, height=28,
                        tag='archive_excel_button',
                        callback=lambda s, a: export_archive_to_excel())
@@ -388,6 +343,7 @@ def _build_info_panel():
     dpg.add_button(label='Управление таблицами...', width=-1, height=28,
                    tag='archive_tables_button',
                    callback=lambda s, a: _open_tables_window())
+
 
 def _build_info_panel_1():
     from .Archive_Delete import _on_open_delete_dialog, _on_open_log_window
@@ -454,6 +410,10 @@ def _build_info_panel_1():
     with dpg.group(horizontal=True):
         dpg.add_checkbox(label='Коэффициенты полинома',
                          tag='archive_coeff_check', default_value=False)
+        # NEW: галочка отображения норм и данных по Shum*
+        dpg.add_checkbox(label='Параметры шума (Shum)',
+                         tag='archive_shum_check', default_value=False,
+                         callback=_on_shum_check_changed)
 
     dpg.add_separator()
     dpg.add_button(label='Экспорт в Excel', width=-1, height=30,
@@ -521,10 +481,6 @@ def _fill_table(df: pd.DataFrame):
                      tag='archive_table_hint', color=(140, 140, 140))
         return
 
-    # ▼ Карта норм — по текущему типу протокола (ПСИ / ОТК).
-    #   Для ОТК _load_spc_map_for_display подменяет Max/Min на
-    #   Max_otk/Min_otk, поэтому подсветка «Брак» в таблице
-    #   считается по тем же нормам, что уйдут в PDF.
     spc_name = _resolve_display_spc(df)
     if spc_name:
         spc_map = _load_spc_map_for_display(spc_name, _current_psi_type())
@@ -546,11 +502,6 @@ def _fill_table(df: pd.DataFrame):
 
     is_history = (_view_state.get('mode') == 'history')
 
-    # (col, label, param_name | None)
-    #   col        — реальное имя колонки в mapped (может отличаться от
-    #                имени параметра в spc: например 'Rc_Rbmax' vs 'Rc_Rb');
-    #   label      — подпись для шапки таблицы;
-    #   param_name — имя параметра из spc_map_table (для подсветки).
     display_cols: list[tuple[str, str, str | None]] = []
 
     if 'Position' in mapped.columns:
@@ -578,7 +529,6 @@ def _fill_table(df: pd.DataFrame):
             display_cols.append(('Measure_ID', 'ID замера', None))
 
     if not spc_map.empty:
-        # Диагностика: пишет в лог имена параметров спеки без колонки в данных
         log_missing_params(mapped, spc_map,
                            context=f"_fill_table spc={spc_name}")
 
@@ -629,7 +579,6 @@ def _fill_table(df: pd.DataFrame):
 
         prev_n = None
         for pos_idx, (_, row) in enumerate(mapped.iterrows()):
-            # --- Разделитель групп в режиме истории ---
             if n_key:
                 cur_n = str(row.get(n_key, '') or '').strip().upper()
                 if cur_n and cur_n != prev_n:
@@ -645,7 +594,6 @@ def _fill_table(df: pd.DataFrame):
             is_rejected = not overall_ok[pos_idx]
             with dpg.table_row():
                 for key, _, param_name in display_cols:
-                    # ---- Служебная колонка «Статус» ----
                     if key == '__status__':
                         if spc_map.empty:
                             dpg.add_text('-', color=(140, 140, 140))
@@ -655,7 +603,6 @@ def _fill_table(df: pd.DataFrame):
                             dpg.add_text('Годен', color=STATUS_GOOD)
                         continue
 
-                    # ---- Обычная ячейка ----
                     val = row.get(key, '')
                     if pd.isna(val):
                         val = ''
@@ -675,7 +622,6 @@ def _fill_table(df: pd.DataFrame):
                     else:
                         dpg.add_text(text)
 
-    # Удаляем старый popup, иначе alias conflict при повторном вызове
     if dpg.does_item_exist('archive_table_context'):
         dpg.delete_item('archive_table_context')
 
@@ -685,7 +631,6 @@ def _fill_table(df: pd.DataFrame):
     from .Archive_Constants import _source_state
     active_table = _source_state.get('main_table', 'psidata')
 
-    # ---- Контекстное меню (правая кнопка мыши по таблице) ----
     with dpg.popup(parent=TABLE_CONTAINER,
                    mousebutton=dpg.mvMouseButton_Right,
                    tag='archive_table_context'):
@@ -713,6 +658,7 @@ def _fill_table(df: pd.DataFrame):
         dpg.add_separator()
         dpg.add_menu_item(label='Открыть в Графиках',
                           callback=lambda s, a: _on_open_in_graphs())
+
 
 def _fill_table_1(df: pd.DataFrame):
     from .Archive_Delete import _on_open_delete_dialog
@@ -744,11 +690,6 @@ def _fill_table_1(df: pd.DataFrame):
 
     is_history = (_view_state.get('mode') == 'history')
 
-    # (col, label, param_name | None)
-    #   col        — реальное имя колонки в mapped (может отличаться от
-    #                имени параметра в spc: например 'Rc_Rbmax' vs 'Rc_Rb');
-    #   label      — подпись для шапки таблицы;
-    #   param_name — имя параметра из spc_map_table (для подсветки).
     display_cols: list[tuple[str, str, str | None]] = []
 
     if 'Position' in mapped.columns:
@@ -776,7 +717,6 @@ def _fill_table_1(df: pd.DataFrame):
             display_cols.append(('Measure_ID', 'ID замера', None))
 
     if not spc_map.empty:
-        # Диагностика: пишет в лог имена параметров спеки без колонки в данных
         log_missing_params(mapped, spc_map,
                            context=f"_fill_table spc={spc_name}")
 
@@ -827,7 +767,6 @@ def _fill_table_1(df: pd.DataFrame):
 
         prev_n = None
         for pos_idx, (_, row) in enumerate(mapped.iterrows()):
-            # --- Разделитель групп в режиме истории ---
             if n_key:
                 cur_n = str(row.get(n_key, '') or '').strip().upper()
                 if cur_n and cur_n != prev_n:
@@ -843,7 +782,6 @@ def _fill_table_1(df: pd.DataFrame):
             is_rejected = not overall_ok[pos_idx]
             with dpg.table_row():
                 for key, _, param_name in display_cols:
-                    # ---- Служебная колонка «Статус» ----
                     if key == '__status__':
                         if spc_map.empty:
                             dpg.add_text('-', color=(140, 140, 140))
@@ -853,7 +791,6 @@ def _fill_table_1(df: pd.DataFrame):
                             dpg.add_text('Годен', color=STATUS_GOOD)
                         continue
 
-                    # ---- Обычная ячейка ----
                     val = row.get(key, '')
                     if pd.isna(val):
                         val = ''
@@ -873,7 +810,6 @@ def _fill_table_1(df: pd.DataFrame):
                     else:
                         dpg.add_text(text)
 
-    # Удаляем старый popup, иначе alias conflict при повторном вызове
     if dpg.does_item_exist('archive_table_context'):
         dpg.delete_item('archive_table_context')
 
@@ -883,7 +819,6 @@ def _fill_table_1(df: pd.DataFrame):
     from .Archive_Constants import _source_state
     active_table = _source_state.get('main_table', 'psidata')
 
-    # ---- Контекстное меню (правая кнопка мыши по таблице) ----
     with dpg.popup(parent=TABLE_CONTAINER,
                    mousebutton=dpg.mvMouseButton_Right,
                    tag='archive_table_context'):
@@ -913,8 +848,6 @@ def _fill_table_1(df: pd.DataFrame):
                           callback=lambda s, a: _on_open_in_graphs())
 
 
-
-
 # ------------------------------------------------------------------- нормы
 def _fill_norms(spc_name: str):
     if dpg.does_item_exist(NORMS_TAG):
@@ -928,7 +861,6 @@ def _fill_norms(spc_name: str):
                      color=(140, 140, 140))
         return
 
-    # ▼ БЫЛО: spc_map = load_spc_map_for_archive(spc_name)
     psi_type = _current_psi_type()
     spc_map = _load_spc_map_for_display(spc_name, psi_type)
     if spc_map.empty:
@@ -958,7 +890,6 @@ def _fill_norms(spc_name: str):
                 dpg.add_text(f'{mn:.4g}' if mn is not None and not pd.isna(mn) else '-')
 
 
-
 def _fill_print_measure_combo(df: pd.DataFrame):
     if not dpg.does_item_exist('archive_print_measure_combo'):
         return
@@ -974,15 +905,12 @@ def _fill_print_measure_combo(df: pd.DataFrame):
 def _on_open_in_graphs(sender=None, data=None):
     """Открыть окно «Графики» для текущего замера из архива."""
     try:
-
-
         df = dpg.get_item_user_data(WINDOW_TAG)
         if df is None or df.empty:
             dpg.set_value('archive_status_text',
                           'Нет данных — сначала загрузите замер')
             return
 
-        # 1) Если пользователь выбрал конкретный ID в комбо — открываем его
         if dpg.does_item_exist('archive_print_measure_combo'):
             mid_str = dpg.get_value('archive_print_measure_combo')
             if mid_str:
@@ -996,7 +924,6 @@ def _on_open_in_graphs(sender=None, data=None):
                                   f'Открыто в Графиках: ID {mid}')
                     return
 
-        # 2) Одна Measure_ID в выборке — открываем её
         if 'Measure_ID' in df.columns:
             mids = df['Measure_ID'].dropna().unique()
             if len(mids) == 1:
@@ -1006,7 +933,6 @@ def _on_open_in_graphs(sender=None, data=None):
                               f'Открыто в Графиках: ID {mid}')
                 return
 
-        # 3) Fallback — единственный МСК в выборке
         if 'MSK' in df.columns:
             msks = df['MSK'].dropna().unique()
             if len(msks) == 1 and msks[0]:
@@ -1118,18 +1044,7 @@ def _on_lookup_sync(full_rebuild: bool):
     dpg.set_frame_callback(dpg.get_frame_count() + 10, _poll)
 
 def _resolve_display_spc(df) -> str:
-    """Единая спецификация для отображения данных.
-
-    Приоритет:
-      1. Одна уникальная Spc в данных  → она (combo синхронизируется).
-      2. Несколько Spc                 → текущее значение combo,
-                                          если оно среди них.
-      3. Иначе                         → самая частая Spc (mode).
-      4. Нет колонки Spc / пусто       → текущее значение combo.
-
-    Всегда синхронизирует archive_spc_combo с результатом, чтобы
-    таблица, панель норм и сам combo показывали одну и ту же спеку.
-    """
+    """Единая спецификация для отображения данных."""
     cur = dpg.get_value('archive_spc_combo') or ''
     if df is None or df.empty or 'Spc' not in df.columns:
         return cur
