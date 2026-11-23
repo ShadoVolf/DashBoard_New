@@ -122,6 +122,27 @@ def _mid_from_label(label: str) -> Optional[int]:
         return None
 
 
+def _resolve_spec_params() -> Dict[str, Any]:
+    """Parametry specifikacii dlya metrik: Tnakl/Tnastr/polinom/TCH_Temp_A/B."""
+    spc = ""
+    if dpg.does_item_exist(SPC_COMBO):
+        spc = (dpg.get_value(SPC_COMBO) or "").strip()
+    if not spc:
+        psi = _state.get("psi_df")
+        if psi is not None and not psi.empty and "Spc" in psi.columns:
+            vals = psi["Spc"].dropna().astype(str).str.strip()
+            if not vals.empty:
+                spc = str(vals.iloc[0])
+    params = toc_data.get_spec_params(spc if spc else None)
+    _state["spec_params"] = params
+    tn = params.get("t_nakl") or params.get("t_nastr")
+    _log(
+        f"Spec: Tnakl={tn}, polinom={params.get('degree')}, "
+        f"T=[{params.get('ta')}; {params.get('tb')}]"
+    )
+    return params
+
+
 # ---------------------------------------------------------------------------
 # Source / cascade
 # ---------------------------------------------------------------------------
@@ -156,6 +177,7 @@ def _on_spc_changed(sender=None, app_data=None, user_data=None):
     if _suppress_cascade:
         return
     spc = dpg.get_value(SPC_COMBO) if dpg.does_item_exist(SPC_COMBO) else ""
+    _state["spec_params"] = None  # perechitat pri sleduyushchem pereschete
     msks = toc_data.get_msk_list(spc if spc else None)
     _set_combo(MSK_COMBO, msks, msks[0] if msks else "")
     _on_msk_changed()
@@ -446,6 +468,7 @@ def _on_load(sender=None, app_data=None, user_data=None):
         _state["numbers"] = nums
         _state["current_number"] = nums[0] if nums else ""
         _state["base_mid"] = mids[0]
+        _resolve_spec_params()
         _state["corrected_temps"] = pd.DataFrame()
         _state["corrections"] = []
         _state["report"] = {}
@@ -523,6 +546,7 @@ def _finish_analyze_ui():
     _state["base_mid"] = report.get("base_mid", prefer)
 
     base_mid = _state["base_mid"]
+    _resolve_spec_params()
     if not corrected.empty:
         corr_for_sum = corrected.copy()
         if "Measure_ID" not in corr_for_sum.columns:
@@ -830,10 +854,11 @@ def _on_recalc_metrics(sender=None, app_data=None, user_data=None):
             if not _state["corrected_temps"].empty
             else _state["temps_df"]
         )
+    spec = _resolve_spec_params()
     _show_progress("Пересчёт метрик")
     _apply_progress_ui(30, "Считаем...")
     try:
-        _refresh_summary(base, temps_override=temps)
+        _refresh_summary(base, temps_override=temps, spec=spec)
         _apply_progress_ui(100, "Готово")
     finally:
         _force_hide_progress()
@@ -946,10 +971,16 @@ def _on_enlarge(sender=None, app_data=None, user_data=None):
     )
 
 
-def _refresh_summary(measure_id: int, temps_override: Optional[pd.DataFrame] = None):
+def _refresh_summary(
+    measure_id: int,
+    temps_override: Optional[pd.DataFrame] = None,
+    spec: Optional[Dict[str, Any]] = None,
+):
     temps = temps_override if temps_override is not None else _state["temps_df"]
     psi = _state["psi_df"]
-    summary = toc_metrics.build_summary_table(psi, temps, measure_id)
+    if spec is None:
+        spec = _state.get("spec_params") or None
+    summary = toc_metrics.build_summary_table(psi, temps, measure_id, spec=spec)
     _state["summary"] = summary
 
     if not dpg.does_item_exist(SUMMARY_CONTAINER):
@@ -1012,7 +1043,9 @@ def _on_save(sender=None, app_data=None, user_data=None):
 
     temps_for_metrics = corr_temps.copy()
     temps_for_metrics["Measure_ID"] = base
-    psi_upd = toc_metrics.apply_metrics_to_psidata(psi_base, temps_for_metrics, base)
+    psi_upd = toc_metrics.apply_metrics_to_psidata(
+        psi_base, temps_for_metrics, base, spec=_state.get("spec_params") or None
+    )
 
     try:
         new_mid = toc_data.save_corrected_measure(

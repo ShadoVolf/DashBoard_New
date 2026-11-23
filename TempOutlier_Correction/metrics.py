@@ -3,11 +3,22 @@
 
 Fmax, Fmin, Fptp, Fptp/2, Rmax, Rmin, Rptp,
 Mono, Slope, Tmax, Tmin, Turnover.
+
+Методика - как в Temperature_Measure/Make_Measure.py (calculate_metrics):
+  - кривая фильтруется в диапазон спецификации [TCH_Temp_A; TCH_Temp_B];
+  - аппроксимация полиномом степени polinom (из спецификации, по умолчанию 3);
+  - Slope = производная полинома в точке Tnakl из спецификации
+    ("наклон на температуре", ppm/°C); Tnakl == 0 -> Tnastr;
+    fallback - хорда по крайним точкам отфильтрованной кривой (не 0.0);
+  - Turnover = точка перегиба (корень 2-й производной полинома);
+  - Mono = максимальное отклонение кривой от аппроксимации;
+  - Tmax / Tmin = температуры первого и второго экстремума
+    (как extr_1 / extr_2 в Make_Measure).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,7 +26,7 @@ import pandas as pd
 from .constants import OUTLIER_MARKER
 
 
-def _clean_series(temps: np.ndarray, values: np.ndarray):
+def _clean_series(temps: np.ndarray, values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     mask = np.isfinite(temps) & np.isfinite(values) & (values != OUTLIER_MARKER)
     t = temps[mask]
     v = values[mask]
@@ -23,12 +34,88 @@ def _clean_series(temps: np.ndarray, values: np.ndarray):
     return t[order], v[order]
 
 
+def _num(v) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+            return None
+        fv = float(str(v).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    return fv if np.isfinite(fv) else None
+
+
+def _normalize_spec(
+    spec: Optional[Dict[str, Any]],
+) -> Tuple[Optional[float], int, float, float]:
+    """(t_nakl, degree, ta, tb) iz spec {t_nakl, t_nastr, degree, ta, tb}."""
+    if not spec:
+        return None, 3, -np.inf, np.inf
+    t_nastr = _num(spec.get("t_nastr"))
+    t_nakl = _num(spec.get("t_nakl"))
+    if t_nakl is None or t_nakl == 0.0:
+        # kak v Make_Measure.py: t_nakl == 0 -> t_nastr
+        t_nakl = t_nastr
+    deg = _num(spec.get("degree"))
+    deg = int(deg) if (deg is not None and deg >= 1) else 3
+    ta = _num(spec.get("ta"))
+    tb = _num(spec.get("tb"))
+    return (
+        t_nakl,
+        deg,
+        ta if ta is not None else -np.inf,
+        tb if tb is not None else np.inf,
+    )
+
+
+def _fit_poly(t: np.ndarray, f: np.ndarray, degree: int) -> Optional[np.ndarray]:
+    n = t.size
+    deg = min(int(degree), n - 1)
+    if deg < 1 or n < deg + 1:
+        return None
+    try:
+        with np.errstate(all="ignore"):
+            coeffs = np.polyfit(t, f, deg)
+    except Exception:
+        return None
+    if not np.all(np.isfinite(coeffs)):
+        return None
+    return coeffs
+
+
+def _real_roots_in(coeffs: Optional[np.ndarray], tmin: float, tmax: float) -> np.ndarray:
+    if coeffs is None or coeffs.size < 1:
+        return np.array([])
+    try:
+        roots = np.roots(coeffs)
+    except Exception:
+        return np.array([])
+    real = np.array([r.real for r in roots if abs(np.imag(r)) < 1e-8], dtype=float)
+    if real.size == 0:
+        return real
+    return np.sort(real[(real >= tmin) & (real <= tmax)])
+
+
+def _chord_slope(t: np.ndarray, f: np.ndarray) -> Optional[float]:
+    if t.size < 2 or t[-1] == t[0]:
+        return None
+    return float((f[-1] - f[0]) / (t[-1] - t[0]))
+
+
 def compute_curve_metrics(
     temp_df: pd.DataFrame,
     f_col: str = "F",
     r_col: str = "R",
     mono_degree: int = 3,
+    spec: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """
+    Svodnye metriki po temperaturnoj krivoj.
+
+    spec: {t_nakl, t_nastr, degree, ta, tb} iz tablicy specification
+    (sm. data.get_spec_params). Bez spec - hordovyj slope i mono_degree.
+    """
     out: Dict[str, Any] = {
         "Fmax": None,
         "Fmin": None,
@@ -47,58 +134,81 @@ def compute_curve_metrics(
         return out
 
     t_raw = pd.to_numeric(temp_df["Temp"], errors="coerce").values.astype(float)
+    t_nakl, degree, ta, tb = _normalize_spec(spec)
+    if spec is None:
+        degree = int(mono_degree)
 
     if f_col in temp_df.columns:
         f_raw = pd.to_numeric(temp_df[f_col], errors="coerce").values.astype(float)
         t, f = _clean_series(t_raw, f_raw)
         if f.size >= 1:
-            out["Fmax"] = float(np.max(f))
-            out["Fmin"] = float(np.min(f))
+            # diapazon specifikacii [TCH_Temp_A; TCH_Temp_B], kak v Make_Measure
+            in_range = (t >= ta) & (t <= tb)
+            tf, ff = (t[in_range], f[in_range]) if in_range.any() else (t, f)
+
+            out["Fmax"] = float(np.max(ff))
+            out["Fmin"] = float(np.min(ff))
             out["Fptp"] = float(out["Fmax"] - out["Fmin"])
             out["Fptp/2"] = out["Fptp"] / 2.0
-            out["Tmax"] = float(t[np.argmax(f)])
-            out["Tmin"] = float(t[np.argmin(f)])
-            if f.size >= 3:
-                deg = min(mono_degree, f.size - 1)
-                coeffs = np.polyfit(t, f, deg)
-                dcoeffs = np.polyder(coeffs)
-                roots = np.roots(dcoeffs)
-                real_roots = [
-                    float(r.real)
-                    for r in roots
-                    if abs(r.imag) < 1e-8 and t.min() <= r.real <= t.max()
-                ]
-                if real_roots:
-                    mid = 0.5 * (t.min() + t.max())
-                    real_roots.sort(key=lambda x: abs(x - mid))
-                    out["Turnover"] = real_roots[0]
-                elif f.size >= 2:
-                    slopes = np.diff(f) / np.diff(t)
-                    idx = int(np.argmin(np.abs(slopes)))
-                    out["Turnover"] = float(0.5 * (t[idx] + t[idx + 1]))
+            out["Tmax"] = float(tf[np.argmax(ff)])
+            out["Tmin"] = float(tf[np.argmin(ff)])
 
-            if f.size >= mono_degree + 1:
-                deg = min(mono_degree, f.size - 1)
-                coeffs = np.polyfit(t, f, deg)
-                approx = np.polyval(coeffs, t)
-                delta = approx - f
-                if delta.size > 2:
-                    delta = delta[1:-1]
-                if delta.size:
-                    i = int(np.argmax(np.abs(delta)))
-                    out["Mono"] = float(delta[i])
+            coeffs = None
+            if tf.size >= max(3, degree + 1):
+                coeffs = _fit_poly(tf, ff, degree)
+            if coeffs is not None:
+                # Tmax/Tmin - pervye dva ekstremuma (kak extr_1/extr_2)
+                extr = _real_roots_in(np.polyder(coeffs, 1), tf.min(), tf.max())
+                if extr.size >= 2:
+                    out["Tmax"] = float(extr[0])
+                    out["Tmin"] = float(extr[1])
+                elif extr.size == 1:
+                    out["Tmax"] = float(extr[0])
+                # Turnover - tochka peregiba (koren 2-j proizvodnoj)
+                if coeffs.size >= 3:
+                    infl = _real_roots_in(np.polyder(coeffs, 2), tf.min(), tf.max())
+                    if infl.size:
+                        mid = 0.5 * (tf.min() + tf.max())
+                        out["Turnover"] = float(infl[int(np.argmin(np.abs(infl - mid)))])
+                # Mono - maks. otklonenie ot approksimacii
+                delta = np.polyval(coeffs, tf) - ff
+                i = int(np.argmax(np.abs(delta)))
+                out["Mono"] = float(delta[i])
 
-            if f.size >= 2:
-                out["Slope"] = (
-                    float((f[-1] - f[0]) / (t[-1] - t[0])) if t[-1] != t[0] else 0.0
-                )
+            if out["Turnover"] is None and tf.size >= 2:
+                slopes = np.diff(ff) / np.diff(tf)
+                finite = np.isfinite(slopes)
+                if finite.any():
+                    s_use = np.where(finite, slopes, np.inf)
+                    idx = int(np.argmin(np.abs(s_use)))
+                    out["Turnover"] = float(0.5 * (tf[idx] + tf[idx + 1]))
+
+            # Slope = proizvodnaya polinoma v tochke Tnakl iz specifikacii
+            # (kak Make_Measure.calculate_metrics); fallback - horda, ne 0.0.
+            slope = None
+            if t_nakl is not None and np.isfinite(t_nakl):
+                if coeffs is None and tf.size >= max(3, degree + 1):
+                    coeffs = _fit_poly(tf, ff, degree)
+                if coeffs is not None:
+                    try:
+                        val = float(np.polyval(np.polyder(coeffs, 1), t_nakl))
+                        slope = val if np.isfinite(val) else None
+                    except Exception:
+                        slope = None
+            if slope is None:
+                slope = _chord_slope(tf, ff)
+            if slope is None:
+                slope = _chord_slope(t, f)
+            out["Slope"] = slope
 
     if r_col in temp_df.columns:
         r_raw = pd.to_numeric(temp_df[r_col], errors="coerce").values.astype(float)
-        t, r = _clean_series(t_raw, r_raw)
-        if r.size >= 1:
-            out["Rmax"] = float(np.max(r))
-            out["Rmin"] = float(np.min(r))
+        t_r, rr = _clean_series(t_raw, r_raw)
+        if rr.size >= 1:
+            in_range_r = (t_r >= ta) & (t_r <= tb)
+            rsub = rr[in_range_r] if in_range_r.any() else rr
+            out["Rmax"] = float(np.max(rsub))
+            out["Rmin"] = float(np.min(rsub))
             out["Rptp"] = float(out["Rmax"] - out["Rmin"])
 
     return out
@@ -121,10 +231,37 @@ def _temps_for_number(
     return sub
 
 
+# Aliasy kolonok psidata: kluch metyki -> realnye kolonki (kak v psidata_map_table)
+_WRITE_ALIAS: Dict[str, Tuple[str, ...]] = {
+    "Fmax": ("Fmax",),
+    "Fmin": ("Fmin",),
+    "Rmax": ("Rmax",),
+    "Rmin": ("Rmin",),
+    "Mono": ("Mono",),
+    "Turnover": ("TurnOver_1", "Turnover", "TurnOver"),
+    "Tmax": ("extr_1", "Tmax"),
+    "Tmin": ("extr_2", "Tmin"),
+    "Fptp": ("Fptp",),
+    "Fptp/2": ("Fptp/2", "Fptp_2"),
+    "Rptp": ("Rptp",),
+    "Slope": ("Slope",),
+}
+
+
+def _write_metric(df: pd.DataFrame, idx: Any, metric: str, value: Any) -> None:
+    if value is None:
+        return
+    for col in _WRITE_ALIAS.get(metric, (metric,)):
+        if col in df.columns:
+            df.at[idx, col] = value
+            return
+
+
 def build_summary_table(
     psi_df: pd.DataFrame,
     temps_df: pd.DataFrame,
     measure_id: int,
+    spec: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """
     Stroim svodnuyu po VSEM nomeram iz temps (corrected) i/ili psi.
@@ -154,7 +291,7 @@ def build_summary_table(
 
     for n in numbers:
         tsub = _temps_for_number(temps_df, n, measure_id)
-        m = compute_curve_metrics(tsub)
+        m = compute_curve_metrics(tsub, spec=spec)
         prow = psi_by_n.get(n)
         status = prow.get("Status") if prow is not None else None
         row = {"N": n, "Measure_ID": measure_id, "Status": status}
@@ -168,6 +305,7 @@ def apply_metrics_to_psidata(
     psi_df: pd.DataFrame,
     temps_df: pd.DataFrame,
     measure_id: int,
+    spec: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     out = psi_df[psi_df["Measure_ID"] == measure_id].copy()
     if out.empty:
@@ -176,28 +314,8 @@ def apply_metrics_to_psidata(
     for idx, prow in out.iterrows():
         n = str(prow.get("N") or "").strip().upper()
         tsub = _temps_for_number(temps_df, n, measure_id)
-        m = compute_curve_metrics(tsub)
-        mapping = {
-            "Fmax": "Fmax",
-            "Fmin": "Fmin",
-            "Rmax": "Rmax",
-            "Rmin": "Rmin",
-            "Mono": "Mono",
-            "Turnover": "Turnover",
-        }
-        extra = {
-            "Fptp": m.get("Fptp"),
-            "Fptp/2": m.get("Fptp/2"),
-            "Rptp": m.get("Rptp"),
-            "Slope": m.get("Slope"),
-            "Tmax": m.get("Tmax"),
-            "Tmin": m.get("Tmin"),
-        }
-        for src, dst in mapping.items():
-            if dst in out.columns and m.get(src) is not None:
-                out.at[idx, dst] = m[src]
-        for col, val in extra.items():
-            if col in out.columns and val is not None:
-                out.at[idx, col] = val
+        m = compute_curve_metrics(tsub, spec=spec)
+        for metric in _WRITE_ALIAS:
+            _write_metric(out, idx, metric, m.get(metric))
 
     return out

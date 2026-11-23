@@ -51,6 +51,62 @@ def _temps() -> str:
     return _source["temps_table"]
 
 
+# Parametry specifikacii dlya metrik TCH (Tnakl/Tnastr/polinom/TCH_Temp_A/B)
+_SPEC_PARAM_COLUMNS = {
+    "t_nakl": ("Tnakl", "t_nakl"),
+    "t_nastr": ("Tnastr", "t_nastr"),
+    "degree": ("polinom", "Polinom"),
+    "ta": ("TCH_Temp_A", "TCH_TempA", "Temp_TCH_A"),
+    "tb": ("TCH_Temp_B", "TCH_TempB", "Temp_TCH_B"),
+}
+_SPEC_PARAMS_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def get_spec_params(spc: Optional[str]) -> Dict[str, Any]:
+    """Parametry specifikacii dlya metrik TCH (kak get_spc_base_temps v Make_Measure)."""
+    empty = {"t_nakl": None, "t_nastr": None, "degree": 3, "ta": None, "tb": None}
+    if not spc:
+        return dict(empty)
+    spc = str(spc).strip()
+    if not spc:
+        return dict(empty)
+    cached = _SPEC_PARAMS_CACHE.get(spc)
+    if cached is not None:
+        return dict(cached)
+    out = dict(empty)
+    eng = _get_engine()
+    try:
+        row = pd.read_sql(
+            text("SELECT * FROM \`specification\` WHERE Name = :n LIMIT 1"),
+            eng,
+            params={"n": spc},
+        )
+        if not row.empty:
+            r = row.iloc[0]
+            for key, cols in _SPEC_PARAM_COLUMNS.items():
+                for c in cols:
+                    if c not in row.columns:
+                        continue
+                    v = r.get(c)
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        continue
+                    if key == "degree":
+                        try:
+                            out["degree"] = max(1, int(float(str(v).strip().replace(",", "."))))
+                        except (TypeError, ValueError):
+                            pass
+                    else:
+                        try:
+                            out[key] = float(str(v).strip().replace(",", "."))
+                        except (TypeError, ValueError):
+                            pass
+                    break
+    except Exception as e:
+        print(f"[TOC] get_spec_params: {e}", flush=True)
+    _SPEC_PARAMS_CACHE[spc] = out
+    return dict(out)
+
+
 # ---------------------------------------------------------------------------
 # Kaskad: Type -> Spec -> MSK -> Date -> Measure_ID  (kak v Archive)
 # ---------------------------------------------------------------------------
