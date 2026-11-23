@@ -6,6 +6,11 @@ from tabulate import tabulate
 
 from Options import get_connection_string, parse_connection_string
 from Temperature_Measure.measure_data_class import MEASURE_DATA
+from Temperature_Measure.spc_matching import (FREQ_TOL_PPM, parse_temp_list,
+                                              temps_covered, temps_sets_equal,
+                                              temps_match,
+                                              load_types_compatible,
+                                              nominal_matches)
 import mysql.connector
 from mysql.connector import Error
 
@@ -560,32 +565,29 @@ def test_spcecification(slot):
         return "Не соответствует"
 
     spc_sel_df = process_nominal(spc_sel_df)
-    # исправляем номинал в случае мульти спецификаций
-    for index, row in spc_sel_df.iterrows():
-        if row['Multy'] == 1:
-            row['Nominal'] = data['Номинал'] / 1E6
+    # Исправляем номинал в случае мульти спецификаций.
+    # Раньше правка выполнялась через iterrows (запись в копию строки),
+    # поэтому DataFrame не менялся и мульти-спецификации всегда возвращали
+    # "Не соответствует". Теперь правим исходный df по маске.
+    multy_mask = spc_sel_df['Multy'] == 1
+    if multy_mask.any():
+        spc_sel_df.loc[multy_mask, 'Nominal'] = data['Номинал'] / 1E6
 
-    if not (spc_sel_df['Nominal'] == data['Номинал']).all():
+    # Допуск по номиналу: 100 ppm вместо строгого равенства float
+    # (равенство float давало ложные отказы из-за погрешностей округления)
+    if not spc_sel_df['Nominal'].apply(
+            lambda f: nominal_matches(f, data['Номинал'],
+                                      tol_ppm=FREQ_TOL_PPM)).all():
         return "Не соответствует"
 
+    # Совместимость режима измерения и типа нагрузки.
+    # Проверка Loadvalue == CL_Value (подбор по ёмкости нагрузки) убрана:
+    # расхождения в форме записи значения CL (нули, '32(30)') отбраковывали
+    # корректные спецификации.
     cl_metod = data['CL_Metod']
-    valid_combinations = {
-        'EQREACT': ['EQREACT', 'SERIES'],
-        'NUMERICAL': ['NUMERICAL', 'SERIES'],
-        'PHYSICAL': ['PHYSICAL'],
-        'SERIES': ['SERIES']  # Добавлен специально как отдельный ключ
-    }
-
-    if cl_metod not in valid_combinations:
+    if not all(load_types_compatible(cl_metod, load_type)
+               for load_type in spc_sel_df['LoadType']):
         return "Не соответствует"
-
-    valid_load_types = valid_combinations[cl_metod]
-    if not spc_sel_df['LoadType'].isin(valid_load_types).all():
-        return "Не соответствует"
-
-    if float(data['CL_Value']) > 0:
-        if not (spc_sel_df['Loadvalue'] == data['CL_Value']).all():
-            return "Не соответствует"
 
     temp_results = []
     for _, row in spc_sel_df.iterrows():
@@ -597,18 +599,18 @@ def test_spcecification(slot):
             return "Не соответствует"
 
         temp_str = df_temp['Temperatures'].iloc[0]
-        temp_list_db = list(map(float, temp_str.split()))
-        temp_list_data = data['Temp_List']
+        # Парсинг устойчив к формату записи: 25 vs 25.0, разделители
+        # ',' / ';' / пробелы, None (раньше строки сравнивались в исходном
+        # виде и проверка падала на неожиданном формате)
+        temp_list_db = parse_temp_list(temp_str)
+        temp_list_data = parse_temp_list(data['Temp_List'])
 
-        set_data = set(temp_list_data)
-        set_db = set(temp_list_db)
-        len_data = len(temp_list_data)
-        len_db = len(temp_list_db)
-
-        if set_data == set_db and len_data == len_db:
+        if temps_sets_equal(temp_list_data, temp_list_db):
             temp_results.append("OK")
-        elif set_db.issubset(set_data) and len_data >= len_db:
+        elif temps_covered(temp_list_db, temp_list_data):
             temp_results.append("OK (Интервал избыточен)")
+        elif temps_match(temp_list_db, temp_list_data):
+            temp_results.append("OK (Гибкое совпадение интервала)")
         else:
             temp_results.append("Не соответствует")
 
@@ -616,8 +618,10 @@ def test_spcecification(slot):
         return "Не соответствует"
     elif "OK" in temp_results:
         return "OK"
-    else:
+    elif "OK (Интервал избыточен)" in temp_results:
         return "OK (Интервал избыточен)"
+    else:
+        return "OK (Гибкое совпадение интервала)"
 
 
 # Функция проверяет соответсвие установленных номеров номерам МСК
