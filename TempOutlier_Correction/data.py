@@ -1,4 +1,4 @@
-"""Загрузка и сохранение данных psidata / psidatatemp."""
+"""Zagruzka i sohranenie dannyh psidata / psidatatemp."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ _engine = None
 _source = {
     "main_table": "psidata",
     "temps_table": "psidatatemp",
-    "label": "Основная",
+    "label": "Osnovnaya",
 }
 
 
@@ -51,8 +51,189 @@ def _temps() -> str:
     return _source["temps_table"]
 
 
-def search_msk(partial: str, limit: int = 50) -> List[str]:
-    """LIKE-поиск МСК по части номера."""
+# ---------------------------------------------------------------------------
+# Kaskad: Type -> Spec -> MSK -> Date -> Measure_ID  (kak v Archive)
+# ---------------------------------------------------------------------------
+
+def get_types() -> List[str]:
+    eng = _get_engine()
+    try:
+        return (
+            pd.read_sql(
+                text("SELECT `Type` FROM `resonatortype` ORDER BY `Type`"),
+                eng,
+            )["Type"]
+            .dropna()
+            .astype(str)
+            .tolist()
+        )
+    except Exception as e:
+        print(f"[TOC] get_types: {e}", flush=True)
+        return []
+
+
+def get_specs_by_type(rtype: str) -> List[str]:
+    if not rtype:
+        return []
+    eng = _get_engine()
+    try:
+        return (
+            pd.read_sql(
+                text(
+                    "SELECT `Name` FROM `specification` "
+                    "WHERE NameR = :t ORDER BY `Name`"
+                ),
+                eng,
+                params={"t": rtype},
+            )["Name"]
+            .dropna()
+            .astype(str)
+            .tolist()
+        )
+    except Exception as e:
+        print(f"[TOC] get_specs: {e}", flush=True)
+        return []
+
+
+def get_msk_list(spc: Optional[str] = None) -> List[str]:
+    eng = _get_engine()
+    table = _main()
+    try:
+        if spc:
+            sql = text(
+                f"SELECT DISTINCT MSK FROM `{table}` "
+                f"WHERE Spc = :spc AND MSK IS NOT NULL ORDER BY MSK"
+            )
+            params = {"spc": spc}
+        else:
+            sql = text(
+                f"SELECT DISTINCT MSK FROM `{table}` "
+                f"WHERE MSK IS NOT NULL ORDER BY MSK"
+            )
+            params = {}
+        return (
+            pd.read_sql(sql, eng, params=params)["MSK"]
+            .dropna()
+            .astype(str)
+            .tolist()
+        )
+    except Exception as e:
+        print(f"[TOC] get_msk_list: {e}", flush=True)
+        return []
+
+
+def get_dates_list(
+    msk: Optional[str] = None, spc: Optional[str] = None
+) -> List[str]:
+    eng = _get_engine()
+    table = _main()
+    cond, params = [], {}
+    if msk:
+        cond.append("MSK = :msk")
+        params["msk"] = msk
+    if spc:
+        cond.append("Spc = :spc")
+        params["spc"] = spc
+    where = " AND ".join(cond) if cond else "1=1"
+    sql = text(
+        f"SELECT DISTINCT Date FROM `{table}` WHERE {where} "
+        f"AND Date IS NOT NULL ORDER BY Date"
+    )
+    try:
+        return (
+            pd.read_sql(sql, eng, params=params)["Date"]
+            .dropna()
+            .astype(str)
+            .tolist()
+        )
+    except Exception as e:
+        print(f"[TOC] get_dates: {e}", flush=True)
+        return []
+
+
+def get_files_list(
+    msk: Optional[str] = None,
+    spc: Optional[str] = None,
+    date: Optional[str] = None,
+) -> List[str]:
+    eng = _get_engine()
+    table = _main()
+    cond, params = [], {}
+    if msk:
+        cond.append("MSK = :msk")
+        params["msk"] = msk
+    if spc:
+        cond.append("Spc = :spc")
+        params["spc"] = spc
+    if date:
+        cond.append("Date = :dt")
+        params["dt"] = date
+    where = " AND ".join(cond) if cond else "1=1"
+    sql = text(
+        f"SELECT DISTINCT File FROM `{table}` WHERE {where} "
+        f"AND File IS NOT NULL ORDER BY File"
+    )
+    try:
+        return (
+            pd.read_sql(sql, eng, params=params)["File"]
+            .dropna()
+            .astype(str)
+            .tolist()
+        )
+    except Exception as e:
+        print(f"[TOC] get_files: {e}", flush=True)
+        return []
+
+
+def list_measure_ids(
+    msk: Optional[str] = None,
+    spc: Optional[str] = None,
+    date: Optional[str] = None,
+    file: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Spisok Measure_ID s metadannymi. Filtry neobyazatelny."""
+    eng = _get_engine()
+    table = _main()
+    cond, params = ["Measure_ID IS NOT NULL"], {}
+    if msk:
+        cond.append("MSK = :msk")
+        params["msk"] = msk
+    if spc:
+        cond.append("Spc = :spc")
+        params["spc"] = spc
+    if date:
+        cond.append("Date = :dt")
+        params["dt"] = date
+    if file:
+        cond.append("File = :fl")
+        params["fl"] = file
+    where = " AND ".join(cond)
+    sql = text(
+        f"""
+        SELECT Measure_ID,
+               MIN(MSK)  AS MSK,
+               MIN(Spc)  AS Spc,
+               MIN(Date) AS Date,
+               MIN(File) AS File,
+               COUNT(DISTINCT N) AS n_count,
+               COUNT(*) AS row_count
+        FROM `{table}`
+        WHERE {where}
+        GROUP BY Measure_ID
+        ORDER BY Measure_ID DESC
+        """
+    )
+    try:
+        with eng.connect() as conn:
+            rows = conn.execute(sql, params).mappings().fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[TOC] list_measure_ids: {e}", flush=True)
+        return []
+
+
+def search_msk(partial: str, limit: int = 80) -> List[str]:
+    """LIKE-poisk MSK po chasti nomera (lyubye imena: data, indeks i t.d.)."""
     partial = (partial or "").strip()
     if not partial:
         return []
@@ -61,33 +242,63 @@ def search_msk(partial: str, limit: int = 50) -> List[str]:
         f"SELECT DISTINCT MSK FROM `{_main()}` "
         f"WHERE MSK LIKE :p ORDER BY MSK LIMIT :lim"
     )
-    with eng.connect() as conn:
-        rows = conn.execute(sql, {"p": f"%{partial}%", "lim": limit}).fetchall()
-    return [str(r[0]) for r in rows if r[0]]
+    try:
+        with eng.connect() as conn:
+            rows = conn.execute(
+                sql, {"p": f"%{partial}%", "lim": int(limit)}
+            ).fetchall()
+        return [str(r[0]) for r in rows if r[0]]
+    except Exception as e:
+        print(f"[TOC] search_msk: {e}", flush=True)
+        return []
+
+
+def search_measure_id(partial: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Poisk Measure_ID po chasti nomera ili tochnomu ID."""
+    partial = (partial or "").strip()
+    if not partial:
+        return []
+    eng = _get_engine()
+    table = _main()
+    try:
+        if partial.isdigit():
+            sql = text(
+                f"""
+                SELECT Measure_ID,
+                       MIN(MSK) AS MSK, MIN(Date) AS Date,
+                       MIN(File) AS File, COUNT(DISTINCT N) AS n_count
+                FROM `{table}`
+                WHERE Measure_ID = :mid
+                GROUP BY Measure_ID
+                """
+            )
+            params = {"mid": int(partial)}
+        else:
+            sql = text(
+                f"""
+                SELECT Measure_ID,
+                       MIN(MSK) AS MSK, MIN(Date) AS Date,
+                       MIN(File) AS File, COUNT(DISTINCT N) AS n_count
+                FROM `{table}`
+                WHERE CAST(Measure_ID AS CHAR) LIKE :p
+                   OR MSK LIKE :p
+                   OR File LIKE :p
+                GROUP BY Measure_ID
+                ORDER BY Measure_ID DESC
+                LIMIT :lim
+                """
+            )
+            params = {"p": f"%{partial}%", "lim": int(limit)}
+        with eng.connect() as conn:
+            rows = conn.execute(sql, params).mappings().fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[TOC] search_measure_id: {e}", flush=True)
+        return []
 
 
 def list_measure_ids_for_msk(msk: str) -> List[Dict[str, Any]]:
-    """Список Measure_ID для МСК с метаданными (Date, File, count N)."""
-    msk = (msk or "").strip()
-    if not msk:
-        return []
-    eng = _get_engine()
-    sql = text(
-        f"""
-        SELECT Measure_ID,
-               MIN(Date) AS Date,
-               MIN(File) AS File,
-               COUNT(DISTINCT N) AS n_count,
-               COUNT(*) AS row_count
-        FROM `{_main()}`
-        WHERE MSK = :msk AND Measure_ID IS NOT NULL
-        GROUP BY Measure_ID
-        ORDER BY Measure_ID DESC
-        """
-    )
-    with eng.connect() as conn:
-        rows = conn.execute(sql, {"msk": msk}).mappings().fetchall()
-    return [dict(r) for r in rows]
+    return list_measure_ids(msk=msk)
 
 
 def load_psidata(measure_ids: Sequence[int]) -> pd.DataFrame:
@@ -116,7 +327,6 @@ def load_temps(measure_ids: Sequence[int]) -> pd.DataFrame:
 def load_temps_for_number(
     measure_ids: Sequence[int], number: str
 ) -> pd.DataFrame:
-    """Температуры для одного номера N по списку Measure_ID."""
     mids = [int(m) for m in measure_ids if m is not None]
     n = str(number or "").strip().upper()
     if not mids or not n:
@@ -163,12 +373,8 @@ def save_corrected_measure(
     source_mids: Sequence[int],
     login: str = "toc",
 ) -> int:
-    """
-    Записать скорректированный замер как новый Measure_ID.
-    Возвращает новый Measure_ID.
-    """
     if psi_rows is None or psi_rows.empty:
-        raise ValueError("Нет строк psidata для сохранения")
+        raise ValueError("Net strok psidata dlya sohraneniya")
 
     new_mid = next_measure_id()
     eng = _get_engine()

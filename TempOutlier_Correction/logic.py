@@ -1,23 +1,36 @@
 """
-Логика обнаружения и коррекции выбросов.
+Logika korrekcii vybrosov TCH (F, R) po neskolkim zameram.
 
-Сценарии:
-1) По каждому номеру резонатора N: сравниваем кривые F/R нескольких замеров
-   на одинаковых температурах. Если точка — выброс только на одном замере
-   (есть «хорошие» соседи на той же T) — заменяем медианой/регрессией.
-2) Глобальная корреляция: если на одной температуре у ВСЕХ номеров одного
-   замера единичный сбой (выброс), точка считается системным сбоем замера
-   и заменяется регрессией по соседним температурам.
+Algoritm na kazhdyj nomer N:
+  1. Dlya kazhdogo Measure_ID stroyim krivuyu param(T).
+  2. Vnutri krivoj: marker 100000 i MAD po T -> lokalnye vybrosy.
+  3. Cross-measure na odnoj T: tochka plohaya, esli silno otlichaetsya
+     ot mediany ostalnyh (rabotaet i pri 2 zamerah).
+  4. Na kazhdoj T:
+       - esli est hotya by odno horoshee znachenie -> median(good)
+       - inache regressiya po krivoj s menshim chislom sboev.
+  5. Bazovyj MID = zamer s minimalnym chislom vybrosov (ne pervyj v spiske).
+  6. NN-hooks (IsolationForest i t.d.) - tolko esli vklyucheny v nastrojkah.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from .constants import MAD_K, MEASURABLE_COLS, OUTLIER_MARKER, OUTLIER_PARAMS
+from .constants import MAD_K, OUTLIER_MARKER, OUTLIER_PARAMS
+
+ProgressCb = Optional[Callable[[float, str], None]]
+
+# minimalnye absolyutnye porogi (kogda MAD neizvesten pri 2 tochkah)
+_ABS_FLOOR = {
+    "F": 2.0,      # ppm
+    "R": 0.5,      # Ohm
+    "FL": 2.0,
+    "Q": 50.0,
+}
 
 
 def _safe_float(v) -> Optional[float]:
@@ -33,13 +46,14 @@ def _safe_float(v) -> Optional[float]:
 
 
 def _mad_threshold(values: Sequence[float]) -> Tuple[float, float, Optional[float]]:
-    """median, robust_sigma, threshold (or None if too few points)."""
     arr = np.asarray(
         [v for v in values if v is not None and v != OUTLIER_MARKER], dtype=float
     )
-    if arr.size < 3:
-        return float(np.median(arr)) if arr.size else 0.0, 0.0, None
+    if arr.size == 0:
+        return 0.0, 0.0, None
     med = float(np.median(arr))
+    if arr.size < 3:
+        return med, 0.0, None
     mad = float(np.median(np.abs(arr - med)))
     sigma = 1.4826 * mad
     thr = MAD_K * sigma if sigma > 0 else None
@@ -60,21 +74,19 @@ def regression_replace(
     bad_mask: np.ndarray,
     degree: int = 2,
 ) -> np.ndarray:
-    """Замена плохих точек полиномиальной регрессией по хорошим."""
     out = values.astype(float).copy()
     good = ~bad_mask & np.isfinite(values) & (values != OUTLIER_MARKER)
-    if good.sum() < max(2, degree + 1):
+    if int(good.sum()) < max(2, degree + 1):
         for i in np.where(bad_mask)[0]:
             neigh = []
             for j in range(max(0, i - 2), min(len(values), i + 3)):
                 if j == i:
                     continue
-                if good[j] or (np.isfinite(values[j]) and values[j] != OUTLIER_MARKER):
-                    neigh.append(values[j])
+                if np.isfinite(values[j]) and values[j] != OUTLIER_MARKER:
+                    neigh.append(float(values[j]))
             if neigh:
                 out[i] = float(np.median(neigh))
         return out
-
     deg = min(degree, int(good.sum()) - 1)
     coeffs = np.polyfit(temps[good], values[good], deg)
     for i in np.where(bad_mask)[0]:
@@ -82,146 +94,356 @@ def regression_replace(
     return out
 
 
-def _align_by_temp(
-    series_list: List[pd.DataFrame],
+def _series_for_number(
+    temps_df: pd.DataFrame, mid: int, number: str
+) -> pd.DataFrame:
+    if temps_df is None or temps_df.empty:
+        return pd.DataFrame()
+    sub = temps_df[
+        (temps_df["Measure_ID"] == mid)
+        & (temps_df["N"].astype(str).str.strip().str.upper() == str(number).upper())
+    ].copy()
+    if sub.empty:
+        return sub
+    return sub.sort_values("Temp").reset_index(drop=True)
+
+
+def _within_curve_bad_mask(temps: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Lokalnye vybrosy vnutri odnoj krivoj (marker + MAD po T)."""
+    n = len(values)
+    bad = np.zeros(n, dtype=bool)
+    clean = []
+    for i, v in enumerate(values):
+        if not np.isfinite(v) or v == OUTLIER_MARKER:
+            bad[i] = True
+        else:
+            clean.append(float(v))
+    if len(clean) >= 3:
+        med, _, thr = _mad_threshold(clean)
+        if thr is not None:
+            for i, v in enumerate(values):
+                if bad[i]:
+                    continue
+                if abs(float(v) - med) > thr:
+                    bad[i] = True
+    # rezkie skachki otnositelno sosedey
+    for i in range(n):
+        if bad[i] or not np.isfinite(values[i]):
+            continue
+        neigh = []
+        for j in (i - 1, i + 1):
+            if 0 <= j < n and not bad[j] and np.isfinite(values[j]) and values[j] != OUTLIER_MARKER:
+                neigh.append(float(values[j]))
+        if len(neigh) == 2:
+            pred = 0.5 * (neigh[0] + neigh[1])
+            spread = abs(neigh[0] - neigh[1]) + 1e-9
+            if abs(float(values[i]) - pred) > max(3.0 * spread, abs(pred) * 0.02 + 1e-6):
+                bad[i] = True
+    return bad
+
+
+def _cross_is_bad(
+    v: Optional[float],
+    peers: List[Optional[float]],
+    param: str,
+) -> bool:
+    """Vybros otnositelno drugih zamerov na toj zhe T (rabotaet pri 2+)."""
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        return True
+    if v == OUTLIER_MARKER:
+        return True
+    peer_vals = [float(x) for x in peers if x is not None and x != OUTLIER_MARKER and np.isfinite(float(x))]
+    if len(peer_vals) < 2:
+        return False
+    med, _, thr = _mad_threshold(peer_vals)
+    floor = _ABS_FLOOR.get(param, 1.0)
+    if thr is None:
+        # 2 tochki: sravnivaem s drugim
+        others = [x for x in peer_vals if abs(x - float(v)) > 1e-15]
+        if not others:
+            return False
+        omed = float(np.median(others))
+        rel = abs(omed) * 0.03 + floor  # 3% + floor
+        return abs(float(v) - omed) > rel
+    thr_use = max(thr, floor)
+    if abs(float(v) - med) > thr_use:
+        return True
+    others = [x for x in peer_vals if abs(x - float(v)) > 1e-15]
+    if others:
+        omed = float(np.median(others))
+        if abs(float(v) - omed) > thr_use:
+            return True
+    return False
+
+
+def _align_grid(
+    series_by_mid: Dict[int, pd.DataFrame],
     param: str,
     temp_tol: float = 0.51,
-) -> Dict[float, List[Optional[float]]]:
-    if not series_list:
-        return {}
-    ref = series_list[0]
-    if ref.empty or "Temp" not in ref.columns:
-        return {}
-    ref_temps = sorted(
-        {
-            round(float(t), 2)
-            for t in ref["Temp"].dropna()
-            if _safe_float(t) is not None
-        }
-    )
-    result: Dict[float, List[Optional[float]]] = {t: [] for t in ref_temps}
-    for df in series_list:
+) -> Tuple[List[float], Dict[int, List[Optional[float]]], Dict[int, List[bool]]]:
+    """
+    Setka T = obyedinenie Temp.
+    aligned[mid][i] = znachenie param
+    within_bad[mid][i] = lokalnyj vybros vnutri krivoj
+    """
+    all_t: List[float] = []
+    for df in series_by_mid.values():
+        if df is None or df.empty or "Temp" not in df.columns:
+            continue
+        for t in df["Temp"].dropna():
+            tv = _safe_float(t)
+            if tv is not None:
+                all_t.append(round(tv, 2))
+    if not all_t:
+        return [], {}, {}
+
+    grid = sorted(set(all_t))
+    aligned: Dict[int, List[Optional[float]]] = {}
+    within_bad: Dict[int, List[bool]] = {}
+
+    for mid, df in series_by_mid.items():
+        if df is None or df.empty or param not in df.columns:
+            aligned[mid] = [None] * len(grid)
+            within_bad[mid] = [True] * len(grid)
+            continue
+        temps = np.asarray([_safe_float(t) or np.nan for t in df["Temp"]], dtype=float)
+        values = np.asarray(
+            [_safe_float(v) if _safe_float(v) is not None else np.nan for v in df[param]],
+            dtype=float,
+        )
+        # nan -> marker for within mask
+        values_for_mask = values.copy()
+        values_for_mask[~np.isfinite(values_for_mask)] = OUTLIER_MARKER
+        wbad = _within_curve_bad_mask(temps, values_for_mask)
+
+        vals: List[Optional[float]] = []
+        wflags: List[bool] = []
         used = set()
-        for t_ref in ref_temps:
+        for t_ref in grid:
             best = None
             best_d = temp_tol + 1
-            for idx, row in df.iterrows():
+            best_i = None
+            for idx in range(len(df)):
                 if idx in used:
                     continue
-                tv = _safe_float(row.get("Temp"))
-                if tv is None:
+                tv = temps[idx]
+                if not np.isfinite(tv):
                     continue
-                d = abs(tv - t_ref)
+                d = abs(float(tv) - t_ref)
                 if d < best_d:
                     best_d = d
-                    best = (idx, _safe_float(row.get(param)))
-            if best is not None and best_d <= temp_tol:
-                used.add(best[0])
-                result[t_ref].append(best[1])
+                    vv = values[idx]
+                    best = float(vv) if np.isfinite(vv) else None
+                    best_i = idx
+            if best_i is not None and best_d <= temp_tol:
+                used.add(best_i)
+                vals.append(best)
+                wflags.append(bool(wbad[best_i]))
             else:
-                result[t_ref].append(None)
-    return result
+                vals.append(None)
+                wflags.append(True)
+        aligned[mid] = vals
+        within_bad[mid] = wflags
+    return grid, aligned, within_bad
 
 
-def detect_cross_measure_outliers(
-    temps_by_mid: Dict[int, pd.DataFrame],
+def _nn_outlier_scores(
+    grid: List[float],
+    aligned: Dict[int, List[Optional[float]]],
+    nn_options: Optional[Dict[str, bool]],
+) -> Dict[int, List[float]]:
+    """
+    Optional NN scores (0=ok, 1=outlier). Default: zeros.
+    Hooks for IsolationForest / autoencoder when enabled.
+    """
+    scores = {m: [0.0] * len(grid) for m in aligned}
+    if not nn_options:
+        return scores
+    use_if = nn_options.get("use_isolation_forest") or nn_options.get("use_autoencoder")
+    if not use_if:
+        return scores
+    try:
+        from sklearn.ensemble import IsolationForest  # type: ignore
+    except Exception:
+        return scores
+    # feature = value at T for each mid; fit on all finite points per mid
+    for mid, vals in aligned.items():
+        arr = np.array([[i, v] for i, v in enumerate(vals) if v is not None and v != OUTLIER_MARKER], dtype=float)
+        if len(arr) < 5:
+            continue
+        try:
+            clf = IsolationForest(contamination=0.15, random_state=42)
+            pred = clf.fit_predict(arr)
+            for k, (i, _) in enumerate(arr):
+                if pred[k] < 0:
+                    scores[mid][int(i)] = 1.0
+        except Exception:
+            continue
+    return scores
+
+
+def build_corrected_curve_for_number(
+    temps_df: pd.DataFrame,
+    selected_mids: Sequence[int],
     number: str,
     params: Sequence[str] = OUTLIER_PARAMS,
-) -> Dict[str, Any]:
-    mids = list(temps_by_mid.keys())
-    if len(mids) < 2:
-        return {"outliers": [], "masks": {}}
+    prefer_mid: Optional[int] = None,
+    degree: int = 2,
+    nn_options: Optional[Dict[str, bool]] = None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
+    """
+    Skorrektirovannaya krivaya dlya N.
 
-    series = []
-    mid_order = []
+    Na kazhdoj T: median(horoshih). Horoshie = ne lokalnyj vybros i ne cross-vybros.
+    Esli horoshih net - regressiya po krivoj base (menshe sboev).
+    """
+    mids = [int(m) for m in selected_mids]
+    series_by_mid: Dict[int, pd.DataFrame] = {}
     for mid in mids:
-        df = temps_by_mid[mid]
-        if df is None or df.empty:
-            continue
-        sub = df[
-            df["N"].astype(str).str.strip().str.upper() == str(number).upper()
-        ].copy()
-        if sub.empty:
-            continue
-        sub = sub.sort_values("Temp")
-        series.append(sub)
-        mid_order.append(mid)
+        s = _series_for_number(temps_df, mid, number)
+        if not s.empty:
+            series_by_mid[mid] = s
+    if not series_by_mid:
+        return pd.DataFrame(), [], (prefer_mid or (mids[0] if mids else 0))
 
-    if len(series) < 2:
-        return {"outliers": [], "masks": {}}
-
-    outliers: List[Dict[str, Any]] = []
-    masks: Dict[int, Dict[str, np.ndarray]] = {mid: {} for mid in mid_order}
+    bad_counts: Dict[int, int] = {m: 0 for m in series_by_mid}
+    aligned_all: Dict[str, Any] = {}
 
     for param in params:
-        aligned = _align_by_temp(series, param)
-        for t_ref, vals in aligned.items():
-            good_vals = [v for v in vals if v is not None and v != OUTLIER_MARKER]
-            if len(good_vals) < 2:
+        grid, aligned, within_bad = _align_grid(series_by_mid, param)
+        nn_scores = _nn_outlier_scores(grid, aligned, nn_options)
+        aligned_all[param] = (grid, aligned, within_bad, nn_scores)
+        for mid in series_by_mid:
+            for i, v in enumerate(aligned.get(mid, [])):
+                peers = [aligned[m][i] for m in aligned]
+                local = within_bad.get(mid, [False] * len(grid))[i] if i < len(within_bad.get(mid, [])) else False
+                cross = _cross_is_bad(v, peers, param)
+                nn = (nn_scores.get(mid) or [0.0])[i] >= 0.5 if i < len(nn_scores.get(mid) or []) else False
+                if local or cross or nn or v is None:
+                    bad_counts[mid] = bad_counts.get(mid, 0) + 1
+
+    # base = menshe vybrosov; prefer_mid tolko kak tae-break
+    ordered = sorted(
+        series_by_mid.keys(),
+        key=lambda m: (bad_counts.get(m, 10**9), 0 if m == prefer_mid else 1, m),
+    )
+    base_mid = ordered[0]
+
+    # setka T dlya vyhoda = obyedinenie (plotnee)
+    all_grid: List[float] = []
+    for param in params:
+        g = aligned_all.get(param, ([], {}, {}, {}))[0]
+        all_grid.extend(g)
+    out_grid = sorted(set(all_grid)) if all_grid else []
+    if not out_grid:
+        # fallback - temp base
+        base_df = series_by_mid[base_mid].copy()
+        base_df["Measure_ID"] = base_mid
+        base_df["N"] = str(number).upper()
+        return base_df, [], base_mid
+
+    # sobiraem rezul'tat po strokam Temp
+    rows: List[Dict[str, Any]] = []
+    for t in out_grid:
+        rows.append({"Temp": t, "N": str(number).upper(), "Measure_ID": base_mid})
+    out_df = pd.DataFrame(rows)
+    # skopirovat prochie kolonki s base gde vozmozhno
+    base_src = series_by_mid[base_mid]
+    extra_cols = [c for c in base_src.columns if c not in ("Temp", "N", "Measure_ID") and c not in params]
+    for c in extra_cols:
+        out_df[c] = np.nan
+
+    corrections: List[Dict[str, Any]] = []
+
+    for param in params:
+        grid, aligned, within_bad, nn_scores = aligned_all.get(
+            param, ([], {}, {}, {})
+        )
+        if not grid:
+            continue
+        # map grid index
+        g_index = {t: i for i, t in enumerate(grid)}
+        corr_vals = []
+        bad_flags = []
+        for t_ref in out_grid:
+            if t_ref not in g_index:
+                corr_vals.append(np.nan)
+                bad_flags.append(True)
                 continue
-            med, _, thr = _mad_threshold(good_vals)
-            for i, v in enumerate(vals):
-                if v is None:
+            i = g_index[t_ref]
+            peers = [aligned[m][i] for m in aligned]
+            good: List[float] = []
+            for mid in aligned:
+                v = aligned[mid][i]
+                if v is None or v == OUTLIER_MARKER or not np.isfinite(float(v)):
                     continue
-                mid = mid_order[i]
-                is_bad = is_outlier_value(v, med, thr)
-                others = [
-                    x
-                    for j, x in enumerate(vals)
-                    if j != i and x is not None and x != OUTLIER_MARKER
-                ]
-                if others and thr is not None:
-                    other_med = float(np.median(others))
-                    if abs(v - other_med) > thr and abs(v - other_med) > abs(
-                        med - other_med
-                    ) * 0.5:
-                        is_bad = True
-                if v == OUTLIER_MARKER:
-                    is_bad = True
-                if is_bad:
-                    outliers.append(
-                        {
-                            "mid": mid,
-                            "param": param,
-                            "temp": t_ref,
-                            "old": v,
-                            "reason": "cross_measure",
-                            "number": number,
-                        }
-                    )
+                local = within_bad.get(mid, [False] * len(grid))[i]
+                cross = _cross_is_bad(v, peers, param)
+                nn = False
+                if nn_scores.get(mid) and i < len(nn_scores[mid]):
+                    nn = nn_scores[mid][i] >= 0.5
+                if not local and not cross and not nn:
+                    good.append(float(v))
 
-        for i, mid in enumerate(mid_order):
-            df = series[i]
-            mask = np.zeros(len(df), dtype=bool)
-            for k, row in enumerate(df.itertuples(index=False)):
-                tv = _safe_float(getattr(row, "Temp", None))
-                if tv is None:
-                    continue
-                t_key = (
-                    min(aligned.keys(), key=lambda x: abs(x - tv)) if aligned else None
-                )
-                if t_key is None or abs(t_key - tv) > 0.51:
-                    continue
-                vals = aligned[t_key]
-                v = vals[i] if i < len(vals) else None
-                if v is None:
-                    continue
-                good_vals = [x for x in vals if x is not None and x != OUTLIER_MARKER]
-                med, _, thr = _mad_threshold(good_vals)
-                if is_outlier_value(v, med, thr) or v == OUTLIER_MARKER:
-                    others = [
-                        x for j, x in enumerate(vals) if j != i and x is not None
-                    ]
-                    if len(others) >= 1 or v == OUTLIER_MARKER:
-                        mask[k] = True
-            masks[mid][param] = mask
+            base_v = aligned.get(base_mid, [None] * len(grid))[i] if base_mid in aligned else None
 
-    return {
-        "outliers": outliers,
-        "masks": masks,
-        "mid_order": mid_order,
-        "series": series,
-    }
+            if good:
+                new_v = float(np.median(good))
+                # esli base horosh i pochti sovpadaet - ostavlyaem base
+                if (
+                    base_v is not None
+                    and base_v != OUTLIER_MARKER
+                    and np.isfinite(float(base_v))
+                    and not _cross_is_bad(base_v, peers, param)
+                    and not (within_bad.get(base_mid, [False] * len(grid))[i] if base_mid in within_bad else False)
+                    and abs(float(base_v) - new_v) <= _ABS_FLOOR.get(param, 1.0) * 0.25
+                ):
+                    new_v = float(base_v)
+                corr_vals.append(new_v)
+                bad_flags.append(False)
+                if base_v is None or abs(float(base_v) - new_v) > 1e-12:
+                    corrections.append({
+                        "mid": base_mid,
+                        "number": number,
+                        "param": param,
+                        "temp": t_ref,
+                        "old": base_v,
+                        "new": new_v,
+                        "reason": "cross_consensus",
+                        "n_good": len(good),
+                        "n_peers": len([p for p in peers if p is not None]),
+                    })
+            else:
+                # net horoshih - vozmem base (dazhe plohoy) i pometim dlya regressii
+                corr_vals.append(float(base_v) if base_v is not None and np.isfinite(float(base_v)) else np.nan)
+                bad_flags.append(True)
+
+        temps_arr = np.asarray(out_grid, dtype=float)
+        vals_arr = np.asarray(corr_vals, dtype=float)
+        bad_mask = np.asarray(bad_flags, dtype=bool) | ~np.isfinite(vals_arr)
+
+        # NN TCN restore hook
+        if nn_options and nn_options.get("use_tcn_restore") and bad_mask.any():
+            # fallback: regression (TCN model not bundled)
+            pass
+
+        if bad_mask.any():
+            fixed = regression_replace(temps_arr, vals_arr, bad_mask, degree=degree)
+            for i in np.where(bad_mask)[0]:
+                corrections.append({
+                    "mid": base_mid,
+                    "number": number,
+                    "param": param,
+                    "temp": float(out_grid[i]),
+                    "old": float(vals_arr[i]) if np.isfinite(vals_arr[i]) else None,
+                    "new": float(fixed[i]),
+                    "reason": "regression_all_bad",
+                })
+                corr_vals[i] = float(fixed[i])
+
+        out_df[param] = [float(v) for v in corr_vals]
+
+    return out_df, corrections, base_mid
 
 
 def detect_global_temp_failures(
@@ -235,118 +457,44 @@ def detect_global_temp_failures(
     df = temps_df[temps_df["Measure_ID"] == measure_id].copy()
     if df.empty:
         return []
-
     numbers = df["N"].astype(str).str.strip().str.upper().unique()
     n_total = len(numbers)
     if n_total < 3:
         return []
-
     failures: List[Dict[str, Any]] = []
     for param in params:
         per_n_bad: Dict[str, set] = {}
         for n in numbers:
-            sub = df[
-                df["N"].astype(str).str.strip().str.upper() == n
-            ].sort_values("Temp")
-            vals = (
-                [_safe_float(v) for v in sub[param].tolist()]
-                if param in sub.columns
-                else []
-            )
-            clean = [v for v in vals if v is not None and v != OUTLIER_MARKER]
-            med, _, thr = _mad_threshold(clean)
+            sub = df[df["N"].astype(str).str.strip().str.upper() == n].sort_values("Temp")
+            if param not in sub.columns:
+                continue
+            vals = [_safe_float(v) for v in sub[param].tolist()]
+            arr = np.asarray([v if v is not None else OUTLIER_MARKER for v in vals], dtype=float)
+            temps = np.asarray([_safe_float(t) or np.nan for t in sub["Temp"]], dtype=float)
+            wbad = _within_curve_bad_mask(temps, arr)
             bad_temps = set()
-            for _, row in sub.iterrows():
-                tv = _safe_float(row.get("Temp"))
-                vv = _safe_float(row.get(param))
-                if tv is None or vv is None:
+            for k, row in enumerate(sub.itertuples(index=False)):
+                tv = _safe_float(getattr(row, "Temp", None))
+                if tv is None:
                     continue
-                if is_outlier_value(vv, med, thr):
+                if wbad[k]:
                     bad_temps.add(round(tv, 2))
             per_n_bad[str(n)] = bad_temps
-
         all_temps: Dict[float, int] = {}
-        for bad_set in per_n_bad.values():
-            for t in bad_set:
+        for s in per_n_bad.values():
+            for t in s:
                 all_temps[t] = all_temps.get(t, 0) + 1
-
         for t, cnt in all_temps.items():
             if cnt / n_total >= min_fraction:
-                failures.append(
-                    {
-                        "mid": measure_id,
-                        "param": param,
-                        "temp": t,
-                        "affected": cnt,
-                        "total": n_total,
-                        "reason": "global_temp_failure",
-                    }
-                )
-    return failures
-
-
-def apply_corrections(
-    temps_df: pd.DataFrame,
-    measure_id: int,
-    number: str,
-    param_masks: Dict[str, np.ndarray],
-    global_failures: Optional[List[Dict[str, Any]]] = None,
-    params: Sequence[str] = OUTLIER_PARAMS,
-    degree: int = 2,
-) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
-    df = temps_df[
-        (temps_df["Measure_ID"] == measure_id)
-        & (temps_df["N"].astype(str).str.strip().str.upper() == str(number).upper())
-    ].sort_values("Temp").copy()
-
-    if df.empty:
-        return df, []
-
-    corrections: List[Dict[str, Any]] = []
-    global_failures = global_failures or []
-    temps = df["Temp"].astype(float).values
-
-    for param in params:
-        if param not in df.columns:
-            continue
-        values = df[param].astype(float).values.copy()
-        bad = np.zeros(len(df), dtype=bool)
-
-        mask = param_masks.get(param)
-        if mask is not None and len(mask) == len(df):
-            bad |= mask
-
-        for gf in global_failures:
-            if gf.get("mid") != measure_id or gf.get("param") != param:
-                continue
-            t_bad = float(gf["temp"])
-            for i, t in enumerate(temps):
-                if abs(t - t_bad) <= 0.51:
-                    bad[i] = True
-
-        if not bad.any():
-            continue
-
-        new_vals = regression_replace(temps, values, bad, degree=degree)
-        for i in np.where(bad)[0]:
-            old = float(values[i])
-            new = float(new_vals[i])
-            if abs(old - new) < 1e-12:
-                continue
-            corrections.append(
-                {
+                failures.append({
                     "mid": measure_id,
-                    "number": number,
                     "param": param,
-                    "temp": float(temps[i]),
-                    "old": old,
-                    "new": new,
-                    "reason": "regression",
-                }
-            )
-            df.iloc[i, df.columns.get_loc(param)] = new
-
-    return df, corrections
+                    "temp": t,
+                    "affected": cnt,
+                    "total": n_total,
+                    "reason": "global_temp_failure",
+                })
+    return failures
 
 
 def build_corrected_temps(
@@ -354,21 +502,21 @@ def build_corrected_temps(
     selected_mids: Sequence[int],
     params: Sequence[str] = OUTLIER_PARAMS,
     prefer_mid: Optional[int] = None,
+    progress: ProgressCb = None,
+    nn_options: Optional[Dict[str, bool]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], Dict[str, Any]]:
     selected_mids = list(selected_mids)
     if not selected_mids:
         return pd.DataFrame(), [], {}
 
-    base_mid = prefer_mid if prefer_mid in selected_mids else selected_mids[0]
-    all_corr: List[Dict[str, Any]] = []
-    report: Dict[str, Any] = {"per_number": {}, "global": []}
+    def _p(pct: float, msg: str) -> None:
+        if progress:
+            try:
+                progress(pct, msg)
+            except Exception:
+                pass
 
-    global_by_mid: Dict[int, List[Dict[str, Any]]] = {}
-    for mid in selected_mids:
-        gfs = detect_global_temp_failures(temps_df, mid, params=params)
-        global_by_mid[mid] = gfs
-        report["global"].extend(gfs)
-
+    _p(2, "Podgotovka...")
     numbers = (
         temps_df[temps_df["Measure_ID"].isin(selected_mids)]["N"]
         .astype(str)
@@ -376,59 +524,50 @@ def build_corrected_temps(
         .str.upper()
         .unique()
         .tolist()
+        if temps_df is not None and not temps_df.empty
+        else []
     )
+    numbers = sorted({n for n in numbers if n})
 
-    corrected_parts: List[pd.DataFrame] = []
+    all_corr: List[Dict[str, Any]] = []
+    parts: List[pd.DataFrame] = []
+    report: Dict[str, Any] = {"per_number": {}, "global": [], "base_mid": None}
+    base_votes: List[int] = []
 
-    for n in sorted(set(numbers)):
-        if not n:
-            continue
-        temps_by_mid = {
-            mid: temps_df[
-                (temps_df["Measure_ID"] == mid)
-                & (temps_df["N"].astype(str).str.strip().str.upper() == n)
-            ]
-            for mid in selected_mids
-        }
-        det = detect_cross_measure_outliers(temps_by_mid, n, params=params)
-        masks = det.get("masks") or {}
+    for mid in selected_mids:
+        gfs = detect_global_temp_failures(temps_df, mid, params=params)
+        report["global"].extend(gfs)
 
-        param_masks = masks.get(base_mid, {})
-        part, corr = apply_corrections(
+    n_total = max(len(numbers), 1)
+    for k, n in enumerate(numbers):
+        _p(5 + 90 * k / n_total, f"N {n} ({k+1}/{n_total})")
+        part, corr, base_mid = build_corrected_curve_for_number(
             temps_df,
-            base_mid,
+            selected_mids,
             n,
-            param_masks,
-            global_failures=global_by_mid.get(base_mid, []),
             params=params,
+            prefer_mid=prefer_mid,
+            nn_options=nn_options,
         )
         if not part.empty:
-            corrected_parts.append(part)
+            parts.append(part)
         all_corr.extend(corr)
+        base_votes.append(base_mid)
         report["per_number"][n] = {
-            "outliers_found": len(det.get("outliers") or []),
             "corrections": len(corr),
+            "base_mid": base_mid,
         }
 
-        for mid in selected_mids:
-            if mid == base_mid:
-                continue
-            pm = masks.get(mid, {})
-            _, corr_o = apply_corrections(
-                temps_df,
-                mid,
-                n,
-                pm,
-                global_failures=global_by_mid.get(mid, []),
-                params=params,
-            )
-            all_corr.extend([{**c, "display_only": True} for c in corr_o])
-
-    if corrected_parts:
-        corrected = pd.concat(corrected_parts, ignore_index=True)
+    if parts:
+        corrected = pd.concat(parts, ignore_index=True)
     else:
-        corrected = temps_df[temps_df["Measure_ID"] == base_mid].copy()
+        corrected = pd.DataFrame()
 
-    report["base_mid"] = base_mid
-    report["n_corrections"] = len([c for c in all_corr if not c.get("display_only")])
+    if base_votes:
+        report["base_mid"] = max(set(base_votes), key=base_votes.count)
+    else:
+        report["base_mid"] = prefer_mid or selected_mids[0]
+    report["n_corrections"] = len(all_corr)
+    report["nn_options"] = dict(nn_options or {})
+    _p(100, "Gotovo")
     return corrected, all_corr, report

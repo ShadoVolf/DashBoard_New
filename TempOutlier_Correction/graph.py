@@ -99,7 +99,7 @@ def render_curves(
         anti_aliased=True,
     ):
         dpg.add_plot_legend(location=dpg.mvPlot_Location_NorthEast)
-        dpg.add_plot_axis(dpg.mvXAxis, label="T, °C", tag=x_tag)
+        dpg.add_plot_axis(dpg.mvXAxis, label="T, C", tag=x_tag)
         with dpg.plot_axis(dpg.mvYAxis, label=param, tag=y_tag):
             all_x: List[float] = []
             all_y: List[float] = []
@@ -167,7 +167,7 @@ def open_enlarged_graph(
         dpg.delete_item(BIG_WIN_TAG)
 
     with dpg.window(
-        label=f"ТЧХ — N {number} / {param}",
+        label=f"ТЧХ - N {number} / {param}",
         tag=BIG_WIN_TAG,
         width=w,
         height=h,
@@ -176,8 +176,8 @@ def open_enlarged_graph(
         no_collapse=True,
     ):
         dpg.add_text(
-            "Колесо мыши — смена номера резонатора.  "
-            "Жёлтая кривая — скорректированная.",
+            "Колесо мыши - смена номера резонатора.  "
+            "Желтая кривая - скорректированная.",
             color=(150, 200, 255),
         )
         with dpg.child_window(tag=BIG_CONTAINER, height=-1, border=False):
