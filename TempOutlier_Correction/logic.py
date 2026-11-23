@@ -1,16 +1,10 @@
 """
 Logika korrekcii vybrosov TCH (F, R) po neskolkim zameram.
 
-Algoritm na kazhdyj nomer N:
-  1. Dlya kazhdogo Measure_ID stroyim krivuyu param(T).
-  2. Vnutri krivoj: marker 100000 i MAD po T -> lokalnye vybrosy.
-  3. Cross-measure na odnoj T: tochka plohaya, esli silno otlichaetsya
-     ot mediany ostalnyh (rabotaet i pri 2 zamerah).
-  4. Na kazhdoj T:
-       - esli est hotya by odno horoshee znachenie -> median(good)
-       - inache regressiya po krivoj s menshim chislom sboev.
-  5. Bazovyj MID = zamer s minimalnym chislom vybrosov (ne pervyj v spiske).
-  6. NN-hooks (IsolationForest i t.d.) - tolko esli vklyucheny v nastrojkah.
+F: zapolnenie prorezhin i sglazhivanie - polinom 3 poryadka.
+R: consensus + regressiya stepeni 2 (kak ran'she, rabotaet horosho).
+IsolationForest: skor po ostatku ot poly3, kraevye tochki ne pomechayutsya
+tol'ko po IF (chtoby ne bylo bol'shih oshibok na krayah).
 """
 
 from __future__ import annotations
@@ -24,12 +18,19 @@ from .constants import MAD_K, OUTLIER_MARKER, OUTLIER_PARAMS
 
 ProgressCb = Optional[Callable[[float, str], None]]
 
-# minimalnye absolyutnye porogi (kogda MAD neizvesten pri 2 tochkah)
 _ABS_FLOOR = {
-    "F": 2.0,      # ppm
-    "R": 0.5,      # Ohm
+    "F": 2.0,
+    "R": 0.5,
     "FL": 2.0,
     "Q": 50.0,
+}
+
+# stepen' polinoma dlya zapolneniya / sglazhivaniya
+_POLY_DEGREE = {
+    "F": 3,
+    "R": 2,
+    "FL": 3,
+    "Q": 2,
 }
 
 
@@ -74,9 +75,11 @@ def regression_replace(
     bad_mask: np.ndarray,
     degree: int = 2,
 ) -> np.ndarray:
+    """Zapolnenie plohih tochek polinomom zadannoj stepeni (dlya F - 3)."""
     out = values.astype(float).copy()
     good = ~bad_mask & np.isfinite(values) & (values != OUTLIER_MARKER)
-    if int(good.sum()) < max(2, degree + 1):
+    n_good = int(good.sum())
+    if n_good < max(2, degree + 1):
         for i in np.where(bad_mask)[0]:
             neigh = []
             for j in range(max(0, i - 2), min(len(values), i + 3)):
@@ -87,10 +90,45 @@ def regression_replace(
             if neigh:
                 out[i] = float(np.median(neigh))
         return out
-    deg = min(degree, int(good.sum()) - 1)
+    deg = min(degree, n_good - 1)
     coeffs = np.polyfit(temps[good], values[good], deg)
     for i in np.where(bad_mask)[0]:
         out[i] = float(np.polyval(coeffs, temps[i]))
+    return out
+
+
+def smooth_curve_poly(
+    temps: np.ndarray,
+    values: np.ndarray,
+    degree: int = 3,
+    protect_mask: Optional[np.ndarray] = None,
+    max_delta: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Sglazhivanie krivoj polinomom. Tochki s protect_mask=True
+    ne dvigaem sil'nee max_delta (sohranyaem consensus).
+    """
+    out = values.astype(float).copy()
+    finite = np.isfinite(out) & (out != OUTLIER_MARKER)
+    if int(finite.sum()) < max(2, degree + 1):
+        return out
+    deg = min(degree, int(finite.sum()) - 1)
+    coeffs = np.polyfit(temps[finite], out[finite], deg)
+    approx = np.polyval(coeffs, temps)
+    for i in range(len(out)):
+        if not np.isfinite(temps[i]):
+            continue
+        if not finite[i]:
+            out[i] = float(approx[i])
+            continue
+        if protect_mask is not None and protect_mask[i]:
+            if max_delta is not None and abs(approx[i] - out[i]) > max_delta:
+                # ne lomayem horoshuyu tochu
+                continue
+            # legkoe podtyagivanie
+            out[i] = float(0.7 * out[i] + 0.3 * approx[i])
+        else:
+            out[i] = float(approx[i])
     return out
 
 
@@ -109,7 +147,6 @@ def _series_for_number(
 
 
 def _within_curve_bad_mask(temps: np.ndarray, values: np.ndarray) -> np.ndarray:
-    """Lokalnye vybrosy vnutri odnoj krivoj (marker + MAD po T)."""
     n = len(values)
     bad = np.zeros(n, dtype=bool)
     clean = []
@@ -126,7 +163,6 @@ def _within_curve_bad_mask(temps: np.ndarray, values: np.ndarray) -> np.ndarray:
                     continue
                 if abs(float(v) - med) > thr:
                     bad[i] = True
-    # rezkie skachki otnositelno sosedey
     for i in range(n):
         if bad[i] or not np.isfinite(values[i]):
             continue
@@ -147,23 +183,24 @@ def _cross_is_bad(
     peers: List[Optional[float]],
     param: str,
 ) -> bool:
-    """Vybros otnositelno drugih zamerov na toj zhe T (rabotaet pri 2+)."""
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return True
     if v == OUTLIER_MARKER:
         return True
-    peer_vals = [float(x) for x in peers if x is not None and x != OUTLIER_MARKER and np.isfinite(float(x))]
+    peer_vals = [
+        float(x) for x in peers
+        if x is not None and x != OUTLIER_MARKER and np.isfinite(float(x))
+    ]
     if len(peer_vals) < 2:
         return False
     med, _, thr = _mad_threshold(peer_vals)
     floor = _ABS_FLOOR.get(param, 1.0)
     if thr is None:
-        # 2 tochki: sravnivaem s drugim
         others = [x for x in peer_vals if abs(x - float(v)) > 1e-15]
         if not others:
             return False
         omed = float(np.median(others))
-        rel = abs(omed) * 0.03 + floor  # 3% + floor
+        rel = abs(omed) * 0.03 + floor
         return abs(float(v) - omed) > rel
     thr_use = max(thr, floor)
     if abs(float(v) - med) > thr_use:
@@ -181,11 +218,6 @@ def _align_grid(
     param: str,
     temp_tol: float = 0.51,
 ) -> Tuple[List[float], Dict[int, List[Optional[float]]], Dict[int, List[bool]]]:
-    """
-    Setka T = obyedinenie Temp.
-    aligned[mid][i] = znachenie param
-    within_bad[mid][i] = lokalnyj vybros vnutri krivoj
-    """
     all_t: List[float] = []
     for df in series_by_mid.values():
         if df is None or df.empty or "Temp" not in df.columns:
@@ -211,7 +243,6 @@ def _align_grid(
             [_safe_float(v) if _safe_float(v) is not None else np.nan for v in df[param]],
             dtype=float,
         )
-        # nan -> marker for within mask
         values_for_mask = values.copy()
         values_for_mask[~np.isfinite(values_for_mask)] = OUTLIER_MARKER
         wbad = _within_curve_bad_mask(temps, values_for_mask)
@@ -251,32 +282,69 @@ def _nn_outlier_scores(
     grid: List[float],
     aligned: Dict[int, List[Optional[float]]],
     nn_options: Optional[Dict[str, bool]],
+    param: str = "F",
 ) -> Dict[int, List[float]]:
     """
-    Optional NN scores (0=ok, 1=outlier). Default: zeros.
-    Hooks for IsolationForest / autoencoder when enabled.
+    IsolationForest po ostatku ot poly-fit (ne po syrym index,value).
+    Kraevye 15% tochek NE pomechayutsya tol'ko po IF.
     """
     scores = {m: [0.0] * len(grid) for m in aligned}
     if not nn_options:
         return scores
     use_if = nn_options.get("use_isolation_forest") or nn_options.get("use_autoencoder")
-    if not use_if:
+    if not use_if or not grid:
         return scores
+
+    # trained model from active learning if available
+    model = None
+    try:
+        from . import learning as toc_learning
+        model = toc_learning.get_trained_model(param)
+    except Exception:
+        model = None
+
     try:
         from sklearn.ensemble import IsolationForest  # type: ignore
     except Exception:
         return scores
-    # feature = value at T for each mid; fit on all finite points per mid
+
+    n = len(grid)
+    edge = max(1, int(0.15 * n))  # kraevye zony
+    deg = _POLY_DEGREE.get(param, 2)
+
     for mid, vals in aligned.items():
-        arr = np.array([[i, v] for i, v in enumerate(vals) if v is not None and v != OUTLIER_MARKER], dtype=float)
-        if len(arr) < 5:
+        xs, ys, idxs = [], [], []
+        for i, v in enumerate(vals):
+            if v is not None and v != OUTLIER_MARKER and np.isfinite(float(v)):
+                xs.append(float(grid[i]))
+                ys.append(float(v))
+                idxs.append(i)
+        if len(xs) < 6:
             continue
+        t_arr = np.asarray(xs, dtype=float)
+        v_arr = np.asarray(ys, dtype=float)
         try:
-            clf = IsolationForest(contamination=0.15, random_state=42)
-            pred = clf.fit_predict(arr)
-            for k, (i, _) in enumerate(arr):
+            d = min(deg, len(xs) - 1)
+            coeffs = np.polyfit(t_arr, v_arr, d)
+            resid = v_arr - np.polyval(coeffs, t_arr)
+            # features: residual, normalized position
+            t_norm = (t_arr - t_arr.min()) / (t_arr.max() - t_arr.min() + 1e-9)
+            feat = np.column_stack([resid, t_norm])
+            if model is not None:
+                pred = model.predict(feat)
+            else:
+                clf = IsolationForest(
+                    contamination=min(0.1, max(0.05, 2.0 / len(xs))),
+                    random_state=42,
+                    n_estimators=100,
+                )
+                pred = clf.fit_predict(feat)
+            for k, i in enumerate(idxs):
+                # ne trogaem kraevye tol'ko po IF
+                if i < edge or i >= n - edge:
+                    continue
                 if pred[k] < 0:
-                    scores[mid][int(i)] = 1.0
+                    scores[mid][i] = 1.0
         except Exception:
             continue
     return scores
@@ -291,12 +359,6 @@ def build_corrected_curve_for_number(
     degree: int = 2,
     nn_options: Optional[Dict[str, bool]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
-    """
-    Skorrektirovannaya krivaya dlya N.
-
-    Na kazhdoj T: median(horoshih). Horoshie = ne lokalnyj vybros i ne cross-vybros.
-    Esli horoshih net - regressiya po krivoj base (menshe sboev).
-    """
     mids = [int(m) for m in selected_mids]
     series_by_mid: Dict[int, pd.DataFrame] = {}
     for mid in mids:
@@ -311,7 +373,7 @@ def build_corrected_curve_for_number(
 
     for param in params:
         grid, aligned, within_bad = _align_grid(series_by_mid, param)
-        nn_scores = _nn_outlier_scores(grid, aligned, nn_options)
+        nn_scores = _nn_outlier_scores(grid, aligned, nn_options, param=param)
         aligned_all[param] = (grid, aligned, within_bad, nn_scores)
         for mid in series_by_mid:
             for i, v in enumerate(aligned.get(mid, [])):
@@ -322,34 +384,32 @@ def build_corrected_curve_for_number(
                 if local or cross or nn or v is None:
                     bad_counts[mid] = bad_counts.get(mid, 0) + 1
 
-    # base = menshe vybrosov; prefer_mid tolko kak tae-break
     ordered = sorted(
         series_by_mid.keys(),
         key=lambda m: (bad_counts.get(m, 10**9), 0 if m == prefer_mid else 1, m),
     )
     base_mid = ordered[0]
 
-    # setka T dlya vyhoda = obyedinenie (plotnee)
     all_grid: List[float] = []
     for param in params:
         g = aligned_all.get(param, ([], {}, {}, {}))[0]
         all_grid.extend(g)
     out_grid = sorted(set(all_grid)) if all_grid else []
     if not out_grid:
-        # fallback - temp base
         base_df = series_by_mid[base_mid].copy()
         base_df["Measure_ID"] = base_mid
         base_df["N"] = str(number).upper()
         return base_df, [], base_mid
 
-    # sobiraem rezul'tat po strokam Temp
     rows: List[Dict[str, Any]] = []
     for t in out_grid:
         rows.append({"Temp": t, "N": str(number).upper(), "Measure_ID": base_mid})
     out_df = pd.DataFrame(rows)
-    # skopirovat prochie kolonki s base gde vozmozhno
     base_src = series_by_mid[base_mid]
-    extra_cols = [c for c in base_src.columns if c not in ("Temp", "N", "Measure_ID") and c not in params]
+    extra_cols = [
+        c for c in base_src.columns
+        if c not in ("Temp", "N", "Measure_ID") and c not in params
+    ]
     for c in extra_cols:
         out_df[c] = np.nan
 
@@ -361,14 +421,20 @@ def build_corrected_curve_for_number(
         )
         if not grid:
             continue
-        # map grid index
         g_index = {t: i for i, t in enumerate(grid)}
-        corr_vals = []
-        bad_flags = []
+        corr_vals: List[float] = []
+        bad_flags: List[bool] = []
+        protect: List[bool] = []
+        methods: List[str] = []
+
+        deg = _POLY_DEGREE.get(param, degree)
+
         for t_ref in out_grid:
             if t_ref not in g_index:
                 corr_vals.append(np.nan)
                 bad_flags.append(True)
+                protect.append(False)
+                methods.append("missing")
                 continue
             i = g_index[t_ref]
             peers = [aligned[m][i] for m in aligned]
@@ -389,7 +455,7 @@ def build_corrected_curve_for_number(
 
             if good:
                 new_v = float(np.median(good))
-                # esli base horosh i pochti sovpadaet - ostavlyaem base
+                method = "cross_consensus"
                 if (
                     base_v is not None
                     and base_v != OUTLIER_MARKER
@@ -399,8 +465,11 @@ def build_corrected_curve_for_number(
                     and abs(float(base_v) - new_v) <= _ABS_FLOOR.get(param, 1.0) * 0.25
                 ):
                     new_v = float(base_v)
+                    method = "base_keep"
                 corr_vals.append(new_v)
                 bad_flags.append(False)
+                protect.append(True)
+                methods.append(method)
                 if base_v is None or abs(float(base_v) - new_v) > 1e-12:
                     corrections.append({
                         "mid": base_mid,
@@ -409,26 +478,25 @@ def build_corrected_curve_for_number(
                         "temp": t_ref,
                         "old": base_v,
                         "new": new_v,
-                        "reason": "cross_consensus",
+                        "reason": method,
                         "n_good": len(good),
                         "n_peers": len([p for p in peers if p is not None]),
                     })
             else:
-                # net horoshih - vozmem base (dazhe plohoy) i pometim dlya regressii
-                corr_vals.append(float(base_v) if base_v is not None and np.isfinite(float(base_v)) else np.nan)
+                corr_vals.append(
+                    float(base_v) if base_v is not None and np.isfinite(float(base_v)) else np.nan
+                )
                 bad_flags.append(True)
+                protect.append(False)
+                methods.append("need_regression")
 
         temps_arr = np.asarray(out_grid, dtype=float)
         vals_arr = np.asarray(corr_vals, dtype=float)
         bad_mask = np.asarray(bad_flags, dtype=bool) | ~np.isfinite(vals_arr)
-
-        # NN TCN restore hook
-        if nn_options and nn_options.get("use_tcn_restore") and bad_mask.any():
-            # fallback: regression (TCN model not bundled)
-            pass
+        protect_mask = np.asarray(protect, dtype=bool)
 
         if bad_mask.any():
-            fixed = regression_replace(temps_arr, vals_arr, bad_mask, degree=degree)
+            fixed = regression_replace(temps_arr, vals_arr, bad_mask, degree=deg)
             for i in np.where(bad_mask)[0]:
                 corrections.append({
                     "mid": base_mid,
@@ -437,11 +505,37 @@ def build_corrected_curve_for_number(
                     "temp": float(out_grid[i]),
                     "old": float(vals_arr[i]) if np.isfinite(vals_arr[i]) else None,
                     "new": float(fixed[i]),
-                    "reason": "regression_all_bad",
+                    "reason": f"poly{deg}_fill",
                 })
                 corr_vals[i] = float(fixed[i])
+                methods[i] = f"poly{deg}_fill"
+            vals_arr = np.asarray(corr_vals, dtype=float)
+
+        # Sglazhivanie dlya F (poly3) - vsya krivaya
+        if param == "F" and len(corr_vals) >= 5:
+            smoothed = smooth_curve_poly(
+                temps_arr,
+                np.asarray(corr_vals, dtype=float),
+                degree=3,
+                protect_mask=protect_mask,
+                max_delta=_ABS_FLOOR.get("F", 2.0) * 2,
+            )
+            for i in range(len(corr_vals)):
+                if abs(smoothed[i] - corr_vals[i]) > 1e-9:
+                    corrections.append({
+                        "mid": base_mid,
+                        "number": number,
+                        "param": param,
+                        "temp": float(out_grid[i]),
+                        "old": float(corr_vals[i]),
+                        "new": float(smoothed[i]),
+                        "reason": "poly3_smooth",
+                    })
+                    methods[i] = methods[i] + "+poly3_smooth"
+                    corr_vals[i] = float(smoothed[i])
 
         out_df[param] = [float(v) for v in corr_vals]
+        out_df[f"{param}_method"] = methods
 
     return out_df, corrections, base_mid
 
@@ -516,7 +610,7 @@ def build_corrected_temps(
             except Exception:
                 pass
 
-    _p(2, "Podgotovka...")
+    _p(2, "Подготовка...")
     numbers = (
         temps_df[temps_df["Measure_ID"].isin(selected_mids)]["N"]
         .astype(str)
@@ -569,5 +663,6 @@ def build_corrected_temps(
         report["base_mid"] = prefer_mid or selected_mids[0]
     report["n_corrections"] = len(all_corr)
     report["nn_options"] = dict(nn_options or {})
-    _p(100, "Gotovo")
+    report["corrections"] = all_corr
+    _p(100, "Готово")
     return corrected, all_corr, report

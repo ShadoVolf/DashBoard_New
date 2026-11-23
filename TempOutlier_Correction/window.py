@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import threading
 import traceback
+from datetime import datetime
+from pathlib import Path as _Path
 from queue import Queue, Empty
 from typing import Any, Dict, List, Optional
 
@@ -23,6 +25,7 @@ from . import graph as toc_graph
 from . import logic as toc_logic
 from . import metrics as toc_metrics
 from . import settings as toc_settings
+from . import learning as toc_learning
 from .constants import (
     WIN_TAG,
     LEFT_PANEL,
@@ -53,6 +56,10 @@ PROGRESS_WIN = "toc_progress_win"
 PROGRESS_BAR = "toc_progress_bar"
 PROGRESS_TEXT = "toc_progress_text"
 SETTINGS_BTN = "toc_settings_btn"
+EDIT_CONTAINER = "toc_edit_container"
+EDIT_TABLE = "toc_edit_table"
+EXPORT_CHECK = "toc_export_check"
+SAVE_DEBUG_CHECK = "toc_save_debug_check"
 
 _suppress_cascade = False
 
@@ -343,9 +350,33 @@ def _update_progress(pct: float, msg: str = ""):
 
 def _hide_progress():
     try:
-        _progress_q.put(("done", 100.0, "Gotovo"))
+        _progress_q.put(("done", 100.0, "Готово"))
     except Exception:
         pass
+    # also force-delete on main thread if possible
+    try:
+        if dpg.does_item_exist(PROGRESS_WIN):
+            dpg.delete_item(PROGRESS_WIN)
+    except Exception:
+        pass
+
+
+def _force_hide_progress():
+    global _worker_busy
+    try:
+        while True:
+            try:
+                _progress_q.get_nowait()
+            except Empty:
+                break
+    except Exception:
+        pass
+    try:
+        if dpg.does_item_exist(PROGRESS_WIN):
+            dpg.delete_item(PROGRESS_WIN)
+    except Exception:
+        pass
+    _worker_busy = False
 
 
 def _apply_progress_ui(pct: float, msg: str):
@@ -375,16 +406,11 @@ def _poll_progress():
                 # msg is unused; pct holds nothing; actual payload in _state['_worker_result']
                 _finish_analyze_ui()
             elif kind == "error":
-                _apply_progress_ui(0, f"Oshibka: {msg}")
-                _log(f"Oshibka analiza: {msg}")
-                try:
-                    if dpg.does_item_exist(PROGRESS_WIN):
-                        dpg.delete_item(PROGRESS_WIN)
-                except Exception:
-                    pass
-                _worker_busy = False
+                _apply_progress_ui(0, f"Ошибка: {msg}")
+                _log(f"Ошибка анализа: {msg}")
+                _force_hide_progress()
             elif kind == "done":
-                _apply_progress_ui(100, msg or "Gotovo")
+                _apply_progress_ui(100, msg or "Готово")
                 try:
                     if dpg.does_item_exist(PROGRESS_WIN):
                         dpg.delete_item(PROGRESS_WIN)
@@ -485,11 +511,7 @@ def _on_analyze(sender=None, app_data=None, user_data=None):
 def _finish_analyze_ui():
     global _worker_busy
     _worker_busy = False
-    try:
-        if dpg.does_item_exist(PROGRESS_WIN):
-            dpg.delete_item(PROGRESS_WIN)
-    except Exception:
-        pass
+    _force_hide_progress()
     payload = _state.pop("_worker_result", None)
     if not payload:
         return
@@ -501,20 +523,218 @@ def _finish_analyze_ui():
     _state["base_mid"] = report.get("base_mid", prefer)
 
     base_mid = _state["base_mid"]
-    temps_view = _state["temps_df"].copy()
     if not corrected.empty:
-        # pokazat corrected kak otdelnuyu seriyu; ne podmenyat raw mid
-        pass
-    _state["_temps_for_summary"] = corrected if not corrected.empty else temps_view
-    _refresh_plot()
-    # metriki po corrected: vremенно prostaem Measure_ID base
-    if not corrected.empty and base_mid is not None:
         corr_for_sum = corrected.copy()
-        corr_for_sum["Measure_ID"] = base_mid
-        # nuzhny stroki psi dlya base
+        if "Measure_ID" not in corr_for_sum.columns:
+            corr_for_sum["Measure_ID"] = base_mid
+        else:
+            corr_for_sum["Measure_ID"] = base_mid
+        _state["_temps_for_summary"] = corr_for_sum
         _refresh_summary(base_mid, temps_override=corr_for_sum)
+    else:
+        _state["_temps_for_summary"] = _state["temps_df"]
+        _refresh_summary(base_mid)
+
+    _refresh_plot()
+    _refresh_edit_table()
     n_corr = report.get("n_corrections", 0)
-    _log(f"Gotovo: pravok {n_corr}, base MID={base_mid}")
+    _log(f"Готово: правок {n_corr}, base MID={base_mid}")
+
+    # export debug if checked
+    try:
+        if dpg.does_item_exist(SAVE_DEBUG_CHECK) and dpg.get_value(SAVE_DEBUG_CHECK):
+            _export_debug_bundle()
+    except Exception as e:
+        _log(f"Экспорт отладки: {e}")
+
+
+def _export_debug_bundle():
+    """Syrye + corrected + log metodov v CSV/JSON."""
+    out_dir = _Path("toc_debug_exports")
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        out_dir = _Path(".")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = out_dir / f"toc_{stamp}"
+
+    raw = _state.get("temps_df")
+    corr = _state.get("corrected_temps")
+    corr_list = _state.get("corrections") or []
+    report = _state.get("report") or {}
+
+    paths = []
+    if raw is not None and not raw.empty:
+        fp = f"{prefix}_raw.csv"
+        raw.to_csv(fp, index=False)
+        paths.append(fp)
+    if corr is not None and not corr.empty:
+        fp = f"{prefix}_corrected.csv"
+        corr.to_csv(fp, index=False)
+        paths.append(fp)
+    if corr_list:
+        fp = f"{prefix}_methods.csv"
+        pd.DataFrame(corr_list).to_csv(fp, index=False)
+        paths.append(fp)
+    import json
+    meta = {
+        "mids": list(_state.get("selected_mids") or []),
+        "base_mid": _state.get("base_mid"),
+        "n_corrections": report.get("n_corrections"),
+        "nn_options": report.get("nn_options"),
+        "per_number": report.get("per_number"),
+        "global": report.get("global"),
+    }
+    fp = f"{prefix}_report.json"
+    with open(fp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2, default=str)
+    paths.append(fp)
+    _log("Экспорт: " + ", ".join(str(x) for x in paths))
+
+
+def _refresh_edit_table():
+    """Tablitsa skorrektirovannyh tochek tekushchego N dlya ruchnoj pravki."""
+    if not dpg.does_item_exist(EDIT_CONTAINER):
+        return
+    try:
+        dpg.delete_item(EDIT_CONTAINER, children_only=True)
+    except Exception:
+        pass
+    corr = _state.get("corrected_temps")
+    n = (_state.get("current_number") or "").strip().upper()
+    if corr is None or (hasattr(corr, "empty") and corr.empty) or not n:
+        dpg.add_text("Нет скорректированных данных", parent=EDIT_CONTAINER)
+        return
+
+    sub = corr[corr["N"].astype(str).str.strip().str.upper() == n].copy()
+    if sub.empty:
+        dpg.add_text(f"Нет данных для N={n}", parent=EDIT_CONTAINER)
+        return
+    sub = sub.sort_values("Temp")
+    _state["_edit_rows"] = sub.reset_index(drop=True)
+
+    with dpg.table(
+        parent=EDIT_CONTAINER,
+        tag=EDIT_TABLE,
+        header_row=True,
+        resizable=True,
+        borders_innerH=True,
+        borders_outerH=True,
+        borders_innerV=True,
+        borders_outerV=True,
+        scrollY=True,
+        height=180,
+        policy=dpg.mvTable_SizingStretchProp,
+    ):
+        dpg.add_table_column(label="Temp")
+        dpg.add_table_column(label="F")
+        dpg.add_table_column(label="R")
+        dpg.add_table_column(label="F method")
+        dpg.add_table_column(label="R method")
+        for i, row in sub.iterrows():
+            with dpg.table_row():
+                dpg.add_text(f"{float(row['Temp']):.2f}" if pd.notna(row.get("Temp")) else "")
+                ftag = f"toc_edit_f_{i}"
+                rtag = f"toc_edit_r_{i}"
+                fv = float(row["F"]) if "F" in row and pd.notna(row.get("F")) else 0.0
+                rv = float(row["R"]) if "R" in row and pd.notna(row.get("R")) else 0.0
+                dpg.add_input_float(tag=ftag, default_value=fv, width=100, step=0.1)
+                dpg.add_input_float(tag=rtag, default_value=rv, width=100, step=0.01)
+                fm = row.get("F_method", "") if "F_method" in row.index else ""
+                rm = row.get("R_method", "") if "R_method" in row.index else ""
+                dpg.add_text(str(fm)[:24])
+                dpg.add_text(str(rm)[:24])
+
+
+def _on_apply_edits(sender=None, app_data=None, user_data=None):
+    corr = _state.get("corrected_temps")
+    n = (_state.get("current_number") or "").strip().upper()
+    edit_rows = _state.get("_edit_rows")
+    if corr is None or edit_rows is None or edit_rows.empty or not n:
+        _log("Нечего применять")
+        return
+    sub_idx = corr.index[corr["N"].astype(str).str.strip().str.upper() == n].tolist()
+    if len(sub_idx) != len(edit_rows):
+        # rebuild by Temp match
+        for i, row in edit_rows.iterrows():
+            t = float(row["Temp"])
+            ftag = f"toc_edit_f_{i}"
+            rtag = f"toc_edit_r_{i}"
+            if not dpg.does_item_exist(ftag):
+                continue
+            fv = dpg.get_value(ftag)
+            rv = dpg.get_value(rtag)
+            mask = (
+                (corr["N"].astype(str).str.strip().str.upper() == n)
+                & ((corr["Temp"].astype(float) - t).abs() < 0.05)
+            )
+            if mask.any():
+                if "F" in corr.columns:
+                    corr.loc[mask, "F"] = float(fv)
+                if "R" in corr.columns:
+                    corr.loc[mask, "R"] = float(rv)
+                if "F_method" in corr.columns:
+                    corr.loc[mask, "F_method"] = "operator_edit"
+                if "R_method" in corr.columns:
+                    corr.loc[mask, "R_method"] = "operator_edit"
+    else:
+        for k, idx in enumerate(sub_idx):
+            ftag = f"toc_edit_f_{k}"
+            rtag = f"toc_edit_r_{k}"
+            if dpg.does_item_exist(ftag) and "F" in corr.columns:
+                corr.at[idx, "F"] = float(dpg.get_value(ftag))
+            if dpg.does_item_exist(rtag) and "R" in corr.columns:
+                corr.at[idx, "R"] = float(dpg.get_value(rtag))
+            if "F_method" in corr.columns:
+                corr.at[idx, "F_method"] = "operator_edit"
+            if "R_method" in corr.columns:
+                corr.at[idx, "R_method"] = "operator_edit"
+    _state["corrected_temps"] = corr
+    _refresh_plot()
+    base = _state.get("base_mid")
+    if base:
+        c = corr.copy()
+        c["Measure_ID"] = base
+        _refresh_summary(base, temps_override=c)
+    _log("Правки оператора применены")
+
+
+def _on_add_to_training(sender=None, app_data=None, user_data=None):
+    # apply edits first
+    _on_apply_edits()
+    corr = _state.get("corrected_temps")
+    n = (_state.get("current_number") or "").strip().upper()
+    if corr is None or corr.empty or not n:
+        _log("Нет данных для обучения")
+        return
+    sub = corr[corr["N"].astype(str).str.strip().str.upper() == n].sort_values("Temp")
+    for param in ("F", "R"):
+        if param not in sub.columns:
+            continue
+        points = []
+        for _, row in sub.iterrows():
+            if pd.isna(row.get("Temp")) or pd.isna(row.get(param)):
+                continue
+            points.append({
+                "temp": float(row["Temp"]),
+                "value": float(row[param]),
+            })
+        if points:
+            cnt = toc_learning.add_training_sample(n, points, param=param, label="corrected")
+            _log(f"В обучение: N={n} {param}, всего образцов {cnt}")
+
+
+def _on_retrain(sender=None, app_data=None, user_data=None):
+    _show_progress("Дообучение модели")
+    _apply_progress_ui(10, "Обучение...")
+    try:
+        res = toc_learning.retrain_models()
+        _log(f"Дообучение: {res}")
+    except Exception as e:
+        _log(f"Ошибка дообучения: {e}")
+        traceback.print_exc()
+    finally:
+        _force_hide_progress()
 
 
 
@@ -531,13 +751,13 @@ def _on_recalc_metrics(sender=None, app_data=None, user_data=None):
             else _state["temps_df"]
         )
     _show_progress("Пересчёт метрик")
-    _update_progress(30, "Schitaem...")
+    _apply_progress_ui(30, "Считаем...")
     try:
         _refresh_summary(base, temps_override=temps)
-        _update_progress(100, "Gotovo")
+        _apply_progress_ui(100, "Готово")
     finally:
-        _hide_progress()
-    _log("Metriki pereschitany")
+        _force_hide_progress()
+    _log("Метрики пересчитаны")
 
 
 def _curves_for_current() -> Dict[str, pd.DataFrame]:
@@ -587,6 +807,7 @@ def _on_number_change(sender=None, app_data=None, user_data=None):
     n = dpg.get_value(NUMBER_COMBO) if dpg.does_item_exist(NUMBER_COMBO) else ""
     _state["current_number"] = (n or "").strip().upper()
     _refresh_plot()
+    _refresh_edit_table()
 
 
 def _shift_number(delta: int):
@@ -603,6 +824,7 @@ def _shift_number(delta: int):
     if dpg.does_item_exist(NUMBER_COMBO):
         dpg.set_value(NUMBER_COMBO, nums[idx])
     _refresh_plot()
+    _refresh_edit_table()
 
 
 def _on_wheel(sender, app_data, user_data=None):
@@ -804,6 +1026,11 @@ def create_temp_outlier_window():
 
                 dpg.add_separator()
                 dpg.add_button(label="Настройки NN", callback=lambda: toc_settings.open_settings_window(), width=-1)
+                dpg.add_checkbox(
+                    label="Сохранять сырые+обработанные+методы в файл",
+                    tag=SAVE_DEBUG_CHECK,
+                    default_value=False,
+                )
                 dpg.add_button(label="1. Загрузить данные", callback=_on_load, width=-1)
                 dpg.add_button(label="2. Анализ и коррекция", callback=_on_analyze, width=-1)
                 dpg.add_button(label="3. Пересчёт метрик", callback=_on_recalc_metrics, width=-1)
@@ -837,8 +1064,34 @@ def create_temp_outlier_window():
                     "Колесо мыши - смена номера. Желтая кривая - corrected.",
                     color=(140, 180, 220),
                 )
-                with dpg.child_window(tag=PLOT_CONTAINER, height=380, border=False):
+                with dpg.child_window(tag=PLOT_CONTAINER, height=280, border=False):
                     pass
+
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label="Показать/обновить таблицу коррекции",
+                        callback=lambda: _refresh_edit_table(),
+                        width=260,
+                    )
+                    dpg.add_button(
+                        label="Применить правки",
+                        callback=_on_apply_edits,
+                        width=140,
+                    )
+                    dpg.add_button(
+                        label="Добавить в обучение",
+                        callback=_on_add_to_training,
+                        width=160,
+                    )
+                    dpg.add_button(
+                        label="Дообучить модель",
+                        callback=_on_retrain,
+                        width=140,
+                    )
+
+                dpg.add_text("Скорректированные точки (правка оператора)")
+                with dpg.child_window(tag=EDIT_CONTAINER, height=200, border=True):
+                    dpg.add_text("После анализа нажмите «Показать/обновить таблицу коррекции»")
 
                 dpg.add_separator()
                 dpg.add_text("Сводная таблица (метрики по температурам)")

@@ -7,7 +7,7 @@ Mono, Slope, Tmax, Tmin, Turnover.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -29,7 +29,6 @@ def compute_curve_metrics(
     r_col: str = "R",
     mono_degree: int = 3,
 ) -> Dict[str, Any]:
-    """Метрики одной кривой (один N, один Measure_ID)."""
     out: Dict[str, Any] = {
         "Fmax": None,
         "Fmin": None,
@@ -47,10 +46,10 @@ def compute_curve_metrics(
     if temp_df is None or temp_df.empty or "Temp" not in temp_df.columns:
         return out
 
-    t_raw = temp_df["Temp"].astype(float).values
+    t_raw = pd.to_numeric(temp_df["Temp"], errors="coerce").values.astype(float)
 
     if f_col in temp_df.columns:
-        f_raw = temp_df[f_col].astype(float).values
+        f_raw = pd.to_numeric(temp_df[f_col], errors="coerce").values.astype(float)
         t, f = _clean_series(t_raw, f_raw)
         if f.size >= 1:
             out["Fmax"] = float(np.max(f))
@@ -73,11 +72,10 @@ def compute_curve_metrics(
                     mid = 0.5 * (t.min() + t.max())
                     real_roots.sort(key=lambda x: abs(x - mid))
                     out["Turnover"] = real_roots[0]
-                else:
-                    if f.size >= 2:
-                        slopes = np.diff(f) / np.diff(t)
-                        idx = int(np.argmin(np.abs(slopes)))
-                        out["Turnover"] = float(0.5 * (t[idx] + t[idx + 1]))
+                elif f.size >= 2:
+                    slopes = np.diff(f) / np.diff(t)
+                    idx = int(np.argmin(np.abs(slopes)))
+                    out["Turnover"] = float(0.5 * (t[idx] + t[idx + 1]))
 
             if f.size >= mono_degree + 1:
                 deg = min(mono_degree, f.size - 1)
@@ -96,7 +94,7 @@ def compute_curve_metrics(
                 )
 
     if r_col in temp_df.columns:
-        r_raw = temp_df[r_col].astype(float).values
+        r_raw = pd.to_numeric(temp_df[r_col], errors="coerce").values.astype(float)
         t, r = _clean_series(t_raw, r_raw)
         if r.size >= 1:
             out["Rmax"] = float(np.max(r))
@@ -106,33 +104,61 @@ def compute_curve_metrics(
     return out
 
 
+def _temps_for_number(
+    temps_df: pd.DataFrame,
+    number: str,
+    measure_id: Optional[int] = None,
+) -> pd.DataFrame:
+    if temps_df is None or temps_df.empty:
+        return pd.DataFrame()
+    n = str(number).strip().upper()
+    mask = temps_df["N"].astype(str).str.strip().str.upper() == n
+    sub = temps_df[mask]
+    if measure_id is not None and "Measure_ID" in temps_df.columns:
+        by_mid = sub[sub["Measure_ID"] == measure_id]
+        if not by_mid.empty:
+            return by_mid
+    return sub
+
+
 def build_summary_table(
     psi_df: pd.DataFrame,
     temps_df: pd.DataFrame,
     measure_id: int,
 ) -> pd.DataFrame:
-    if psi_df is None or psi_df.empty:
-        return pd.DataFrame()
-
-    sub = psi_df[psi_df["Measure_ID"] == measure_id].copy()
-    if sub.empty:
-        return pd.DataFrame()
-
+    """
+    Stroim svodnuyu po VSEM nomeram iz temps (corrected) i/ili psi.
+    Esli psi po measure_id pustoj - berem nomera iz temps.
+    """
     rows = []
-    for _, prow in sub.iterrows():
-        n = str(prow.get("N") or "").strip().upper()
-        if not n:
-            continue
-        tsub = temps_df[
-            (temps_df["Measure_ID"] == measure_id)
-            & (temps_df["N"].astype(str).str.strip().str.upper() == n)
-        ]
+    numbers = []
+    psi_sub = pd.DataFrame()
+    if psi_df is not None and not psi_df.empty and "Measure_ID" in psi_df.columns:
+        psi_sub = psi_df[psi_df["Measure_ID"] == measure_id].copy()
+        if not psi_sub.empty and "N" in psi_sub.columns:
+            numbers = (
+                psi_sub["N"].astype(str).str.strip().str.upper().unique().tolist()
+            )
+    if not numbers and temps_df is not None and not temps_df.empty and "N" in temps_df.columns:
+        numbers = (
+            temps_df["N"].astype(str).str.strip().str.upper().unique().tolist()
+        )
+    numbers = sorted({n for n in numbers if n and n != "NAN"})
+
+    psi_by_n = {}
+    if not psi_sub.empty and "N" in psi_sub.columns:
+        for _, prow in psi_sub.iterrows():
+            nn = str(prow.get("N") or "").strip().upper()
+            if nn:
+                psi_by_n[nn] = prow
+
+    for n in numbers:
+        tsub = _temps_for_number(temps_df, n, measure_id)
         m = compute_curve_metrics(tsub)
-        row = {"N": n, "Measure_ID": measure_id, "Status": prow.get("Status")}
+        prow = psi_by_n.get(n)
+        status = prow.get("Status") if prow is not None else None
+        row = {"N": n, "Measure_ID": measure_id, "Status": status}
         row.update(m)
-        for col in ("Fmax", "Fmin", "Rmax", "Rmin", "Mono", "Turnover"):
-            if col in prow.index and pd.notna(prow.get(col)):
-                row.setdefault(f"{col}_psi", prow.get(col))
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -149,10 +175,7 @@ def apply_metrics_to_psidata(
 
     for idx, prow in out.iterrows():
         n = str(prow.get("N") or "").strip().upper()
-        tsub = temps_df[
-            (temps_df["Measure_ID"] == measure_id)
-            & (temps_df["N"].astype(str).str.strip().str.upper() == n)
-        ]
+        tsub = _temps_for_number(temps_df, n, measure_id)
         m = compute_curve_metrics(tsub)
         mapping = {
             "Fmax": "Fmax",
