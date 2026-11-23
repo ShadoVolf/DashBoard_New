@@ -7,7 +7,9 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 # hiddenimports:
 #   * подмодули проекта (кроме train_models — обучение в exe не нужно);
 #   * динамически подгружаемые пакеты (pyvisa-py, serial, mysql, PIL);
-#   * условный импорт scipy.stats (используется в Virtual_Stats).
+#   * условный импорт scipy.stats (используется в Virtual_Stats);
+#   * PhaseNoise_View / TempOutlier_Correction — меню и окна на Main_Current;
+#   * sklearn/joblib — IsolationForest в TempOutlier_Correction.learning.
 # ---------------------------------------------------------------------------
 hiddenimports = (
     collect_submodules('pyvisa_py')
@@ -21,6 +23,8 @@ hiddenimports = (
     + collect_submodules('Assistant')         # ← НОВОЕ, с большой A
     + collect_submodules('Statistik')         # ← НОВОЕ (dashboard_llm и др.)
     + collect_submodules('ResonatorGraph')    # ← НОВОЕ (graph_tools/controller)
+    + collect_submodules('PhaseNoise_View')  # фазовые шумы (меню «Данные»)
+    + collect_submodules('TempOutlier_Correction')  # коррекция выбросов ТЧХ
     + [
         # Подмодули Virtual_Measure явно (train_models намеренно пропущен)
         'Virtual_Measure.Virtual_Data',
@@ -48,6 +52,11 @@ hiddenimports = (
         # Условный импорт в Virtual_Stats
         'scipy.stats',
         'scipy.stats._stats',
+
+        # TempOutlier_Correction: IsolationForest (ленивый импорт в learning/logic)
+        'sklearn.ensemble',
+        'sklearn.ensemble._iforest',
+        'joblib',
     ]
 )
 
