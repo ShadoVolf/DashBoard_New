@@ -179,7 +179,7 @@ def _param_tag(param: str) -> str:
     return f"toc::{(param or 'F').upper()}"
 
 
-def save_model_to_db(param: str, blob: bytes, meta: dict) -> bool:
+def save_model_to_db(param: str, blob: bytes, meta: dict, kind: str = KIND_TOC_IF) -> bool:
     eng = _get_engine()
     if eng is None or not _ensure_table(eng):
         return False
@@ -202,7 +202,7 @@ def save_model_to_db(param: str, blob: bytes, meta: dict) -> bool:
         )
         with eng.begin() as conn:
             conn.execute(sql, {
-                "k": KIND_TOC_IF,
+                "k": kind,
                 "r": _param_tag(param),
                 "d": blob,
                 "m": meta_str,
@@ -216,7 +216,7 @@ def save_model_to_db(param: str, blob: bytes, meta: dict) -> bool:
         return False
 
 
-def load_model_bytes_from_db(param: str) -> Optional[bytes]:
+def load_model_bytes_from_db(param: str, kind: str = KIND_TOC_IF) -> Optional[bytes]:
     eng = _get_engine()
     if eng is None or not _ensure_table(eng):
         return None
@@ -228,7 +228,7 @@ def load_model_bytes_from_db(param: str) -> Optional[bytes]:
         )
         with eng.connect() as conn:
             row = conn.execute(sql, {
-                "k": KIND_TOC_IF,
+                "k": kind,
                 "r": _param_tag(param),
             }).fetchone()
         if not row or not row[0]:
@@ -326,6 +326,12 @@ def retrain_models() -> Dict[str, str]:
             print(f"[TOC] local model write: {e}", flush=True)
         result[param] = f"OK n={len(X)} db={'yes' if ok else 'no'}"
 
+    # TCN/seq2seq vosstanovlenie probelov (tog zhe nabor obrazcov)
+    try:
+        result["tcn"] = retrain_tcn_models(samples)
+    except Exception as e:
+        result["tcn"] = f"error: {e}"
+
     result["status"] = "ok"
     return result
 
@@ -397,3 +403,299 @@ def list_toc_models() -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"[TOC] list_toc_models: {e}", flush=True)
         return []
+
+
+# ---------------------------------------------------------------------------
+# TCN / seq2seq: vosstanovlenie probelov po krivoj F(T).
+# Inference - chistyj numpy (kak mlp / ae v Virtual_NN).
+# Model: npz v virtual_nn_models (Kind=toc_tcn, Rtype=toc::<PARAM>)
+# ili lokalnyj fajl TOC_Learning/tcn_<param>.npz. Obuchenie - chistyj numpy
+# (Adam) na chistyh krivyh iz TOC_Learning, maskirovanie dyh pri trenirgove.
+# ---------------------------------------------------------------------------
+
+KIND_TCN = "toc_tcn"
+_tcn_models: Dict[str, Any] = {}
+# (in, out, kernel, dilation) po sloyam; poslednij sloy - linearnyj vyhod
+_TCN_ARCH = [(1, 8, 3, 1), (8, 8, 3, 2), (8, 1, 3, 4)]
+
+
+def _parse_tcn_npz(npz) -> Dict[str, Any]:
+    n_layers = int(npz["n_layers"][0])
+    return {
+        "Ws": [np.asarray(npz[f"W{i}"], dtype=float) for i in range(n_layers)],
+        "bs": [np.asarray(npz[f"b{i}"], dtype=float) for i in range(n_layers)],
+        "dils": [int(npz[f"dil{i}"][0]) for i in range(n_layers)],
+    }
+
+
+def _load_tcn_from_bytes(data: bytes) -> Dict[str, Any]:
+    with np.load(io.BytesIO(data)) as npz:
+        return _parse_tcn_npz(npz)
+
+
+def _serialize_tcn(m: Dict[str, Any]) -> bytes:
+    buf = io.BytesIO()
+    args: Dict[str, Any] = {"n_layers": np.array([len(m["Ws"])], dtype=int)}
+    for i, (W, b, dil) in enumerate(zip(m["Ws"], m["bs"], m["dils"])):
+        args[f"W{i}"] = W
+        args[f"b{i}"] = b
+        args[f"dil{i}"] = np.array([dil], dtype=int)
+    np.savez(buf, **args)
+    return buf.getvalue()
+
+
+def _init_tcn(rng, arch=None) -> Dict[str, Any]:
+    Ws, bs, dils = [], [], []
+    for c_in, c_out, k, d in (arch or _TCN_ARCH):
+        Ws.append(rng.normal(0.0, np.sqrt(2.0 / (c_in * k)), size=(c_out, c_in, k)))
+        bs.append(np.zeros(c_out, dtype=float))
+        dils.append(int(d))
+    return {"Ws": Ws, "bs": bs, "dils": dils}
+
+
+def _causal_conv(x: np.ndarray, W: np.ndarray, b: np.ndarray, dil: int) -> np.ndarray:
+    """x: [Cin, T] -> [Cout, T], causal dilated conv1d (levyj nulevoj padding)."""
+    T = x.shape[1]
+    K = W.shape[2]
+    pad = (K - 1) * int(dil)
+    xp = np.zeros((x.shape[0], T + pad), dtype=float)
+    xp[:, pad:] = x[:, :T]
+    out = np.tile(np.asarray(b, dtype=float)[:, None], (1, T))
+    for k in range(K):
+        seg = xp[:, k * dil:k * dil + T]
+        out += W[:, :, k] @ seg
+    return out
+
+
+def _causal_conv_backward(
+    dout: np.ndarray, x_in: np.ndarray, W: np.ndarray, dil: int
+):
+    C_out, C_in, K = W.shape
+    T = x_in.shape[1]
+    pad = (K - 1) * int(dil)
+    dW = np.zeros_like(W)
+    db = dout.sum(axis=1)
+    dxp = np.zeros((C_in, T + pad), dtype=float)
+    for k in range(K):
+        seg = x_in[:, k * dil:k * dil + T]
+        dW[:, :, k] += dout @ seg.T
+        dxp[:, k * dil:k * dil + T] += W[:, :, k].T @ dout
+    dx = dxp[:, pad:pad + T]
+    return dW, db, dx
+
+
+def _tcn_forward(m: Dict[str, Any], xs: np.ndarray) -> np.ndarray:
+    h = xs
+    last = len(m["Ws"]) - 1
+    for i in range(len(m["Ws"])):
+        h = _causal_conv(h, m["Ws"][i], m["bs"][i], m["dils"][i])
+        if i < last:
+            h = np.maximum(h, 0.0)
+    return h
+
+
+def _tcn_train(
+    curves: List[np.ndarray],
+    seed: int = 42,
+    epochs: int = 500,
+    lr: float = 3e-3,
+) -> Dict[str, Any]:
+    """Seq2seq-trening: vhod - krivaya s maskirovannymi dyrami, celi - celaya."""
+    rng = np.random.default_rng(seed)
+    m = _init_tcn(rng)
+    n_layers = len(m["Ws"])
+    adam = [
+        {
+            "W": (np.zeros_like(m["Ws"][i]), np.zeros_like(m["Ws"][i])),
+            "b": (np.zeros_like(m["bs"][i]), np.zeros_like(m["bs"][i])),
+        }
+        for i in range(n_layers)
+    ]
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+    idxs = np.arange(len(curves))
+    step = 0
+    for _epoch in range(epochs):
+        rng.shuffle(idxs)
+        for ci in idxs:
+            step += 1
+            curve = curves[int(ci)]
+            if curve.size < 5:
+                continue
+            mu = float(np.mean(curve))
+            sd = float(np.std(curve)) or 1.0
+            y = (curve - mu) / sd
+            holes = rng.random(curve.size) < 0.25
+            if holes.sum() >= curve.size - 3:
+                holes = np.zeros(curve.size, dtype=bool)
+            x = y.copy()
+            x[holes] = 0.0
+
+            caches = []
+            h = x[None, :]
+            for i in range(n_layers):
+                pre = _causal_conv(h, m["Ws"][i], m["bs"][i], m["dils"][i])
+                h_next = np.maximum(pre, 0.0) if i < n_layers - 1 else pre
+                caches.append((h, pre))
+                h = h_next
+            err = h - y[None, :]
+            loss = float(np.mean(err ** 2))
+            if not np.isfinite(loss):
+                m = _init_tcn(rng)
+                adam = [
+                    {
+                        "W": (np.zeros_like(m["Ws"][i]), np.zeros_like(m["Ws"][i])),
+                        "b": (np.zeros_like(m["bs"][i]), np.zeros_like(m["bs"][i])),
+                    }
+                    for i in range(n_layers)
+                ]
+                continue
+
+            dout = (2.0 / err.size) * err
+            grads = [None] * n_layers
+            for i in range(n_layers - 1, -1, -1):
+                h_in, pre = caches[i]
+                dpre = dout * (pre > 0) if i < n_layers - 1 else dout
+                dW, db, dh = _causal_conv_backward(
+                    dpre, h_in, m["Ws"][i], m["dils"][i]
+                )
+                grads[i] = (dW, db)
+                dout = dh
+
+            for i in range(n_layers):
+                for name, gi in (("W", grads[i][0]), ("b", grads[i][1])):
+                    m1, m2 = adam[i][name]
+                    m1 += (1 - beta1) * (gi - m1)
+                    m2 += (1 - beta2) * (gi * gi - m2)
+                    mh = m1 / (1 - beta1 ** step)
+                    vh = m2 / (1 - beta2 ** step)
+                    if name == "W":
+                        m["Ws"][i] -= lr * mh / (np.sqrt(vh) + eps)
+                    else:
+                        m["bs"][i] -= lr * mh / (np.sqrt(vh) + eps)
+    return m
+
+
+def retrain_tcn_models(samples: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
+    """Trening TCN na chistyh krivyh iz obrazcov; zapis' v BD Kind=toc_tcn."""
+    global _tcn_models
+    result: Dict[str, str] = {}
+    if samples is None:
+        samples = load_samples()
+    if not samples:
+        return {"status": "net obrazcov"}
+    by_param: Dict[str, List[np.ndarray]] = {}
+    for s in samples:
+        param = (s.get("param") or "F").upper()
+        pts = sorted(s.get("points") or [], key=lambda p: p.get("temp", 0.0))
+        vals = []
+        for p in pts:
+            try:
+                v = float(p["value"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if np.isfinite(v):
+                vals.append(v)
+        if len(vals) >= 6:
+            by_param.setdefault(param, []).append(np.asarray(vals, dtype=float))
+    for param, curves in by_param.items():
+        if len(curves) < 2:
+            result[param] = f"malo krivyh ({len(curves)})"
+            continue
+        try:
+            m = _tcn_train(curves)
+            blob = _serialize_tcn(m)
+            _tcn_models[param] = m
+            ok = save_model_to_db(
+                param,
+                blob,
+                meta={"algorithm": "tcn_numpy", "n_curves": len(curves)},
+                kind=KIND_TCN,
+            )
+            try:
+                local = _ensure_dir() / f"tcn_{param}.npz"
+                local.write_bytes(blob)
+            except Exception as e:
+                print(f"[TOC] local tcn write: {e}", flush=True)
+            result[param] = f"OK cur={len(curves)} db={'yes' if ok else 'no'}"
+        except Exception as e:
+            result[param] = f"error: {e}"
+    result["status"] = "ok" if by_param else "net dannyh"
+    return result
+
+
+def get_tcn_model(param: str) -> Optional[Dict[str, Any]]:
+    " Prioritet: pamiat -> BD (Kind=toc_tcn, active) -> lokalnyj fajl. "
+    p = (param or "F").upper()
+    if p in _tcn_models:
+        return _tcn_models[p]
+    try:
+        blob = load_model_bytes_from_db(p, kind=KIND_TCN)
+        if blob:
+            m = _load_tcn_from_bytes(blob)
+            _tcn_models[p] = m
+            print(f"[TOC] TCN model from DB param={p}", flush=True)
+            return m
+    except Exception as e:
+        print(f"[TOC] load TCN db: {e}", flush=True)
+    local = learning_dir() / f"tcn_{p}.npz"
+    if local.exists():
+        try:
+            with np.load(local) as npz:
+                m = _parse_tcn_npz(npz)
+            _tcn_models[p] = m
+            print(f"[TOC] TCN model from file {local}", flush=True)
+            return m
+        except Exception as e:
+            print(f"[TOC] load TCN file: {e}", flush=True)
+    return None
+
+
+def tcn_restore_curve(
+    values: np.ndarray, bad_mask: np.ndarray, param: str = "F"
+) -> Optional[np.ndarray]:
+    """
+    Seq2seq/TCN vosstanovlenie probelov po krivoj.
+    Bez modeli (ili nestabilnom prognoze) - interpolyaciya + median sglazh.
+    Vozvrashaet novyj massiv ili None (net dannh / ne poluchilos).
+    """
+    vals = np.asarray(values, dtype=float)
+    bad = np.asarray(bad_mask, dtype=bool)
+    if vals.size < 3 or not bad.any():
+        return None
+    good = ~bad & np.isfinite(vals)
+    good_vals = vals[good]
+    if good_vals.size < 3:
+        return None
+    out = vals.copy()
+    m = None
+    try:
+        m = get_tcn_model(param)
+    except Exception:
+        m = None
+    if m is not None:
+        try:
+            mu = float(np.mean(good_vals))
+            sd = float(np.std(good_vals)) or 1.0
+            with np.errstate(all="ignore"):
+                y = _tcn_forward(m, ((vals - mu) / sd)[None, :])[0]
+            pred = y * sd + mu
+            if np.all(np.isfinite(pred[bad])):
+                out[bad] = pred[bad]
+                return out
+        except Exception as e:
+            print(f"[TOC] tcn forward: {e}", flush=True)
+    # fallback bez modeli
+    gi = np.flatnonzero(good).astype(float)
+    if gi.size:
+        out[bad] = np.interp(np.flatnonzero(bad), gi, good_vals)
+    for _ in range(3):
+        for i in np.flatnonzero(bad):
+            lo, hi = max(0, i - 2), min(vals.size, i + 3)
+            seg = [
+                out[j] for j in range(lo, hi)
+                if j != i and not bad[j] and np.isfinite(out[j])
+            ]
+            if seg:
+                out[i] = float(np.median(seg))
+    return out if np.all(np.isfinite(out)) else None
+
