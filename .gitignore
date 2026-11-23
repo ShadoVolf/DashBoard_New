@@ -16,3 +16,8 @@ Resonator Stat/Resonator Stat.exe
 *.xlsx
 *.toc
 /Resonator Stat
+/toc_debug_exports/
+*.csv
+/toc_debug_exports
+*.csv
+*.csv
