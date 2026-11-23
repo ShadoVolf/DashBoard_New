@@ -31,19 +31,25 @@ def set_nn_options(opts: Dict[str, Any]) -> None:
 
 def open_settings_window() -> None:
     if dpg.does_item_exist(SETTINGS_WIN):
-        dpg.focus_item(SETTINGS_WIN)
+        try:
+            dpg.focus_item(SETTINGS_WIN)
+        except Exception:
+            pass
         return
 
     labels = {
-        "use_autoencoder": "Autoencoder anomaly detection",
-        "use_tcn_restore": "TCN / seq2seq curve restore",
-        "use_failure_classifier": "Failure type classifier (stand / single / noise)",
-        "use_active_learning": "Active learning (operator feedback)",
+        "use_isolation_forest": "Лес изолирующих деревьев (Isolation Forest)",
+        "use_autoencoder": "Автоэнкодер (поиск аномалий)",
+        "use_tcn_restore": "TCN / seq2seq восстановление кривой",
+        "use_failure_classifier": "Классификатор типа сбоя (стенд / один / шум)",
+        "use_active_learning": "Активное обучение (правки оператора)",
     }
 
     with dpg.window(
         label="TOC - настройки NN",
         tag=SETTINGS_WIN,
+        width=520,
+        height=360,
         modal=False,
     ):
         dpg.add_text("Нейросетевые методы (все отключены по умолчанию)")
@@ -57,6 +63,10 @@ def open_settings_window() -> None:
             )
         dpg.add_separator()
         dpg.add_text(
+            "При включении методы подключаются в build_corrected_temps. "
+            "Без моделей: MAD + consensus + полином (F: 3-й порядок, R: 2-й). "
+            "Активное обучение: правки под графиком + кнопка «Добавить в обучение».",
+            wrap=490,
         )
         with dpg.group(horizontal=True):
             dpg.add_button(label="Применить", callback=_on_apply, width=120)
