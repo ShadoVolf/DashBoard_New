@@ -189,7 +189,7 @@ def save_model_to_db(param: str, blob: bytes, meta: dict, kind: str = KIND_TOC_I
         meta.setdefault("finetuned", True)
         meta.setdefault("active", True)
         meta.setdefault("module", "TempOutlier_Correction")
-        meta.setdefault("kind", KIND_TOC_IF)
+        meta.setdefault("kind", kind)
         meta.setdefault("param", param)
         meta_str = json.dumps(meta, ensure_ascii=False)[:2000]
         sql = text(
@@ -208,7 +208,7 @@ def save_model_to_db(param: str, blob: bytes, meta: dict, kind: str = KIND_TOC_I
                 "m": meta_str,
                 "s": len(blob),
             })
-        print(f"[TOC] model saved DB kind={KIND_TOC_IF} tag={_param_tag(param)}",
+        print(f"[TOC] model saved DB kind={kind} tag={_param_tag(param)}",
               flush=True)
         return True
     except Exception as e:
