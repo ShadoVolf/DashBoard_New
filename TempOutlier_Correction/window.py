@@ -592,29 +592,31 @@ def _export_debug_bundle():
     _log("Экспорт: " + ", ".join(str(x) for x in paths))
 
 
-def _refresh_edit_table():
-    """Tablitsa skorrektirovannyh tochek tekushchego N dlya ruchnoj pravki."""
-    if not dpg.does_item_exist(EDIT_CONTAINER):
-        return
-    try:
-        dpg.delete_item(EDIT_CONTAINER, children_only=True)
-    except Exception:
-        pass
+def _build_edit_table(parent: str):
+    """Tablitsa skorrektirovannyh tochek v ukazannom parent (okno uvelicheniya)."""
     corr = _state.get("corrected_temps")
     n = (_state.get("current_number") or "").strip().upper()
     if corr is None or (hasattr(corr, "empty") and corr.empty) or not n:
-        dpg.add_text("Нет скорректированных данных", parent=EDIT_CONTAINER)
+        dpg.add_text("Нет скорректированных данных", parent=parent)
         return
 
     sub = corr[corr["N"].astype(str).str.strip().str.upper() == n].copy()
     if sub.empty:
-        dpg.add_text(f"Нет данных для N={n}", parent=EDIT_CONTAINER)
+        dpg.add_text(f"Нет данных для N={n}", parent=parent)
         return
-    sub = sub.sort_values("Temp")
-    _state["_edit_rows"] = sub.reset_index(drop=True)
+    sub = sub.sort_values("Temp").reset_index(drop=True)
+    _state["_edit_rows"] = sub
+
+    with dpg.group(horizontal=True, parent=parent):
+        dpg.add_button(
+            label="Применить все правки",
+            callback=_on_apply_edits,
+            width=160,
+        )
+        dpg.add_text("  Изменение поля сразу обновляет кривую corrected", color=(140, 180, 220))
 
     with dpg.table(
-        parent=EDIT_CONTAINER,
+        parent=parent,
         tag=EDIT_TABLE,
         header_row=True,
         resizable=True,
@@ -623,27 +625,102 @@ def _refresh_edit_table():
         borders_innerV=True,
         borders_outerV=True,
         scrollY=True,
-        height=180,
+        height=-1,
         policy=dpg.mvTable_SizingStretchProp,
     ):
-        dpg.add_table_column(label="Temp")
-        dpg.add_table_column(label="F")
-        dpg.add_table_column(label="R")
+        dpg.add_table_column(label="Temp", width_fixed=True, init_width_or_weight=70)
+        dpg.add_table_column(label="F", width_fixed=True, init_width_or_weight=110)
+        dpg.add_table_column(label="R", width_fixed=True, init_width_or_weight=110)
         dpg.add_table_column(label="F method")
         dpg.add_table_column(label="R method")
         for i, row in sub.iterrows():
             with dpg.table_row():
-                dpg.add_text(f"{float(row['Temp']):.2f}" if pd.notna(row.get("Temp")) else "")
+                dpg.add_text(
+                    f"{float(row['Temp']):.2f}" if pd.notna(row.get("Temp")) else ""
+                )
                 ftag = f"toc_edit_f_{i}"
                 rtag = f"toc_edit_r_{i}"
                 fv = float(row["F"]) if "F" in row and pd.notna(row.get("F")) else 0.0
                 rv = float(row["R"]) if "R" in row and pd.notna(row.get("R")) else 0.0
-                dpg.add_input_float(tag=ftag, default_value=fv, width=100, step=0.1)
-                dpg.add_input_float(tag=rtag, default_value=rv, width=100, step=0.01)
+                dpg.add_input_float(
+                    tag=ftag,
+                    default_value=fv,
+                    width=100,
+                    step=0.1,
+                    callback=_on_edit_cell_changed,
+                    user_data=("F", i, float(row["Temp"]) if pd.notna(row.get("Temp")) else None),
+                )
+                dpg.add_input_float(
+                    tag=rtag,
+                    default_value=rv,
+                    width=100,
+                    step=0.01,
+                    callback=_on_edit_cell_changed,
+                    user_data=("R", i, float(row["Temp"]) if pd.notna(row.get("Temp")) else None),
+                )
                 fm = row.get("F_method", "") if "F_method" in row.index else ""
                 rm = row.get("R_method", "") if "R_method" in row.index else ""
-                dpg.add_text(str(fm)[:24])
-                dpg.add_text(str(rm)[:24])
+                dpg.add_text(str(fm)[:28])
+                dpg.add_text(str(rm)[:28])
+
+
+def _on_edit_cell_changed(sender=None, app_data=None, user_data=None):
+    """Mgnovennoye obnovlenie corrected krivoj pri pravke yachejki."""
+    if not user_data:
+        return
+    param, row_i, temp = user_data
+    try:
+        val = float(app_data) if app_data is not None else float(dpg.get_value(sender))
+    except Exception:
+        return
+    corr = _state.get("corrected_temps")
+    n = (_state.get("current_number") or "").strip().upper()
+    if corr is None or corr.empty or not n or temp is None:
+        return
+    if param not in corr.columns:
+        return
+    mask = (
+        (corr["N"].astype(str).str.strip().str.upper() == n)
+        & ((corr["Temp"].astype(float) - float(temp)).abs() < 0.05)
+    )
+    if not mask.any():
+        return
+    corr.loc[mask, param] = val
+    method_col = f"{param}_method"
+    if method_col in corr.columns:
+        corr.loc[mask, method_col] = "operator_edit"
+    _state["corrected_temps"] = corr
+    # refresh both plots
+    _refresh_plot()
+    _refresh_big_if_open()
+
+
+def _refresh_edit_table():
+    """Sovmestimost': esli est' big window - tuda, inache nichego na main."""
+    if dpg.does_item_exist("toc_big_edit_area"):
+        try:
+            dpg.delete_item("toc_big_edit_area", children_only=True)
+        except Exception:
+            pass
+        _build_edit_table("toc_big_edit_area")
+
+
+def _refresh_big_if_open():
+    if not dpg.does_item_exist("toc_window") and not dpg.does_item_exist("toc_big_graph_window"):
+        pass
+    from .constants import BIG_WIN_TAG
+    if not dpg.does_item_exist(BIG_WIN_TAG):
+        return
+    curves = _curves_for_current()
+    param = _state.get("param") or "F"
+    n = _state.get("current_number") or ""
+    toc_graph.refresh_enlarged_graph(
+        curves,
+        param,
+        n,
+        edit_builder=_build_edit_table,
+    )
+
 
 
 def _on_apply_edits(sender=None, app_data=None, user_data=None):
@@ -691,6 +768,7 @@ def _on_apply_edits(sender=None, app_data=None, user_data=None):
                 corr.at[idx, "R_method"] = "operator_edit"
     _state["corrected_temps"] = corr
     _refresh_plot()
+    _refresh_big_if_open()
     base = _state.get("base_mid")
     if base:
         c = corr.copy()
@@ -722,6 +800,8 @@ def _on_add_to_training(sender=None, app_data=None, user_data=None):
         if points:
             cnt = toc_learning.add_training_sample(n, points, param=param, label="corrected")
             _log(f"В обучение: N={n} {param}, всего образцов {cnt}")
+            if dpg.does_item_exist("toc_samples_count"):
+                dpg.set_value("toc_samples_count", f"  образцов: {toc_learning.samples_count()}")
 
 
 def _on_retrain(sender=None, app_data=None, user_data=None):
@@ -794,7 +874,7 @@ def _refresh_plot():
         PLOT_CONTAINER,
         curves,
         param=_state["param"],
-        height=360,
+        height=400,
         title=f"N {_state.get('current_number') or ''}",
     )
 
@@ -807,7 +887,7 @@ def _on_number_change(sender=None, app_data=None, user_data=None):
     n = dpg.get_value(NUMBER_COMBO) if dpg.does_item_exist(NUMBER_COMBO) else ""
     _state["current_number"] = (n or "").strip().upper()
     _refresh_plot()
-    _refresh_edit_table()
+    _refresh_big_if_open()
 
 
 def _shift_number(delta: int):
@@ -824,16 +904,32 @@ def _shift_number(delta: int):
     if dpg.does_item_exist(NUMBER_COMBO):
         dpg.set_value(NUMBER_COMBO, nums[idx])
     _refresh_plot()
-    _refresh_edit_table()
+    _refresh_big_if_open()
 
 
 def _on_wheel(sender, app_data, user_data=None):
+    """Smena nomera kolesom. Rabotaet i na osnovnoj paneli, i v okne uvelicheniya."""
     try:
         delta = int(app_data)
     except Exception:
         delta = 0
     if delta == 0:
         return
+    # zashchita ot dvojnogo sdviga: big-handler i main-handler
+    # esli big okno navedeno - obrabatyvaet tol'ko big (cherez user_data flag)
+    from .constants import BIG_WIN_TAG
+    if user_data == "from_big":
+        _shift_number(-1 if delta > 0 else 1)
+        return
+    if dpg.does_item_exist(BIG_WIN_TAG):
+        try:
+            if dpg.is_item_hovered(BIG_WIN_TAG):
+                return  # big handler srabotaet
+            for tag in ("toc_big_plot_area", "toc_plot_big", "toc_big_edit_area"):
+                if dpg.does_item_exist(tag) and dpg.is_item_hovered(tag):
+                    return
+        except Exception:
+            pass
     _shift_number(-1 if delta > 0 else 1)
 
 
@@ -844,6 +940,9 @@ def _on_enlarge(sender=None, app_data=None, user_data=None):
         _state.get("param") or "F",
         _state.get("current_number") or "",
         on_wheel=_on_wheel,
+        on_prev=lambda: _shift_number(-1),
+        on_next=lambda: _shift_number(1),
+        edit_builder=_build_edit_table,
     )
 
 
@@ -1061,23 +1160,11 @@ def create_temp_outlier_window():
                     dpg.add_button(label="Увеличить график", callback=_on_enlarge, width=140)
 
                 dpg.add_text(
-                    "Колесо мыши - смена номера. Желтая кривая - corrected.",
+                    "Колесо мыши - смена номера. Желтая кривая - corrected. "
+                    "Правки точек - в окне «Увеличить график».",
                     color=(140, 180, 220),
                 )
-                with dpg.child_window(tag=PLOT_CONTAINER, height=280, border=False):
-                    pass
-
                 with dpg.group(horizontal=True):
-                    dpg.add_button(
-                        label="Показать/обновить таблицу коррекции",
-                        callback=lambda: _refresh_edit_table(),
-                        width=260,
-                    )
-                    dpg.add_button(
-                        label="Применить правки",
-                        callback=_on_apply_edits,
-                        width=140,
-                    )
                     dpg.add_button(
                         label="Добавить в обучение",
                         callback=_on_add_to_training,
@@ -1088,14 +1175,18 @@ def create_temp_outlier_window():
                         callback=_on_retrain,
                         width=140,
                     )
+                    dpg.add_text(
+                        f"  образцов: {toc_learning.samples_count()}",
+                        tag="toc_samples_count",
+                    )
 
-                dpg.add_text("Скорректированные точки (правка оператора)")
-                with dpg.child_window(tag=EDIT_CONTAINER, height=200, border=True):
-                    dpg.add_text("После анализа нажмите «Показать/обновить таблицу коррекции»")
+                # grafik: fiksir. vysota dostatochnaya, bez obrezki
+                with dpg.child_window(tag=PLOT_CONTAINER, height=420, border=False):
+                    pass
 
                 dpg.add_separator()
                 dpg.add_text("Сводная таблица (метрики по температурам)")
-                with dpg.child_window(tag=SUMMARY_CONTAINER, height=-1, border=False):
+                with dpg.child_window(tag=SUMMARY_CONTAINER, height=220, border=False):
                     pass
 
     handler = "toc_wheel_handler"
