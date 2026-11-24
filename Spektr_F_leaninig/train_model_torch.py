@@ -16,6 +16,7 @@ from training_common import (
     TARGET, FILTR_MIN, FILTR_MAX, MIN_PER_SPC, MIN_TRAIN, TEST_SIZE, RANDOM_STATE,
     get_engine, load_raw, clean_data, get_features, interactive_setup,
     print_diag, report_predictions, safe_name, save_index,
+    save_model_metrics, make_metrics_row,
 )
 
 OUT_DIR         = "models_torch"
@@ -191,10 +192,14 @@ def main():
         "target": TARGET, "features": feats, "backend": "pytorch",
         "auto_stop": False, "epochs": TORCH_EPOCHS, "models": {},
     }
+    all_rows = []
 
     if scope.startswith("global"):
         spec = train_group(df, feats, OUT_DIR, "global", setup["auto_search"])
-        if spec: index["models"]["*"] = spec
+        if spec:
+            index["models"]["*"] = spec
+            all_rows.append(make_metrics_row(
+                spec, "*", scope, df, setup["fmax"], "pytorch"))
     else:
         counts = df.groupby("Spc").size().sort_values(ascending=False)
         total, skipped = len(counts), []
@@ -203,15 +208,25 @@ def main():
             if n < MIN_PER_SPC:
                 skipped.append((spc, n)); continue
             sub = df[df["Spc"] == spc]
-            spec = train_group(sub, feats, OUT_DIR, "spc_" + safe_name(spc), setup["auto_search"])
+            spec = train_group(sub, feats, OUT_DIR,
+                               "spc_" + safe_name(spc), setup["auto_search"])
             if spec is None:
                 skipped.append((spc, n)); continue
             index["models"][spc] = spec
+            all_rows.append(make_metrics_row(
+                spec, spc, scope, sub, setup["fmax"], "pytorch"))
+
         if skipped:
             print(f"\nПропущено Spc: {len(skipped)}")
+            for spc, n in skipped:
+                print(f"  {spc!r:40s} n={n}")
 
     save_index(os.path.join(OUT_DIR, "index.json"), index)
+    save_model_metrics(engine, all_rows)
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()

@@ -9,8 +9,8 @@ from packaging import version
 
 from Options import parse_connection_string
 
-version_ = '1.9.1'
-update_date = '23.11.2026'
+version_ = '1.9.2'
+update_date = '24.11.2026'
 
 
 @staticmethod

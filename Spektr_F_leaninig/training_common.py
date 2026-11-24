@@ -401,3 +401,138 @@ def print_coverage(dfe, results, y=None, top=25):
         elif res.get("skipped_spcs"):
             line += f"  skip Spc={len(res['skipped_spcs'])}"
         print(line)
+
+# ---------------- малые модели: сохранение в БД ----------------
+
+SMALL_METRICS_TABLE = "small_model_metrics"
+
+
+def ensure_small_metrics_table(engine, table=SMALL_METRICS_TABLE):
+    """Создаёт таблицу для метрик малых моделей, если её нет."""
+    ddl = text(f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            nominal DOUBLE NULL,
+            spc VARCHAR(255) NULL,
+            model_type VARCHAR(64) NULL,
+            pct_lt50_train DOUBLE NULL,
+            pct_lt50_test DOUBLE NULL,
+            n_train INT NULL,
+            n_test INT NULL,
+            mean_delta DOUBLE NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    with engine.begin() as conn:
+        conn.execute(ddl)
+
+
+def save_small_model_metrics(engine, rows, table=SMALL_METRICS_TABLE):
+    """
+    rows: список dict'ов, каждый должен содержать ключи:
+          nominal, spc, model_type, pct_lt50_train, pct_lt50_test,
+          n_train, n_test, mean_delta
+    """
+    if not rows:
+        print("  [db] нет строк для записи")
+        return
+    ensure_small_metrics_table(engine, table)
+    df = pd.DataFrame(rows)
+    keep = ("nominal", "spc", "model_type", "pct_lt50_train", "pct_lt50_test",
+            "n_train", "n_test", "mean_delta")
+    df = df[[c for c in keep if c in df.columns]]
+    df.to_sql(table, engine, if_exists="append", index=False)
+    print(f"  [db] записано в {table}: {len(df)} строк")
+
+    # ---------------- метрики моделей: сохранение в БД ----------------
+
+
+MODEL_METRICS_TABLE = "model_metrics"
+
+
+def ensure_model_metrics_table(engine, table=MODEL_METRICS_TABLE):
+    """Создаёт общую таблицу метрик всех моделей, если её нет."""
+    ddl = text(f"""
+         CREATE TABLE IF NOT EXISTS {table} (
+             id INT AUTO_INCREMENT PRIMARY KEY,
+             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+             scope VARCHAR(32) NULL,
+             spc VARCHAR(255) NULL,
+             nominal DOUBLE NULL,
+             backend VARCHAR(32) NULL,
+             model_type VARCHAR(64) NULL,
+             n_train INT NULL,
+             n_test INT NULL,
+             pct_lt50_train DOUBLE NULL,
+             pct_lt50_test DOUBLE NULL,
+             mae_train DOUBLE NULL,
+             mae_test DOUBLE NULL,
+             rmse_train DOUBLE NULL,
+             rmse_test DOUBLE NULL,
+             fmax DOUBLE NULL,
+             extra TEXT NULL
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+     """)
+    with engine.begin() as conn:
+        conn.execute(ddl)
+
+
+def save_model_metrics(engine, rows, table=MODEL_METRICS_TABLE):
+    """rows: список dict'ов; недостающие колонки заполняются NULL."""
+    if not rows:
+        print(f"  [db] нет строк для записи в {table}")
+        return
+    ensure_model_metrics_table(engine, table)
+    df = pd.DataFrame(rows)
+    cols = ("scope", "spc", "nominal", "backend", "model_type",
+            "n_train", "n_test", "pct_lt50_train", "pct_lt50_test",
+            "mae_train", "mae_test", "rmse_train", "rmse_test",
+            "fmax", "extra")
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    df = df[list(cols)]
+    df.to_sql(table, engine, if_exists="append", index=False)
+    print(f"  [db] записано в {table}: {len(df)} строк")
+
+
+def make_metrics_row(spec, spc_key, scope, sub, fmax, backend):
+    """
+    Универсальный конструктор строки для model_metrics.
+    spec  — то, что вернул train_group();
+            sklearn: {"metrics": {"mlp": {"train","test"}, "hgb": {...}}, "best": ...}
+            TF/torch: {"metrics": {"train","test"}, ...}
+    spc_key — "*" для global, иначе имя Spc;
+    sub     — DataFrame этой группы (для среднего Nominal);
+    """
+    m = spec["metrics"]
+    best = spec.get("best")
+    if best is not None and best in m:
+        tr, te = m[best]["train"], m[best]["test"]
+        model_type = f"{backend}_{best}"
+    else:
+        tr, te = m["train"], m["test"]
+        model_type = backend
+
+    nominal = None
+    if sub is not None and "Nominal" in getattr(sub, "columns", []):
+        if len(sub):
+            nominal = float(sub["Nominal"].mean())
+
+    return {
+        "scope": scope,
+        "spc": str(spc_key),
+        "nominal": nominal,
+        "backend": backend,
+        "model_type": model_type,
+        "n_train": int(spec["n_train"]),
+        "n_test": int(spec["n_test"]),
+        "pct_lt50_train": float(tr["frac_50hz"]) * 100.0,
+        "pct_lt50_test": float(te["frac_50hz"]) * 100.0,
+        "mae_train": float(tr["mae"]),
+        "mae_test": float(te["mae"]),
+        "rmse_train": float(tr["rmse"]),
+        "rmse_test": float(te["rmse"]),
+        "fmax": float(fmax),
+        "extra": None,
+    }

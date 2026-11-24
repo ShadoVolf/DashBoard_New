@@ -1,0 +1,142 @@
+# -*- coding: utf-8 -*-
+"""
+Модель для малого числа измерений (2..30 на Spc):
+предсказание через среднюю разницу avg(F*Nominal - Filtr_Freq).
+
+Для каждого Spc с 2..30 измерениями:
+    delta_i  = F_i*Nominal_i - Filtr_Freq_i
+    mean_d   = mean(delta по train)
+    pred_i   = F_i*Nominal_i - mean_d
+    err_i    = Filtr_Freq_i - pred_i
+
+Метрики (% |err| < 50 Hz) на train и test сохраняются в БД
+в таблицу small_model_metrics.
+"""
+import os
+import numpy as np
+from sklearn.model_selection import train_test_split
+import joblib
+
+from training_common import (
+    TARGET, FILTR_MIN, FILTR_MAX, TEST_SIZE, RANDOM_STATE, DEFAULT_FMAX,
+    get_engine, load_raw, clean_data, print_diag,
+    report_predictions, safe_name, save_index,
+    prompt_yn, prompt_float,
+    save_small_model_metrics, SMALL_METRICS_TABLE,
+)
+
+OUT_DIR = "models_small"
+MIN_SMALL, MAX_SMALL = 2, 30
+
+
+def _predict(F, Nominal, mean_delta):
+    return F * Nominal - mean_delta
+
+
+def train_group_small(sub, spc, out_dir):
+    n = len(sub)
+    print(f"\n=== Spc={spc!r}  n={n} ===")
+    if n < MIN_SMALL or n > MAX_SMALL:
+        print(f"[skip] n={n} вне [{MIN_SMALL},{MAX_SMALL}]")
+        return None
+
+    F    = sub["F"].to_numpy(float)
+    Nom  = sub["Nominal"].to_numpy(float)
+    y    = sub[TARGET].to_numpy(float)
+    delta = F * Nom - y
+
+    # train / test
+    idx_tr, idx_te = train_test_split(
+        np.arange(n), test_size=TEST_SIZE, random_state=RANDOM_STATE)
+
+    mean_delta = float(np.mean(delta[idx_tr]))
+    pred_tr = _predict(F[idx_tr], Nom[idx_tr], mean_delta)
+    pred_te = _predict(F[idx_te], Nom[idx_te], mean_delta)
+
+    print("Baselines:")
+    report_predictions("mean_y", y, np.full_like(y, y.mean()))
+
+    print("\n=== Метрики (delta = y - pred) ===")
+    res_tr = report_predictions("small-train", y[idx_tr], pred_tr)
+    res_te = report_predictions("small-test",  y[idx_te], pred_te)
+
+    tag = "spc_" + safe_name(spc)
+    d = os.path.join(out_dir, tag)
+    os.makedirs(d, exist_ok=True)
+    joblib.dump({
+        "type":       "mean_delta",
+        "spc":        spc,
+        "mean_delta": mean_delta,
+        "nominal":    float(np.mean(Nom)),
+        "n_train":    int(len(idx_tr)),
+        "n_test":     int(len(idx_te)),
+        "metrics":    {"train": res_tr, "test": res_te},
+    }, os.path.join(d, "model.joblib"))
+    print(f"Сохранено: {d}")
+
+    return {
+        "spc":             spc,
+        "nominal":         float(np.mean(Nom)),
+        "model_type":      "mean_delta",
+        "mean_delta":      mean_delta,
+        "n_train":         int(len(idx_tr)),
+        "n_test":          int(len(idx_te)),
+        "pct_lt50_train":  res_tr["frac_50hz"] * 100.0,
+        "pct_lt50_test":   res_te["frac_50hz"] * 100.0,
+        "metrics":         {"train": res_tr, "test": res_te},
+        "dir":             tag,
+    }
+
+
+def main():
+    print("=== Small-data model (mean_delta) | n ∈ [2, 30] ===")
+    engine = get_engine()
+    df_raw = load_raw(engine)
+    print(f"Загружено: {len(df_raw)}")
+    print_diag(df_raw)
+
+    if prompt_yn("\nТолько диагностика (без обучения)?", default_yes=False):
+        return
+
+    fmax = prompt_float(f"|{TARGET}| < fmax", DEFAULT_FMAX)
+    df = clean_data(df_raw, fmax=fmax)
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    print(f"\n=== Режим: small-mean_delta  fmax={fmax:g}  "
+          f"диапазон n=[{MIN_SMALL},{MAX_SMALL}] ===")
+
+    counts   = df.groupby("Spc").size().sort_values(ascending=False)
+    in_range = [(spc, n) for spc, n in counts.items()
+                if MIN_SMALL <= n <= MAX_SMALL]
+    print(f"\nSpc в диапазоне: {len(in_range)} из {len(counts)}")
+
+    results = []
+    for i, (spc, n) in enumerate(in_range, 1):
+        print(f"\n[{i}/{len(in_range)}]")
+        sub = df[df["Spc"] == spc]
+        spec = train_group_small(sub, spc, OUT_DIR)
+        if spec:
+            results.append(spec)
+
+    if results:
+        rows = [{k: r[k] for k in
+                 ("nominal", "spc", "model_type",
+                  "pct_lt50_train", "pct_lt50_test",
+                  "n_train", "n_test", "mean_delta")}
+                for r in results]
+        save_small_model_metrics(engine, rows, SMALL_METRICS_TABLE)
+        print(f"\nОбработано Spc: {len(results)}")
+
+    index = {
+        "model_type": "mean_delta",
+        "min_small":  MIN_SMALL,
+        "max_small":  MAX_SMALL,
+        "fmax":       fmax,
+        "db_table":   SMALL_METRICS_TABLE,
+        "models":     {r["spc"]: r for r in results},
+    }
+    save_index(os.path.join(OUT_DIR, "index.json"), index)
+
+
+if __name__ == "__main__":
+    main()
