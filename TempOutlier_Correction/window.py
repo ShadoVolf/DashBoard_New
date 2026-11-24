@@ -1226,19 +1226,26 @@ def _on_save(sender=None, app_data=None, user_data=None):
         if not vals.empty:
             spc_name = str(vals.iloc[0])
 
-    # Parametry F,R,Q,C0,Cq,L: s zamera gde v norme, inache s base
-    psi_base = toc_data.apply_in_spec_params_to_psi(
-        psi_base,
-        psi,
-        _state["selected_mids"],
-        int(base),
-        spc_name or None,
-    )
-
+    # Metriki krivoj (Fmax/Rmax/...) po corrected temps
     temps_for_metrics = corr_temps.copy()
     temps_for_metrics["Measure_ID"] = base
     psi_upd = toc_metrics.apply_metrics_to_psidata(
         psi_base, temps_for_metrics, base, spec=_state.get("spec_params") or None
+    )
+
+    # F,R,Q,C0,Cq(C1),L - dlya kazhdogo parametra otdelno:
+    # znachenie s lyubogo zamera gde v norme Spc; inache s base.
+    # temps_df - vse ishodnye krivye (dlya Q/C0 esli net v psidata)
+    temps_all = _state.get("temps_df")
+    if temps_all is None or (hasattr(temps_all, "empty") and temps_all.empty):
+        temps_all = corr_temps
+    psi_upd = toc_data.apply_in_spec_params_to_psi(
+        psi_upd,
+        psi,
+        _state["selected_mids"],
+        int(base),
+        spc_name or None,
+        temps_df=temps_all,
     )
 
     # File osnovnogo zamera -> "<File> (TOC)"
