@@ -8,7 +8,7 @@ from Archive_View.Archive_Data import (
     apply_rounding, build_archive_status_df,
     load_spc_map_for_archive, log_missing_params,
 )
-from Archive_View.Archive_Helpers import load_spc_map_otk_for_archive
+from Archive_View.Archive_Helpers import load_spc_map_otk_for_archive, sanitize_tmax_tmin_value
 from Archive_View.Archive_UI import _screen_safe
 
 from . import Protocol_Constants as _C
@@ -236,6 +236,11 @@ def _render_data_table(df, parent_container, table_tag, spc_map,
                     val = row.get(key, '')
                     if pd.isna(val):
                         val = ''
+                    # extr_1/extr_2 (spc Parameter, Note_mini «Tmax, C»/«Tmin, C»)
+                    # и Tmax/Tmin (psidata) вне [-60, 150] — пустая строка
+                    if (param_name in ('Tmax', 'Tmin', 'extr_1', 'extr_2')
+                            or key in ('Tmax', 'Tmin', 'extr_1', 'extr_2')):
+                        val = sanitize_tmax_tmin_value(val, param_name or key)
                     text = _screen_safe(val)
                     color = None
                     if param_name and param_name in param_ok:

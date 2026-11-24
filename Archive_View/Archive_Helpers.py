@@ -193,3 +193,57 @@ def _load_spc_map_for_display(spc_name: str, psi_type: str) -> pd.DataFrame:
         return spc_map
 
     return load_spc_map_for_archive(spc_name)
+
+# ---------------------------------------------------------------------------
+# Tmax / Tmin: значения вне рабочего диапазона не показываем
+# ---------------------------------------------------------------------------
+_TMAX_TMIN_PARAMS = frozenset({
+    'Tmax', 'Tmin',           # имена в psidata / алиасы
+    'extr_1', 'extr_2',       # Parameter в spc_map_table (Note_mini: «Tmax, C» / «Tmin, C»)
+})
+_TMAX_TMIN_LO = -60.0
+_TMAX_TMIN_HI = 150.0
+
+
+def sanitize_tmax_tmin_value(val, param_name=None):
+    """Для Tmax/Tmin (psidata) и extr_1/extr_2 (spc_map Parameter):
+    если значение вне [-60, +150] — пустая строка.
+
+    На экране (Note_mini «Tmax, C» / «Tmin, C») и в протоколе вместо
+    «мусорных» экстремумов — пустое место. Остальные параметры без изменений.
+    """
+    if param_name is not None and param_name not in _TMAX_TMIN_PARAMS:
+        return val
+    if val is None:
+        return ''
+    try:
+        if pd.isna(val):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        # Нечисловое — тоже не показываем для Tmax/Tmin
+        if param_name in _TMAX_TMIN_PARAMS or param_name is None:
+            return ''
+        return val
+    if f < _TMAX_TMIN_LO or f > _TMAX_TMIN_HI:
+        return ''
+    return val
+
+
+def sanitize_tmax_tmin_columns(df: pd.DataFrame,
+                               param_cols=('Tmax', 'Tmin', 'extr_1', 'extr_2')) -> pd.DataFrame:
+    """Обнуляет Tmax/Tmin/extr_1/extr_2 вне [-60, 150] в DataFrame (на копии)."""
+    if df is None or df.empty:
+        return df
+    out = df
+    for col in param_cols:
+        if col not in out.columns:
+            continue
+        def _cell(v, _col=col):
+            return sanitize_tmax_tmin_value(v, _col)
+        out = out.copy()
+        out[col] = out[col].map(_cell)
+    return out

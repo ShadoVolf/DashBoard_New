@@ -1150,6 +1150,29 @@ def build_archive_print_data(df: pd.DataFrame,
                 pass
 
     # ------------------------------------------------------------------
+    # 7b) Tmax / Tmin вне [-60, +150] -> пусто (в протоколе пустое место)
+    # ------------------------------------------------------------------
+    for _tmax_col in ('Tmax', 'Tmin', 'extr_1', 'extr_2'):
+        if _tmax_col not in out.columns:
+            continue
+        def _mask_out_of_range(v):
+            if v is None:
+                return ''
+            try:
+                if pd.isna(v):
+                    return ''
+            except (TypeError, ValueError):
+                pass
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return ''
+            if f < -60.0 or f > 150.0:
+                return ''
+            return v
+        out[_tmax_col] = out[_tmax_col].map(_mask_out_of_range)
+
+    # ------------------------------------------------------------------
     # 8) Пустые значения -> ''  (для отрисовки в PDF)
     # ------------------------------------------------------------------
     return out.fillna('')
@@ -1211,6 +1234,28 @@ def build_archive_print_data_3(df, spc_map):
         if param in out.columns:
             out[param] = pd.to_numeric(
                 out[param], errors='coerce').round(int(decimals))
+
+    # Tmax / Tmin вне [-60, +150] -> пусто (в протоколе пустое место)
+    for _tmax_col in ('Tmax', 'Tmin', 'extr_1', 'extr_2'):
+        if _tmax_col not in out.columns:
+            continue
+        def _mask_out_of_range(v):
+            if v is None:
+                return ''
+            try:
+                if pd.isna(v):
+                    return ''
+            except (TypeError, ValueError):
+                pass
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return ''
+            if f < -60.0 or f > 150.0:
+                return ''
+            return v
+        out[_tmax_col] = out[_tmax_col].map(_mask_out_of_range)
+
     return out.fillna('')
 
 

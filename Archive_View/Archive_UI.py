@@ -25,7 +25,7 @@ from .Archive_Data import (
     resolve_param_column, log_missing_params,   # ← добавить
     set_include_shum,                           # NEW
 )
-from .Archive_Helpers import _current_psi_type, _load_spc_map_for_display
+from .Archive_Helpers import _current_psi_type, _load_spc_map_for_display, sanitize_tmax_tmin_value
 # ============================================================
 # Экранная замена спецсимволов
 # ============================================================
@@ -606,6 +606,11 @@ def _fill_table(df: pd.DataFrame):
                     val = row.get(key, '')
                     if pd.isna(val):
                         val = ''
+                    # extr_1/extr_2 (spc Parameter, Note_mini «Tmax, C»/«Tmin, C»)
+                    # и Tmax/Tmin (psidata) вне [-60, 150] — пустая строка
+                    if (param_name in ('Tmax', 'Tmin', 'extr_1', 'extr_2')
+                            or key in ('Tmax', 'Tmin', 'extr_1', 'extr_2')):
+                        val = sanitize_tmax_tmin_value(val, param_name or key)
                     text = _screen_safe(val)
 
                     color = None
@@ -794,6 +799,11 @@ def _fill_table_1(df: pd.DataFrame):
                     val = row.get(key, '')
                     if pd.isna(val):
                         val = ''
+                    # extr_1/extr_2 (spc Parameter, Note_mini «Tmax, C»/«Tmin, C»)
+                    # и Tmax/Tmin (psidata) вне [-60, 150] — пустая строка
+                    if (param_name in ('Tmax', 'Tmin', 'extr_1', 'extr_2')
+                            or key in ('Tmax', 'Tmin', 'extr_1', 'extr_2')):
+                        val = sanitize_tmax_tmin_value(val, param_name or key)
                     text = _screen_safe(val)
 
                     color = None
