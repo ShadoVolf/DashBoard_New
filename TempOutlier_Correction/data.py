@@ -1079,6 +1079,13 @@ def save_corrected_measure(
         temps["Measure_ID"] = new_mid
         if "MSK" in temps.columns:
             temps["MSK"] = msk
+        # File v psidatatemp - novoe imya (kak v psidata)
+        file_cols = [c for c in temps.columns if str(c).strip().lower() == "file"]
+        if file_cols:
+            for fc in file_cols:
+                temps[fc] = file_label
+        elif "File" in _table_columns(_temps()):
+            temps["File"] = file_label
 
     for df in (psi, temps):
         for pk in ("ID", "id", "RecordId", "RecordID"):
@@ -1098,6 +1105,12 @@ def save_corrected_measure(
             psi[real] = 1
     if not temps.empty:
         temps = _align_df_to_table(temps, _temps())
+        # posle align File mog propast' esli ne bylo v df - vosstanovim
+        tcols = {str(c).strip().lower(): c for c in temps.columns}
+        if "file" in tcols:
+            temps[tcols["file"]] = file_label
+        elif "File" in _table_columns(_temps()):
+            temps["File"] = file_label
 
     with eng.begin() as conn:
         psi.to_sql(

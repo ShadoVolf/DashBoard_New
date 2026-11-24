@@ -525,6 +525,26 @@ def build_corrected_curve_for_number(
         rows.append({"Temp": t, "N": str(number).upper(), "Measure_ID": base_mid})
     out_df = pd.DataFrame(rows)
     base_src = series_by_mid[base_mid]
+
+    # Kolonki, kotorye VSEGDA berutsya s base bez izmenenij (kak est').
+    # File pri sohranenii perepisyvaetsya na novoe imya v save_corrected_measure.
+    _BASE_PASSTHROUGH = {
+        "pos", "status", "fn",
+        "variant_1", "variant_2", "variant_3",
+        "spurr", "spur", "rc_rb", "f_int", "file",
+        # chasto vstrechayushchiesya varianty registra/napisaniya
+        "rc_rb", "rс_rb", "spur_r",
+    }
+
+    def _is_passthrough(col: str) -> bool:
+        cl = str(col).strip().lower().replace("-", "_")
+        if cl in _BASE_PASSTHROUGH:
+            return True
+        # RC_Rb / Rc_Rb / rc-rb
+        if cl.replace("_", "") in ("rcrb", "spurr"):
+            return True
+        return False
+
     extra_cols = [
         c for c in base_src.columns
         if c not in ("Temp", "N", "Measure_ID") and c not in params
@@ -532,11 +552,52 @@ def build_corrected_curve_for_number(
     for c in extra_cols:
         out_df[c] = np.nan
 
-    # Parametry na odnoj temperature (ne OUTLIER_PARAMS F/R):
-    # 1) s zamera gde znachenie v norme specifikacii (esli limity est)
-    # 2) inache s osnovnogo
-    # 3) inache s lyubogo drugogo gde est konechnoe znachenie
-    if extra_cols and out_grid:
+    # Index strok base po Temp (tochnoe + blizhajshee)
+    base_by_t: Dict[float, Any] = {}
+    base_temps_list: List[Tuple[float, Any]] = []
+    if "Temp" in base_src.columns:
+        for _, row in base_src.iterrows():
+            try:
+                tv = round(float(row["Temp"]), 4)
+            except (TypeError, ValueError):
+                continue
+            base_by_t[tv] = row
+            base_temps_list.append((tv, row))
+
+    def _base_row_at(t: float):
+        key = round(float(t), 4)
+        if key in base_by_t:
+            return base_by_t[key]
+        if not base_temps_list:
+            return None
+        best = min(base_temps_list, key=lambda x: abs(x[0] - key))
+        if abs(best[0] - key) <= 0.51:
+            return best[1]
+        return None
+
+    # 1) passthrough-kolonki: STROGO s base, bez float/spec
+    for i, t in enumerate(out_grid):
+        brow = _base_row_at(t)
+        if brow is None:
+            continue
+        for c in extra_cols:
+            if not _is_passthrough(c):
+                continue
+            if c not in brow.index:
+                continue
+            val = brow.get(c)
+            try:
+                if val is None or (isinstance(val, float) and not np.isfinite(val)):
+                    continue
+                if pd.isna(val):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            out_df.at[i, c] = val
+
+    # 2) Ostal'nye extra (Q, C0, Cq, L, ...): spec -> base -> drugoj
+    other_cols = [c for c in extra_cols if not _is_passthrough(c)]
+    if other_cols and out_grid:
         from .data import value_in_spec
 
         limits_map = getattr(
@@ -556,7 +617,7 @@ def build_corrected_curve_for_number(
 
         for i, t in enumerate(out_grid):
             key = round(float(t), 4)
-            for c in extra_cols:
+            for c in other_cols:
                 val = None
                 lim = limits_map.get(c) or limits_map.get(str(c).upper())
                 if lim:
@@ -578,12 +639,21 @@ def build_corrected_curve_for_number(
                 if val is None:
                     row = rows_by_mid_t.get(base_mid, {}).get(key)
                     if row is not None and c in row.index:
+                        raw = row.get(c)
                         try:
-                            v = float(row[c])
+                            v = float(raw)
                             if np.isfinite(v) and v != OUTLIER_MARKER:
                                 val = v
+                            elif raw is not None and not (isinstance(raw, float) and pd.isna(raw)):
+                                # nechislo (stroka) - kopiruem kak est'
+                                val = raw
                         except (TypeError, ValueError):
-                            pass
+                            if raw is not None:
+                                try:
+                                    if not pd.isna(raw):
+                                        val = raw
+                                except (TypeError, ValueError):
+                                    val = raw
                 if val is None:
                     for mid, bucket in rows_by_mid_t.items():
                         if mid == base_mid:
