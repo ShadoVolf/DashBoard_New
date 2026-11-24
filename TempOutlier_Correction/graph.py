@@ -29,6 +29,7 @@ BIG_PLOT_AREA = "toc_big_plot_area"
 BIG_EDIT_AREA = "toc_big_edit_area"
 BIG_EDIT_TABLE = "toc_big_edit_table"
 BIG_HINT = "toc_big_hint"
+ONLY_CORR_CHECK_BIG = "toc_only_corr_check_big"
 
 
 def _line_theme(color: tuple):
@@ -84,6 +85,7 @@ def render_curves(
     x_tag: str = X_AXIS_TAG,
     y_tag: str = Y_AXIS_TAG,
     title: str = "",
+    only_corrected: bool = False,
 ) -> None:
     if dpg.does_item_exist(parent):
         try:
@@ -111,6 +113,11 @@ def render_curves(
             all_y: List[float] = []
             i = 0
             for label, df in curves.items():
+                # rejim "Только corrected": izmeritel'nye krivye (i linii,
+                # i tochki) voobshche ne risuetsya, chtoby ne meshaali
+                # ocenivat' skorrektirovannuyu krivuyu
+                if only_corrected and not str(label).lower().startswith("corr"):
+                    continue
                 xs, ys = _series_xy(df, param)
                 if not xs:
                     continue
@@ -161,6 +168,8 @@ def open_enlarged_graph(
     on_next: Optional[Callable] = None,
     edit_builder: Optional[Callable] = None,
     plot_height: Optional[int] = None,
+    only_corrected: bool = False,
+    on_only_corrected: Optional[Callable] = None,
 ) -> None:
     """
     Bol'shoe okno: grafik + tablitsa pravok operatora snizu.
@@ -204,6 +213,12 @@ def open_enlarged_graph(
                 color=(150, 200, 255),
             )
             dpg.add_spacer(width=20)
+            dpg.add_checkbox(
+                label="Только corrected",
+                tag=ONLY_CORR_CHECK_BIG,
+                default_value=only_corrected,
+                callback=on_only_corrected,
+            )
             if on_prev:
                 dpg.add_button(label="< N", callback=lambda: on_prev(), width=50)
             if on_next:
@@ -239,6 +254,7 @@ def open_enlarged_graph(
         x_tag=X_AXIS_TAG_BIG,
         y_tag=Y_AXIS_TAG_BIG,
         title=f"N {number}",
+        only_corrected=only_corrected,
     )
 
     # wheel: only when mouse is over big window
@@ -291,6 +307,7 @@ def refresh_enlarged_graph(
     param: str,
     number: str,
     edit_builder: Optional[Callable] = None,
+    only_corrected: bool = False,
 ) -> None:
     """Obnovit uvelichennyj grafik i tablitsu bez pereotkrytiya okna."""
     if not dpg.does_item_exist(BIG_WIN_TAG):
@@ -304,6 +321,11 @@ def refresh_enlarged_graph(
             dpg.set_value(BIG_HINT, f"Номер: {number}   параметр: {param}")
         except Exception:
             pass
+    try:
+        if dpg.does_item_exist(ONLY_CORR_CHECK_BIG):
+            dpg.set_value(ONLY_CORR_CHECK_BIG, bool(only_corrected))
+    except Exception:
+        pass
 
     plot_h = 320
     try:
@@ -322,6 +344,7 @@ def refresh_enlarged_graph(
             x_tag=X_AXIS_TAG_BIG,
             y_tag=Y_AXIS_TAG_BIG,
             title=f"N {number}",
+            only_corrected=only_corrected,
         )
 
     if dpg.does_item_exist(BIG_EDIT_AREA):
