@@ -1,235 +1,218 @@
 # -*- coding: utf-8 -*-
 """
-TensorFlow/Keras — предсказание Filtr_Freq.
-Добавлены: фиче-инжиниринг, HGB-baseline, разбивка метрик по Measure_ID,
-           остаточный анализ на батч-эффект.
+TensorFlow/Keras: единый интерактив, авто-подбор через KFold-grid.
+Auto-stop: OFF (фиксированное TF_EPOCHS), прогресс через TFProgress callback.
 """
-import argparse, json, os, re, sys
+import os, sys, time, itertools
 import numpy as np, pandas as pd
-from sqlalchemy import create_engine, text
-from sklearn.compose import TransformedTargetRegressor
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import RobustScaler, StandardScaler
+from sklearn.metrics import mean_absolute_error
 import joblib
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+from training_common import (
+    TARGET, FILTR_MIN, FILTR_MAX, MIN_PER_SPC, MIN_TRAIN, TEST_SIZE, RANDOM_STATE,
+    get_engine, load_raw, clean_data, get_features, interactive_setup,
+    print_diag, report_predictions, safe_name, save_index,
+)
 
-DB_URL       = "mysql+mysqlconnector://xampp:43FPa!29S8HQeAW@MES1:3306/coordinator"
-SPC_FILTER   = "РК731"
-RAW_FEATS    = ["F", "R", "Q", "C0", "Cq", "L", "Nominal"]
-TARGET       = "Filtr_Freq"
-RANDOM_STATE = 42
-DEFAULT_FMAX = 500.0
-OUT_DIR      = "models_tf"
-MIN_PER_SPC  = 100
+OUT_DIR        = "models_tf"
+TF_EPOCHS      = 400           # финальное обучение
+TF_EPOCHS_CV   = 150           # для авто-поиска
+TF_BATCH       = 256
+PROGRESS_EVERY = 20
 
-# --- доп. колонки из psidata, если есть в таблице ---
-EXTRA_COLS   = ["Fptp", "Fmax", "Fmin", "C0_C1", "Mono", "F0_Fl", "Rmax_Rmin",
-                "Fs_ppm", "Fl_ppm", "delta_Fint", "Measure_ID", "PH_ID", "Date"]
-# ---------------------------------------------------
-
-
-def safe_name(s): return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_") or "empty"
-
-
-def available_cols(engine, table="psidata"):
-    q = text(f"SHOW COLUMNS FROM {table}")
-    return {r[0] for r in engine.execute(q)}
+# --- сетка для авто-поиска ---
+TF_CONFIGS = [
+    {"hidden": (128, 64, 32), "lr": 1e-3, "batch": 256},
+    {"hidden": (256, 128, 64), "lr": 1e-3, "batch": 256},
+    {"hidden": (128, 128, 64, 32), "lr": 5e-4, "batch": 256},
+    {"hidden": (256, 128, 64), "lr": 5e-4, "batch": 128},
+]
+DEFAULT_CFG = {"hidden": (128, 64, 32), "lr": 1e-3, "batch": TF_BATCH}
 
 
-def load_data(engine):
-    cols = available_cols(engine)
-    use_extra = [c for c in EXTRA_COLS if c in cols]
-    print(f"Доп. признаки из psidata: {use_extra or '—'}")
-    all_feats = RAW_FEATS + use_extra
-    q = text(f"SELECT ID, Spc, {', '.join(all_feats)}, {TARGET} "
-             f"FROM psidata WHERE Spc LIKE :spc AND {TARGET} IS NOT NULL")
-    df = pd.read_sql(q, engine, params={"spc": f"%{SPC_FILTER}%"})
-    df.attrs["extra_cols_used"] = use_extra
-    return df, all_feats
+# ---------------- модель ----------------
+
+class TFProgress(keras.callbacks.Callback):
+    """Печать прогресса без остановки."""
+    def __init__(self, every=PROGRESS_EVERY):
+        super().__init__()
+        self.every = every
+        self.t0 = None
+
+    def on_train_begin(self, logs=None):
+        self.t0 = time.time()
+        print(f"  [TF] старт: epochs={self.params.get('epochs')}, "
+              f"batch={self.params.get('batch_size')}")
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        n = self.params.get("epochs", 0)
+        if not (epoch == 0 or (epoch + 1) % self.every == 0 or (epoch + 1) == n):
+            return
+        el = time.time() - self.t0
+        eta = el / (epoch + 1) * (n - epoch - 1)
+        print(f"  [TF] epoch {epoch+1:>4}/{n}  "
+              f"loss={logs.get('loss', float('nan')):.4g}  "
+              f"val_loss={logs.get('val_loss', float('nan')):.4g}  "
+              f"mae={logs.get('mae', float('nan')):.4g}  "
+              f"val_mae={logs.get('val_mae', float('nan')):.4g}  "
+              f"{el:6.1f}s  ETA {eta:6.1f}s")
 
 
-def clean_and_fe(df, feats, fmax):
-    df = df.copy()
-    for c in feats + [TARGET]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=feats + [TARGET])
-    df = df[(df["Nominal"] > 0) & (df["Nominal"] < 1000)]
-    df = df[df["F"].abs() < 1e5]
-    df = df[(df["R"] > 0) & (df["Q"] > 0) & (df["L"] > 0)]
-    df = df[df[TARGET].abs() < fmax].copy()
-
-    # ---------- ФИЧЕ-ИНЖИНИРИНГ ----------
-    eps = 1e-12
-    df["Nominal_Hz"] = df["Nominal"] * 1e6
-    df["F_Hz"]       = df["F"] * df["Nominal"]
-    df["F_Hz_over_Q"]     = df["F_Hz"] / (df["Q"] + eps)
-    df["F_Hz_times_Cq"]   = df["F_Hz"] * df["Cq"]
-    df["C0_over_Cq"]      = df["C0"] / (df["Cq"] + eps)
-    df["R_times_C0"]      = df["R"] * df["C0"]
-    df["Q_sq"]            = df["Q"] ** 2
-    df["sqrt_F_Hz_signed"] = np.sign(df["F_Hz"]) * np.sqrt(np.abs(df["F_Hz"]) + eps)
-    df["L_over_Cq"]       = df["L"] / (df["Cq"] + eps)
-    df["F_times_Cq"]      = df["F"] * df["Cq"]
-    df["F_over_R"]        = df["F"] / (df["R"] + eps)
-    # ---------------------------------------
-
-    engineered = ["Nominal_Hz", "F_Hz", "F_Hz_over_Q", "F_Hz_times_Cq",
-                  "C0_over_Cq", "R_times_C0", "Q_sq", "sqrt_F_Hz_signed",
-                  "L_over_Cq", "F_times_Cq", "F_over_R"]
-    return df, feats + engineered
-
-
-def build_model(n_in):
+def build_model(n_in, hidden, lr):
     inp = keras.Input(shape=(n_in,))
-    x = layers.Dense(128, activation="relu")(inp)
-    x = layers.Dense(64,  activation="relu")(x)
-    x = layers.Dense(32,  activation="relu")(x)
+    x = inp
+    for h in hidden:
+        x = layers.Dense(h, activation="relu")(x)
     out = layers.Dense(1)(x)
     m = keras.Model(inp, out)
-    m.compile(optimizer=keras.optimizers.Adam(1e-3), loss="mse", metrics=["mae"])
+    m.compile(optimizer=keras.optimizers.Adam(lr), loss="mse", metrics=["mae"])
     return m
 
 
-def fit_tf(Xtr, ytr, Xval, yval, verbose=0):
+def fit_tf(Xtr, ytr, Xval, yval, cfg, epochs=TF_EPOCHS, verbose_progress=True):
     sx = RobustScaler().fit(Xtr)
     sy = StandardScaler().fit(ytr.reshape(-1, 1))
-    m = build_model(Xtr.shape[1])
-    cb = [keras.callbacks.EarlyStopping(
-        monitor="val_loss", patience=40, restore_best_weights=True)]
-    m.fit(sx.transform(Xtr), sy.transform(ytr.reshape(-1, 1)).ravel(),
-          validation_data=(sx.transform(Xval), sy.transform(yval.reshape(-1, 1)).ravel()),
-          epochs=800, batch_size=256, verbose=verbose, callbacks=cb)
+    m = build_model(Xtr.shape[1], cfg["hidden"], cfg["lr"])
+    callbacks = [TFProgress()] if verbose_progress else []
+    m.fit(
+        sx.transform(Xtr), sy.transform(ytr.reshape(-1, 1)).ravel(),
+        validation_data=(sx.transform(Xval), sy.transform(yval.reshape(-1, 1)).ravel()),
+        epochs=epochs, batch_size=cfg["batch"], verbose=0, callbacks=callbacks,
+    )
     return {"model": m, "scaler_x": sx, "scaler_y": sy, "backend": "tensorflow"}
 
 
-def fit_hgb(Xtr, ytr, Xval, yval):
-    m = TransformedTargetRegressor(
-        regressor=HistGradientBoostingRegressor(
-            max_iter=1500, learning_rate=0.03, max_leaf_nodes=63,
-            l2_regularization=1e-3, early_stopping=True,
-            n_iter_no_change=40, random_state=RANDOM_STATE),
-        transformer=StandardScaler())
-    m.fit(Xtr, ytr)
-    return {"model": m, "backend": "sklearn_hgb"}
-
-
 def predict(b, X):
-    if b["backend"] == "tensorflow":
-        ys = b["model"].predict(b["scaler_x"].transform(X), verbose=0).ravel()
-        return b["scaler_y"].inverse_transform(ys.reshape(-1, 1)).ravel()
-    return b["model"].predict(X)
+    ys = b["model"].predict(b["scaler_x"].transform(X), verbose=0).ravel()
+    return b["scaler_y"].inverse_transform(ys.reshape(-1, 1)).ravel()
 
 
-def report(name, yt, yp):
-    return {"n": int(len(yt)),
-            "rmse": float(np.sqrt(mean_squared_error(yt, yp))),
-            "mae":  float(mean_absolute_error(yt, yp)),
-            "r2":   float(r2_score(yt, yp)) if np.std(yt) > 0 else float("nan")}
+# ---------------- авто-поиск ----------------
+
+def auto_search_tf(Xtr, ytr, n_splits=3):
+    print(f"\n  [auto TF] KFold({n_splits}) по {len(TF_CONFIGS)} конфигам, "
+          f"по {TF_EPOCHS_CV} эпох на фолд")
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    results = []
+    for i, cfg in enumerate(TF_CONFIGS, 1):
+        fold_mae = []
+        for j, (tr, va) in enumerate(kf.split(Xtr), 1):
+            b = fit_tf(Xtr[tr], ytr[tr], Xtr[va], ytr[va], cfg,
+                       epochs=TF_EPOCHS_CV, verbose_progress=False)
+            p = predict(b, Xtr[va])
+            fold_mae.append(mean_absolute_error(ytr[va], p))
+        mean = float(np.mean(fold_mae))
+        print(f"  [auto TF] cfg {i}/{len(TF_CONFIGS)}  "
+              f"hidden={cfg['hidden']}  lr={cfg['lr']}  batch={cfg['batch']}  "
+              f"→ CV MAE = {mean:.4g}")
+        results.append((mean, cfg))
+    results.sort(key=lambda x: x[0])
+    print(f"  [auto TF] best CV MAE = {results[0][0]:.4g}, cfg = {results[0][1]}")
+    return results[0][1]
 
 
-def print_report(name, m):
-    print(f"  {name:<8} RMSE={m['rmse']:10.4g}  MAE={m['mae']:10.4g}  R²={m['r2']:.4f}")
+# ---------------- обучение группы ----------------
 
+def train_group(sub, feats, out_dir, tag, auto_search_on):
+    print(f"\n=== {tag} (n={len(sub)}, features={feats}) ===")
+    if len(sub) < MIN_TRAIN:
+        print(f"[skip] мало данных: {len(sub)} < {MIN_TRAIN}")
+        return None
 
-def save_tf(b, out_dir, tag):
-    d = os.path.join(out_dir, tag); os.makedirs(d, exist_ok=True)
+    idx_tr, idx_te = train_test_split(sub.index, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    Xtr = sub.loc[idx_tr, feats].to_numpy(float)
+    Xte = sub.loc[idx_te, feats].to_numpy(float)
+    ytr = sub.loc[idx_tr, TARGET].to_numpy(float)
+    yte = sub.loc[idx_te, TARGET].to_numpy(float)
+
+    print("Baselines:")
+    report_predictions("mean", yte, np.full_like(yte, ytr.mean()))
+
+    # для авто-поиска — подвыборка
+    if auto_search_on and len(Xtr) > 15000:
+        rs = np.random.RandomState(RANDOM_STATE)
+        sel = rs.choice(len(Xtr), 15000, replace=False)
+        Xsr, ysr = Xtr[sel], ytr[sel]
+        print(f"  [auto] подвыборка для поиска: {len(Xsr)}")
+    else:
+        Xsr, ysr = Xtr, ytr
+
+    cfg = auto_search_tf(Xsr, ysr) if auto_search_on else DEFAULT_CFG
+
+    print(f"\n  [TF] финальный fit: cfg={cfg}, epochs={TF_EPOCHS}")
+    t0 = time.time()
+    b = fit_tf(Xtr, ytr, Xte, yte, cfg, epochs=TF_EPOCHS, verbose_progress=True)
+    print(f"  [TF] готово за {time.time()-t0:.1f}s")
+
+    print("\n=== Метрики (delta = y - pred) ===")
+    res = {
+        "train": report_predictions("TF-train", ytr, predict(b, Xtr)),
+        "test":  report_predictions("TF-test",  yte, predict(b, Xte)),
+    }
+
+    d = os.path.join(out_dir, tag)
+    os.makedirs(d, exist_ok=True)
     b["model"].save(os.path.join(d, "model.keras"))
     joblib.dump({k: v for k, v in b.items() if k != "model"},
                 os.path.join(d, "bundle.pkl"))
-    return d
+    print(f"Сохранено: {d}")
 
+    return {"dir": tag, "n_train": int(len(Xtr)), "n_test": int(len(Xte)),
+            "features": list(feats), "metrics": res, "cfg": cfg}
+
+
+# ---------------- main ----------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--scope", choices=["global", "per-spc"], default="global")
-    ap.add_argument("--fmax", type=float, default=DEFAULT_FMAX)
-    ap.add_argument("--out", default=OUT_DIR)
-    ap.add_argument("--verbose", type=int, default=0)
-    ap.add_argument("--diagnose-only", action="store_true")
-    args = ap.parse_args()
+    print(f"=== TensorFlow {tf.__version__} | auto-stop: OFF ===")
+    engine = get_engine()
+    df_raw = load_raw(engine)
+    print(f"Загружено: {len(df_raw)}")
+    print_diag(df_raw)
 
-    print(f"=== TensorFlow {tf.__version__} | scope={args.scope} | |Filtr_Freq|<{args.fmax:g}")
-    engine = create_engine(DB_URL, pool_pre_ping=True)
-    df, feats = load_data(engine)
-    df, feats = clean_and_fe(df, feats, args.fmax)
-    print(f"После чистки и FE: n={len(df)}  n_features={len(feats)}")
-
-    print("\nГруппы Spc:")
-    for spc, n in df.groupby("Spc").size().sort_values(ascending=False).items():
-        print(f"  {spc!r:40s} n={n}")
-    if args.diagnose_only:
+    setup = interactive_setup()
+    if setup["diagnose_only"]:
         return
 
-    if len(df) < 200:
-        sys.exit("[ERROR] мало данных")
+    df = clean_data(df_raw, fmax=setup["fmax"])
+    if len(df) < 2 * MIN_TRAIN:
+        sys.exit(f"[ERROR] мало данных: {len(df)}")
 
-    os.makedirs(args.out, exist_ok=True)
-    index = {"scope": args.scope, "spc_filter": SPC_FILTER, "fmax": args.fmax,
-             "features": feats, "target": TARGET, "backend": "tensorflow", "models": {}}
+    scope, feats = setup["scope"], get_features(setup["scope"])
+    print(f"\n=== Режим: {scope}  fmax={setup['fmax']:g}  "
+          f"features={feats}  auto_search={setup['auto_search']} ===")
 
-    def one_run(sub, tag, key):
-        print(f"\n=== {tag} (n={len(sub)}) ===")
-        # split
-        idx_tr, idx_te = train_test_split(sub.index, test_size=0.2, random_state=RANDOM_STATE)
-        Xtr, Xte = sub.loc[idx_tr, feats].to_numpy(float), sub.loc[idx_te, feats].to_numpy(float)
-        ytr, yte = sub.loc[idx_tr, TARGET].to_numpy(float), sub.loc[idx_te, TARGET].to_numpy(float)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    index = {
+        "scope": scope, "spc_filter": "РК731", "fmax": setup["fmax"],
+        "target": TARGET, "features": feats, "backend": "tensorflow",
+        "auto_stop": False, "epochs": TF_EPOCHS, "models": {},
+    }
 
-        # baseline
-        print("Baselines:")
-        print_report("mean", report("mean", yte, np.full_like(yte, ytr.mean())))
-        print_report("F_Hz", report("F_Hz", yte, sub.loc[idx_te, "F_Hz"].to_numpy(float)))
-
-        # models
-        print("\nModels:")
-        res = {}
-        b_tf = fit_tf(Xtr, ytr, Xte, yte, args.verbose)
-        res["tf"] = {"train": report("train", ytr, predict(b_tf, Xtr)),
-                     "test":  report("test",  yte, predict(b_tf, Xte))}
-        print_report("TF-train", res["tf"]["train"]); print_report("TF-test", res["tf"]["test"])
-
-        b_hgb = fit_hgb(Xtr, ytr, Xte, yte)
-        res["hgb"] = {"train": report("train", ytr, predict(b_hgb, Xtr)),
-                      "test":  report("test",  yte, predict(b_hgb, Xte))}
-        print_report("HGB-train", res["hgb"]["train"]); print_report("HGB-test", res["hgb"]["test"])
-
-        best = "hgb" if res["hgb"]["test"]["mae"] < res["tf"]["test"]["mae"] else "tf"
-        print(f"Лучший: {best}")
-
-        # residual analysis by Measure_ID (если есть)
-        if "Measure_ID" in sub.columns:
-            pred = predict(b_tf if best == "tf" else b_hgb, Xte)
-            te = sub.loc[idx_te, ["Measure_ID", TARGET]].copy()
-            te["pred"] = pred
-            te["res"] = te[TARGET] - te["pred"]
-            print("\nСредний residual по Measure_ID (батч-эффект):")
-            for mid, g in te.groupby("Measure_ID"):
-                print(f"  Measure_ID={mid}: n={len(g)}  mean_res={g['res'].mean():+.2f}  "
-                      f"std={g['res'].std():.2f}")
-
-        # save TF (пользователь просил TF-вариант)
-        d = save_tf(b_tf, args.out, tag)
-        index["models"][key] = {"dir": os.path.relpath(d, args.out),
-                                "n_train": int(len(Xtr)), "n_test": int(len(Xte)),
-                                "metrics": res, "best": best,
-                                "features": feats}
-        print(f"Сохранено: {d}")
-
-    if args.scope == "global":
-        one_run(df, "global", "*")
+    if scope.startswith("global"):
+        spec = train_group(df, feats, OUT_DIR, "global", setup["auto_search"])
+        if spec: index["models"]["*"] = spec
     else:
-        for spc, sub in df.groupby("Spc"):
-            if len(sub) < MIN_PER_SPC:
-                print(f"[skip] Spc={spc!r}: n={len(sub)} < {MIN_PER_SPC}")
-                continue
-            one_run(sub, "spc_" + safe_name(spc), spc)
+        counts = df.groupby("Spc").size().sort_values(ascending=False)
+        total, skipped = len(counts), []
+        for i, (spc, n) in enumerate(counts.items(), 1):
+            print(f"\n[{i}/{total}] Spc={spc!r}  n={n}")
+            if n < MIN_PER_SPC:
+                skipped.append((spc, n)); continue
+            sub = df[df["Spc"] == spc]
+            spec = train_group(sub, feats, OUT_DIR, "spc_" + safe_name(spc), setup["auto_search"])
+            if spec is None:
+                skipped.append((spc, n)); continue
+            index["models"][spc] = spec
+        if skipped:
+            print(f"\nПропущено Spc: {len(skipped)}")
 
-    with open(os.path.join(args.out, "index.json"), "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False, indent=2)
-    print(f"\nИндекс: {os.path.join(args.out, 'index.json')}")
+    save_index(os.path.join(OUT_DIR, "index.json"), index)
 
 
 if __name__ == "__main__":
