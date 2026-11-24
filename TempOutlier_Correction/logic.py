@@ -197,22 +197,123 @@ def _cross_is_bad(
         return False
     med, _, thr = _mad_threshold(peer_vals)
     floor = _ABS_FLOOR.get(param, 1.0)
+    fv = float(v)
+
+    # Esli est' "nizkij" klaster (bez skachka) - vse chto vyshe nego sil'no = bad.
+    # Tipichnyj skachok R: odin-dva zamera s pikom, ostal'nye gladkie.
+    lo = float(np.min(peer_vals))
+    hi = float(np.max(peer_vals))
+    spread = hi - lo
+    if spread > max(floor, abs(med) * 0.02 + floor * 0.5):
+        # nizhnyaya polovina (bez pika)
+        lower = [x for x in peer_vals if x <= med]
+        ref = float(np.median(lower)) if lower else lo
+        # dopusk ot "chistogo" urovnya
+        tol = max(floor * 0.5, abs(ref) * 0.02 + floor * 0.15)
+        if fv > ref + tol:
+            return True
+
     if thr is None:
-        others = [x for x in peer_vals if abs(x - float(v)) > 1e-15]
+        others = [x for x in peer_vals if abs(x - fv) > 1e-15]
         if not others:
             return False
         omed = float(np.median(others))
         rel = abs(omed) * 0.03 + floor
-        return abs(float(v) - omed) > rel
-    thr_use = max(thr, floor)
-    if abs(float(v) - med) > thr_use:
+        return abs(fv - omed) > rel
+    thr_use = max(thr, floor * 0.75)
+    if abs(fv - med) > thr_use:
         return True
-    others = [x for x in peer_vals if abs(x - float(v)) > 1e-15]
+    others = [x for x in peer_vals if abs(x - fv) > 1e-15]
     if others:
         omed = float(np.median(others))
-        if abs(float(v) - omed) > thr_use:
+        if abs(fv - omed) > thr_use:
             return True
     return False
+
+
+def _consensus_value(
+    peers: List[Optional[float]],
+    base_v: Optional[float],
+    param: str,
+    within_bad_flags: Optional[List[bool]] = None,
+    mid_order: Optional[List[int]] = None,
+    aligned_at_i: Optional[Dict[int, Optional[float]]] = None,
+    within_bad_at_i: Optional[Dict[int, bool]] = None,
+    nn_at_i: Optional[Dict[int, float]] = None,
+) -> Tuple[Optional[float], str, List[float]]:
+    """Consensus v tochke temperatury.
+
+    Esli hot' na odnom zamere net skachka (tochka "good") - berem medianu
+    "chistogo" klastera i NE ostavlyaem base, esli base vyshe/vne klastera.
+    """
+    floor = _ABS_FLOOR.get(param, 1.0)
+
+    # sobiraem good po mid
+    good: List[float] = []
+    all_finite: List[float] = []
+    if aligned_at_i is not None:
+        for mid, v in aligned_at_i.items():
+            if v is None or v == OUTLIER_MARKER or not np.isfinite(float(v)):
+                continue
+            fv = float(v)
+            all_finite.append(fv)
+            local = bool((within_bad_at_i or {}).get(mid, False))
+            peers_list = list(aligned_at_i.values())
+            cross = _cross_is_bad(fv, peers_list, param)
+            nn = float((nn_at_i or {}).get(mid, 0.0)) >= 0.5
+            if not local and not cross and not nn:
+                good.append(fv)
+    else:
+        for v in peers:
+            if v is None or v == OUTLIER_MARKER or not np.isfinite(float(v)):
+                continue
+            all_finite.append(float(v))
+        good = list(all_finite)
+
+    if not good and not all_finite:
+        if base_v is not None and np.isfinite(float(base_v)):
+            return float(base_v), "base_only", []
+        return None, "missing", []
+
+    pool = good if good else all_finite
+    arr = np.asarray(pool, dtype=float)
+    med = float(np.median(arr))
+    lo = float(np.min(arr))
+    hi = float(np.max(arr))
+
+    # "chistyj" klaster: nizhnyaya chast' pri nalichii skachka vverh
+    if hi - lo > max(floor, abs(med) * 0.02 + floor * 0.5):
+        lower = arr[arr <= med]
+        ref = float(np.median(lower)) if lower.size else lo
+        tol = max(floor * 0.5, abs(ref) * 0.02 + floor * 0.15)
+        clean = arr[arr <= ref + tol]
+        if clean.size == 0:
+            clean = lower if lower.size else arr
+        new_v = float(np.median(clean))
+        method = "clean_cluster"
+    else:
+        new_v = med
+        method = "cross_consensus"
+        clean = arr
+
+    # base_keep TOL'KO esli base vnutri chistogo klastera
+    if (
+        base_v is not None
+        and base_v != OUTLIER_MARKER
+        and np.isfinite(float(base_v))
+    ):
+        bv = float(base_v)
+        c_lo = float(np.min(clean))
+        c_hi = float(np.max(clean))
+        # dopusk - uzkij: base ne dolzhen torchat' nad chistymi
+        if c_lo - floor * 0.1 <= bv <= c_hi + floor * 0.05:
+            if abs(bv - new_v) <= max(floor * 0.15, abs(new_v) * 0.01):
+                return bv, "base_keep", list(map(float, clean))
+        # base vyshe chistogo klastera = skachok, ubiraem
+        if bv > c_hi + max(floor * 0.1, abs(c_hi) * 0.01):
+            return new_v, "spike_removed", list(map(float, clean))
+
+    return new_v, method, list(map(float, clean))
 
 
 def _align_grid(
@@ -525,50 +626,59 @@ def build_corrected_curve_for_number(
                 continue
             i = g_index[t_ref]
             peers = [aligned[m][i] for m in aligned]
-            good: List[float] = []
-            for mid in aligned:
-                v = aligned[mid][i]
-                if v is None or v == OUTLIER_MARKER or not np.isfinite(float(v)):
-                    continue
-                local = within_bad.get(mid, [False] * len(grid))[i]
-                cross = _cross_is_bad(v, peers, param)
-                nn = False
-                if nn_scores.get(mid) and i < len(nn_scores[mid]):
-                    nn = nn_scores[mid][i] >= 0.5
-                if not local and not cross and not nn:
-                    good.append(float(v))
-
             base_v = aligned.get(base_mid, [None] * len(grid))[i] if base_mid in aligned else None
 
-            if good:
-                new_v = float(np.median(good))
-                method = "cross_consensus"
-                if (
-                    base_v is not None
-                    and base_v != OUTLIER_MARKER
-                    and np.isfinite(float(base_v))
-                    and not _cross_is_bad(base_v, peers, param)
-                    and not (within_bad.get(base_mid, [False] * len(grid))[i] if base_mid in within_bad else False)
-                    and abs(float(base_v) - new_v) <= _ABS_FLOOR.get(param, 1.0) * 0.25
-                ):
-                    new_v = float(base_v)
-                    method = "base_keep"
-                corr_vals.append(new_v)
-                bad_flags.append(False)
-                protect.append(True)
-                methods.append(method)
-                if base_v is None or abs(float(base_v) - new_v) > 1e-12:
-                    corrections.append({
-                        "mid": base_mid,
-                        "number": number,
-                        "param": param,
-                        "temp": t_ref,
-                        "old": base_v,
-                        "new": new_v,
-                        "reason": method,
-                        "n_good": len(good),
-                        "n_peers": len([p for p in peers if p is not None]),
-                    })
+            aligned_at_i = {m: aligned[m][i] for m in aligned}
+            within_bad_at_i = {
+                m: (
+                    within_bad.get(m, [False] * len(grid))[i]
+                    if i < len(within_bad.get(m, []))
+                    else False
+                )
+                for m in aligned
+            }
+            nn_at_i = {
+                m: (
+                    (nn_scores.get(m) or [0.0])[i]
+                    if i < len(nn_scores.get(m) or [])
+                    else 0.0
+                )
+                for m in aligned
+            }
+
+            new_v, method, clean = _consensus_value(
+                peers,
+                base_v,
+                param,
+                aligned_at_i=aligned_at_i,
+                within_bad_at_i=within_bad_at_i,
+                nn_at_i=nn_at_i,
+            )
+
+            if new_v is not None and method not in ("missing", "need_regression"):
+                # need_regression esli sovsem net clean/good i ostalsya tol'ko somnitel'nyj base
+                if method == "base_only":
+                    corr_vals.append(float(new_v))
+                    bad_flags.append(True)
+                    protect.append(False)
+                    methods.append("need_regression")
+                else:
+                    corr_vals.append(float(new_v))
+                    bad_flags.append(False)
+                    protect.append(True)
+                    methods.append(method)
+                    if base_v is None or abs(float(base_v) - float(new_v)) > 1e-12:
+                        corrections.append({
+                            "mid": base_mid,
+                            "number": number,
+                            "param": param,
+                            "temp": t_ref,
+                            "old": base_v,
+                            "new": float(new_v),
+                            "reason": method,
+                            "n_good": len(clean),
+                            "n_peers": len([p for p in peers if p is not None]),
+                        })
             else:
                 corr_vals.append(
                     float(base_v) if base_v is not None and np.isfinite(float(base_v)) else np.nan
