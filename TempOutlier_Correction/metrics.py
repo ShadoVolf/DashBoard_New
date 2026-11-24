@@ -61,6 +61,11 @@ def _normalize_spec(
     deg = int(deg) if (deg is not None and deg >= 1) else 3
     ta = _num(spec.get("ta"))
     tb = _num(spec.get("tb"))
+    if (ta is None) != (tb is None):
+        # odna iz granic intervala [TCH_Temp_A; TCH_Temp_B] ne zadana -
+        # berem vse temperatury (kak Make_Measure.py)
+        ta = None
+        tb = None
     return (
         t_nakl,
         deg,
