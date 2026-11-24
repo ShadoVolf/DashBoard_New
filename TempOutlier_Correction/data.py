@@ -354,6 +354,60 @@ def search_msk(partial: str, limit: int = 80) -> List[str]:
         return []
 
 
+def get_spc_for_msk(msk: str) -> Optional[str]:
+    """Первая спецификация, встречающаяся у данного MSK (для каскада после поиска)."""
+    msk = (msk or "").strip()
+    if not msk:
+        return None
+    eng = _get_engine()
+    sql = text(
+        f"SELECT Spc FROM `{_main()}` "
+        f"WHERE MSK = :msk AND Spc IS NOT NULL AND Spc != '' "
+        f"LIMIT 1"
+    )
+    try:
+        with eng.connect() as conn:
+            row = conn.execute(sql, {"msk": msk}).fetchone()
+        if row and row[0]:
+            return str(row[0]).strip()
+    except Exception as e:
+        print(f"[TOC] get_spc_for_msk: {e}", flush=True)
+    return None
+
+
+def get_type_for_spc(spc: str) -> Optional[str]:
+    """Тип резонатора по имени спецификации (если есть связь)."""
+    spc = (spc or "").strip()
+    if not spc:
+        return None
+    eng = _get_engine()
+    try:
+        # specification.Name + Type / Rtype / TypeName — пробуем типичные колонки
+        for col in ("Type", "Rtype", "TypeName", "ResonatorType"):
+            try:
+                sql = text(
+                    f"SELECT `{col}` FROM `specification` WHERE Name = :n LIMIT 1"
+                )
+                with eng.connect() as conn:
+                    row = conn.execute(sql, {"n": spc}).fetchone()
+                if row and row[0]:
+                    return str(row[0]).strip()
+            except Exception:
+                continue
+        # fallback: Type из psidata по Spc
+        sql = text(
+            f"SELECT Type FROM `{_main()}` "
+            f"WHERE Spc = :spc AND Type IS NOT NULL AND Type != '' LIMIT 1"
+        )
+        with eng.connect() as conn:
+            row = conn.execute(sql, {"spc": spc}).fetchone()
+        if row and row[0]:
+            return str(row[0]).strip()
+    except Exception as e:
+        print(f"[TOC] get_type_for_spc: {e}", flush=True)
+    return None
+
+
 def search_measure_id(partial: str, limit: int = 50) -> List[Dict[str, Any]]:
     """Poisk Measure_ID po chasti nomera ili tochnomu ID."""
     partial = (partial or "").strip()
@@ -366,7 +420,7 @@ def search_measure_id(partial: str, limit: int = 50) -> List[Dict[str, Any]]:
             sql = text(
                 f"""
                 SELECT Measure_ID,
-                       MIN(MSK) AS MSK, MIN(Date) AS Date,
+                       MIN(MSK) AS MSK, MIN(Spc) AS Spc, MIN(Date) AS Date,
                        MIN(File) AS File, COUNT(DISTINCT N) AS n_count
                 FROM `{table}`
                 WHERE Measure_ID = :mid
@@ -378,7 +432,7 @@ def search_measure_id(partial: str, limit: int = 50) -> List[Dict[str, Any]]:
             sql = text(
                 f"""
                 SELECT Measure_ID,
-                       MIN(MSK) AS MSK, MIN(Date) AS Date,
+                       MIN(MSK) AS MSK, MIN(Spc) AS Spc, MIN(Date) AS Date,
                        MIN(File) AS File, COUNT(DISTINCT N) AS n_count
                 FROM `{table}`
                 WHERE CAST(Measure_ID AS CHAR) LIKE :p

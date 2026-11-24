@@ -108,18 +108,22 @@ def _set_combo(tag: str, items: list, value: str = "") -> None:
         _log(f"combo {tag}: {e}")
 
 
-def _mid_label(r: dict) -> str:
-    """ASCII-safe label: MID | MSK | Date | Nx"""
+def _mid_label(r: dict, is_base: bool = False) -> str:
+    """ASCII-safe label: [ОСН] MID | MSK | Date | Nx"""
     mid = r.get("Measure_ID", "")
     msk = r.get("MSK") or ""
     date = r.get("Date") or ""
     n = r.get("n_count") or "?"
-    return f"{mid} | {msk} | {date} | N x {n}"
+    prefix = "[ОСН] " if is_base else ""
+    return f"{prefix}{mid} | {msk} | {date} | N x {n}"
 
 
 def _mid_from_label(label: str) -> Optional[int]:
     try:
-        return int(str(label).split("|")[0].strip())
+        s = str(label).strip()
+        if s.startswith("[ОСН]"):
+            s = s[len("[ОСН]"):].strip()
+        return int(s.split("|")[0].strip())
     except (TypeError, ValueError):
         return None
 
@@ -192,6 +196,9 @@ def _on_msk_changed(sender=None, app_data=None, user_data=None):
     spc = dpg.get_value(SPC_COMBO) if dpg.does_item_exist(SPC_COMBO) else ""
     _state["msk"] = (msk or "").strip()
     dates = toc_data.get_dates_list(msk if msk else None, spc if spc else None)
+    # Если по связке MSK+Spec дат нет (часто после поиска по части МСК) — без Spec
+    if not dates and msk and spc:
+        dates = toc_data.get_dates_list(msk, None)
     _set_combo(DATE_COMBO, dates, dates[0] if dates else "")
     _on_date_changed()
 
@@ -207,6 +214,10 @@ def _on_date_changed(sender=None, app_data=None, user_data=None):
         spc if spc else None,
         date if date else None,
     )
+    if not files and msk and (spc or date):
+        files = toc_data.get_files_list(msk, None, date if date else None)
+        if not files:
+            files = toc_data.get_files_list(msk, None, None)
     _set_combo(FILE_COMBO, files, files[0] if files else "")
     _refresh_available_mids()
 
@@ -222,6 +233,11 @@ def _refresh_available_mids():
         date=date or None,
         file=file or None,
     )
+    # Fallback: если каскад Spec/Date/File отсёк всё — только по МСК
+    if not mids and msk:
+        mids = toc_data.list_measure_ids(msk=msk or None)
+        if mids:
+            _log(f"Fallback: MID po MSK bez Spec/Date/File ({len(mids)})")
     _state["available_mids"] = mids
     labels = [_mid_label(r) for r in mids]
     if dpg.does_item_exist(MID_LIST):
@@ -234,13 +250,90 @@ def _refresh_available_mids():
 # ---------------------------------------------------------------------------
 
 def _on_msk_search(sender=None, app_data=None, user_data=None):
+    """Поиск МСК по части. Подтягиваем Spec/Type каскада под найденную МСК,
+    иначе list_measure_ids фильтрует по старому Spec → пустой список («замер не найден»)."""
+    global _suppress_cascade
     q = dpg.get_value(MSK_INPUT) if dpg.does_item_exist(MSK_INPUT) else ""
     found = toc_data.search_msk(q)
-    _set_combo(MSK_COMBO, found, found[0] if found else "")
-    if found:
-        _state["msk"] = found[0]
-        _on_msk_changed()
-    _log(f"MSK naydeno: {len(found)}")
+    if not found:
+        _set_combo(MSK_COMBO, [], "")
+        _log("MSK ne naydeny")
+        return
+
+    chosen = found[0]
+    _state["msk"] = chosen
+
+    # Спецификация и тип, реально связанные с этой МСК
+    spc_for_msk = toc_data.get_spc_for_msk(chosen)
+    rtype = toc_data.get_type_for_spc(spc_for_msk) if spc_for_msk else None
+
+    _suppress_cascade = True
+    try:
+        if rtype and dpg.does_item_exist(TYPE_COMBO):
+            types = list(dpg.get_item_configuration(TYPE_COMBO).get("items") or [])
+            if rtype not in types:
+                types = [rtype] + [t for t in types if t != rtype]
+            _set_combo(TYPE_COMBO, types, rtype)
+            specs = toc_data.get_specs_by_type(rtype)
+            if spc_for_msk and spc_for_msk not in specs:
+                specs = [spc_for_msk] + [s for s in specs if s != spc_for_msk]
+            _set_combo(SPC_COMBO, specs, spc_for_msk or (specs[0] if specs else ""))
+        elif spc_for_msk and dpg.does_item_exist(SPC_COMBO):
+            specs = list(dpg.get_item_configuration(SPC_COMBO).get("items") or [])
+            if spc_for_msk not in specs:
+                specs = [spc_for_msk] + [s for s in specs if s != spc_for_msk]
+            _set_combo(SPC_COMBO, specs, spc_for_msk)
+
+        # В комбо МСК — найденные + текущие (чтобы не потерять список поиска)
+        current_msks = list(dpg.get_item_configuration(MSK_COMBO).get("items") or []) if dpg.does_item_exist(MSK_COMBO) else []
+        merged = list(dict.fromkeys(found + current_msks))
+        _set_combo(MSK_COMBO, merged, chosen)
+    finally:
+        _suppress_cascade = False
+
+    # Даты/файлы/MID без жёсткого фильтра по Spec, если Spec не совпал
+    _refresh_after_msk_search(chosen, spc_for_msk)
+    _log(f"MSK naydeno: {len(found)}, vybrano: {chosen}")
+
+
+def _refresh_after_msk_search(msk: str, spc: Optional[str] = None):
+    """Обновить Date/File/available_mids для МСК из поиска.
+    Сначала с Spec (если есть), при пустом результате — без Spec."""
+    if _suppress_cascade:
+        return
+    msk = (msk or "").strip()
+    _state["msk"] = msk
+
+    dates = toc_data.get_dates_list(msk if msk else None, spc if spc else None)
+    if not dates and spc:
+        dates = toc_data.get_dates_list(msk if msk else None, None)
+        spc = None  # дальше без Spec
+    _set_combo(DATE_COMBO, dates, dates[0] if dates else "")
+
+    date = dates[0] if dates else ""
+    files = toc_data.get_files_list(
+        msk if msk else None,
+        spc if spc else None,
+        date if date else None,
+    )
+    if not files and (spc or date):
+        files = toc_data.get_files_list(msk if msk else None, None, None)
+    _set_combo(FILE_COMBO, files, files[0] if files else "")
+
+    mids = toc_data.list_measure_ids(
+        msk=msk or None,
+        spc=spc or None,
+        date=date or None,
+        file=(files[0] if files else None),
+    )
+    # Если с фильтрами пусто — все MID этой МСК
+    if not mids and msk:
+        mids = toc_data.list_measure_ids(msk=msk)
+    _state["available_mids"] = mids
+    labels = [_mid_label(r) for r in mids]
+    if dpg.does_item_exist(MID_LIST):
+        dpg.configure_item(MID_LIST, items=labels)
+    _log(f"Dostupno Measure_ID: {len(mids)} (MSK={msk})")
 
 
 def _on_mid_search(sender=None, app_data=None, user_data=None):
@@ -314,17 +407,47 @@ def _on_clear_selected(sender=None, app_data=None, user_data=None):
 
 def _refresh_selected_list():
     labels = []
+    base = _state.get("base_mid")
+    # если base не в списке — сбрасываем
+    if base is not None and base not in _state["selected_mids"]:
+        base = None
+        _state["base_mid"] = None
+    # если base не задан, а список не пуст — первый выбранный
+    if base is None and _state["selected_mids"]:
+        base = _state["selected_mids"][0]
+        _state["base_mid"] = base
     for mid in _state["selected_mids"]:
         r = _state["selected_meta"].get(mid) or {"Measure_ID": mid}
-        labels.append(_mid_label(r))
+        labels.append(_mid_label(r, is_base=(mid == base)))
     if dpg.does_item_exist(SELECTED_LIST):
         dpg.configure_item(SELECTED_LIST, items=labels)
-    # primary MSK for save = first selected meta
+    # primary MSK for save = meta of base (or first)
     if _state["selected_mids"]:
-        first = _state["selected_meta"].get(_state["selected_mids"][0], {})
+        src_mid = base if base is not None else _state["selected_mids"][0]
+        first = _state["selected_meta"].get(src_mid, {})
         if first.get("MSK"):
             _state["msk"] = str(first["MSK"])
-    _log(f"Vybrano zamеров: {len(_state['selected_mids'])}")
+    base_txt = f", osnovnoj MID={base}" if base is not None else ""
+    _log(f"Vybrano zamеров: {len(_state['selected_mids'])}{base_txt}")
+
+
+def _on_set_base_mid(sender=None, app_data=None, user_data=None):
+    """Отметить выбранный в списке «Выбранные» замер как основной (от него ведём отсчёт)."""
+    if not dpg.does_item_exist(SELECTED_LIST):
+        return
+    selected = dpg.get_value(SELECTED_LIST) or []
+    if isinstance(selected, str):
+        selected = [selected]
+    if not selected:
+        _log("Vyberite zamer v spiske «Vybrannye»")
+        return
+    mid = _mid_from_label(selected[0])
+    if mid is None or mid not in _state["selected_mids"]:
+        _log("Ne udalos opredelit Measure_ID")
+        return
+    _state["base_mid"] = mid
+    _refresh_selected_list()
+    _log(f"Osnovnoj zamer: MID={mid}")
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +592,11 @@ def _on_load(sender=None, app_data=None, user_data=None):
         nums = toc_data.unique_numbers(psi)
         _state["numbers"] = nums
         _state["current_number"] = nums[0] if nums else ""
-        _state["base_mid"] = mids[0]
+        # сохраняем выбранный пользователем основной замер, если он ещё в списке
+        base = _state.get("base_mid")
+        if base is None or base not in mids:
+            base = mids[0]
+            _state["base_mid"] = base
         _resolve_spec_params()
         _state["corrected_temps"] = pd.DataFrame()
         _state["corrections"] = []
@@ -478,12 +605,14 @@ def _on_load(sender=None, app_data=None, user_data=None):
         _log(f"Oshibka zagruzki: {e}")
         traceback.print_exc()
         return
+    _refresh_selected_list()
     _set_combo(NUMBER_COMBO, _state["numbers"], _state["current_number"])
     _refresh_plot()
     _refresh_summary(_state["base_mid"])
     _log(
         f"Zagruzheno: psi={len(_state['psi_df'])}, "
-        f"temp={len(_state['temps_df'])}, N={len(_state['numbers'])}"
+        f"temp={len(_state['temps_df'])}, N={len(_state['numbers'])}, "
+        f"base MID={_state['base_mid']}"
     )
 
 
@@ -545,7 +674,13 @@ def _finish_analyze_ui():
     _state["corrections"] = corrections
     _state["report"] = report
     prefer = _state.get("base_mid")
-    _state["base_mid"] = report.get("base_mid", prefer)
+    # если пользователь явно выбрал основной — не перезаписываем голосованием логики
+    if prefer is not None and prefer in (mids or []):
+        _state["base_mid"] = prefer
+        report["base_mid"] = prefer
+        report["base_mid_user_forced"] = True
+    else:
+        _state["base_mid"] = report.get("base_mid", prefer)
 
     base_mid = _state["base_mid"]
     _resolve_spec_params()
@@ -1182,9 +1317,18 @@ def create_temp_outlier_window():
                     dpg.add_button(label="Добавить", callback=_on_add_selected, width=100)
                     dpg.add_button(label="Все", callback=_on_add_all, width=60)
                 dpg.add_text("Выбранные (разные МСК допустимы)")
+                dpg.add_text(
+                    "[ОСН] — основной замер, от него ведём отсчёт",
+                    color=(140, 180, 220),
+                )
                 dpg.add_listbox([], tag=SELECTED_LIST, num_items=6, width=-1)
                 with dpg.group(horizontal=True):
-                    dpg.add_button(label="Убрать", callback=_on_remove_selected, width=100)
+                    dpg.add_button(
+                        label="Сделать основным",
+                        callback=_on_set_base_mid,
+                        width=140,
+                    )
+                    dpg.add_button(label="Убрать", callback=_on_remove_selected, width=80)
                     dpg.add_button(label="Очистить", callback=_on_clear_selected, width=80)
 
                 dpg.add_separator()

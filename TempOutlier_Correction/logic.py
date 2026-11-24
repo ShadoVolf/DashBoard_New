@@ -397,11 +397,16 @@ def build_corrected_curve_for_number(
                 if local or cross or nn or v is None:
                     bad_counts[mid] = bad_counts.get(mid, 0) + 1
 
-    ordered = sorted(
-        series_by_mid.keys(),
-        key=lambda m: (bad_counts.get(m, 10**9), 0 if m == prefer_mid else 1, m),
-    )
-    base_mid = ordered[0]
+    # Если пользователь явно указал основной замер и по нему есть данные — берём его.
+    # Иначе: меньше «плохих» точек, при равенстве — prefer_mid, затем меньший MID.
+    if prefer_mid is not None and int(prefer_mid) in series_by_mid:
+        base_mid = int(prefer_mid)
+    else:
+        ordered = sorted(
+            series_by_mid.keys(),
+            key=lambda m: (bad_counts.get(m, 10**9), 0 if m == prefer_mid else 1, m),
+        )
+        base_mid = ordered[0]
 
     all_grid: List[float] = []
     for param in params:
@@ -425,6 +430,53 @@ def build_corrected_curve_for_number(
     ]
     for c in extra_cols:
         out_df[c] = np.nan
+
+    # Параметры на одной температуре (не из OUTLIER_PARAMS):
+    # сначала из основного замера; если в точке нет значения — из любого другого,
+    # у которого есть конечное значение на этой температуре.
+    if extra_cols and out_grid:
+        base_by_t = {}
+        if "Temp" in base_src.columns:
+            for _, row in base_src.iterrows():
+                try:
+                    base_by_t[round(float(row["Temp"]), 4)] = row
+                except (TypeError, ValueError):
+                    continue
+        others_by_t: Dict[float, list] = {}
+        for mid, src in series_by_mid.items():
+            if mid == base_mid or "Temp" not in src.columns:
+                continue
+            for _, row in src.iterrows():
+                try:
+                    key = round(float(row["Temp"]), 4)
+                except (TypeError, ValueError):
+                    continue
+                others_by_t.setdefault(key, []).append(row)
+        for i, t in enumerate(out_grid):
+            key = round(float(t), 4)
+            src_row = base_by_t.get(key)
+            for c in extra_cols:
+                val = None
+                if src_row is not None and c in src_row.index:
+                    try:
+                        v = float(src_row[c])
+                        if np.isfinite(v) and v != OUTLIER_MARKER:
+                            val = v
+                    except (TypeError, ValueError):
+                        pass
+                if val is None:
+                    for alt in others_by_t.get(key, []):
+                        if c not in alt.index:
+                            continue
+                        try:
+                            v = float(alt[c])
+                            if np.isfinite(v) and v != OUTLIER_MARKER:
+                                val = v
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                if val is not None:
+                    out_df.at[i, c] = val
 
     corrections: List[Dict[str, Any]] = []
 
