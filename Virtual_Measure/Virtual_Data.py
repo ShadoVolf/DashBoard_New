@@ -556,7 +556,53 @@ def peek_next_measure_id() -> int:
 # ============================================================================
 # Создание Measure_ID
 # ============================================================================
+from sqlalchemy import Table, MetaData
+
 def create_measure_id(new_msk: str, file_name: str,
+                      operator: str, file_id: str = '') -> Optional[int]:
+    eng = _engine()
+
+    # 1. Загружаем реальные метаданные таблицы (как autoload в Save_To_mySql)
+    try:
+        tbl = Table('psi_measure_id', MetaData(), autoload_with=eng)
+    except Exception as e:
+        print(f"[Virtual] create_measure_id: table load error: {e}")
+        return None
+
+    col_names = {c.name for c in tbl.columns}
+
+    # 2. Значения; фильтруем по фактическим колонкам
+    values_full = {
+        'MSK':          new_msk,
+        'File':         file_name,
+        'Operator':     operator,
+        'Program_Type': 'VirtualMeasure',
+        'File_ID':      file_id or '',
+        'ProtokolN':    'Виртуальный',
+    }
+    values = {k: v for k, v in values_full.items() if k in col_names}
+
+    # 3. Одна ORM-вставка + inserted_primary_key в той же транзакции
+    try:
+        with eng.begin() as conn:
+            res = conn.execute(tbl.insert().values(**values))
+            pk = res.inserted_primary_key
+            if pk and pk[0] is not None:
+                new_id = int(pk[0])
+            else:
+                # fallback для драйверов без inserted_primary_key
+                new_id = int(
+                    conn.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+                )
+        if new_id <= 0:
+            print(f"[Virtual] create_measure_id: invalid id={new_id}")
+            return None
+        print(f"[Virtual] create_measure_id: ok, id={new_id}")
+        return new_id
+    except Exception as e:
+        print(f"[Virtual] create_measure_id failed: {e}")
+        return None
+def create_measure_id_1(new_msk: str, file_name: str,
                       operator: str, file_id: str = '') -> Optional[int]:
     eng = _engine()
 

@@ -11,10 +11,10 @@
     "last_param": ""
   },
   "last_used": {
-    "rtype": "Etalon",
-    "spc": "Etalon",
-    "msk": "826-88*",
-    "measure_id": "272909",
+    "rtype": "РК450",
+    "spc": "РК450-10М-144-1",
+    "msk": "23-439",
+    "measure_id": "158671",
     "only_good": false,
     "machine_type": "Saunders",
     "machine_sn": "76648"
