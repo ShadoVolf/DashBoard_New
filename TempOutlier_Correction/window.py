@@ -60,6 +60,7 @@ EDIT_CONTAINER = "toc_edit_container"
 EDIT_TABLE = "toc_edit_table"
 EXPORT_CHECK = "toc_export_check"
 SAVE_DEBUG_CHECK = "toc_save_debug_check"
+ONLY_CORR_CHECK = "toc_only_corr_check"
 
 _suppress_cascade = False
 
@@ -76,6 +77,7 @@ _state: Dict[str, Any] = {
     "numbers": [],
     "current_number": "",
     "param": "F",
+    "only_corrected": False,
     "summary": pd.DataFrame(),
     "base_mid": None,
 }
@@ -743,6 +745,7 @@ def _refresh_big_if_open():
         param,
         n,
         edit_builder=_build_edit_table,
+        only_corrected=bool(_state.get("only_corrected")),
     )
 
 
@@ -889,6 +892,31 @@ def _curves_for_current() -> Dict[str, pd.DataFrame]:
     return curves
 
 
+def _apply_only_corrected(val: bool) -> None:
+    """Rezhim 'Только corrected': skryt' vse krivye, krome skorrektirovannoj."""
+    _state["only_corrected"] = bool(val)
+    # sinhroniziruem obochezekboksy (osnovnoe okno + okno uvelicheniya)
+    big_tag = getattr(toc_graph, "ONLY_CORR_CHECK_BIG", "toc_only_corr_check_big")
+    for tag in (ONLY_CORR_CHECK, big_tag):
+        if dpg.does_item_exist(tag):
+            try:
+                dpg.set_value(tag, bool(val))
+            except Exception:
+                pass
+    _refresh_plot()
+    _refresh_big_if_open()
+
+
+def _on_only_corr_change(sender=None, app_data=None, user_data=None):
+    _apply_only_corrected(bool(dpg.get_value(ONLY_CORR_CHECK)))
+
+
+def _on_only_corr_change_big(sender=None, app_data=None, user_data=None):
+    big_tag = getattr(toc_graph, "ONLY_CORR_CHECK_BIG", "toc_only_corr_check_big")
+    val = bool(dpg.get_value(big_tag)) if dpg.does_item_exist(big_tag) else False
+    _apply_only_corrected(val)
+
+
 def _refresh_plot():
     param = dpg.get_value(PARAM_COMBO) if dpg.does_item_exist(PARAM_COMBO) else "F"
     _state["param"] = param or "F"
@@ -901,6 +929,7 @@ def _refresh_plot():
         param=_state["param"],
         height=400,
         title=f"N {_state.get('current_number') or ''}",
+        only_corrected=bool(_state.get("only_corrected")),
     )
 
 
@@ -968,6 +997,8 @@ def _on_enlarge(sender=None, app_data=None, user_data=None):
         on_prev=lambda: _shift_number(-1),
         on_next=lambda: _shift_number(1),
         edit_builder=_build_edit_table,
+        only_corrected=bool(_state.get("only_corrected")),
+        on_only_corrected=_on_only_corr_change_big,
     )
 
 
@@ -1191,6 +1222,12 @@ def create_temp_outlier_window():
                     dpg.add_button(label="<", callback=lambda: _shift_number(-1), width=28)
                     dpg.add_button(label=">", callback=lambda: _shift_number(1), width=28)
                     dpg.add_button(label="Увеличить график", callback=_on_enlarge, width=140)
+                    dpg.add_checkbox(
+                        label="Только corrected",
+                        tag=ONLY_CORR_CHECK,
+                        default_value=False,
+                        callback=_on_only_corr_change,
+                    )
 
                 dpg.add_text(
                     "Колесо мыши - смена номера. Желтая кривая - corrected. "
