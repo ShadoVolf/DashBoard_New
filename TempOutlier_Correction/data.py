@@ -423,6 +423,65 @@ def next_measure_id() -> int:
 
 
 
+def register_measure_id(
+    msk: str,
+    filename: str,
+    file_id: Optional[int] = None,
+    login: str = "toc",
+    protokol_type: Optional[str] = None,
+    program_type: str = "TempOutlier_Correction",
+) -> int:
+    """Registraciya Measure_ID srazu v tablice psi_measure_id.
+
+    Kak Save_To_mySql.insert_msk_value v Temperature_Measure: dobavlyaetsya
+    strochka v psi_measure_id i ID beretsya iz LAST_INSERT_ID(). Eto
+    isklyuchaet nalezhenie Measure_ID pri parallel'nom sohranenii
+    (v otlichie ot next_measure_id = MAX(Measure_ID)+1).
+    Kolonki zapisyvayutsya tolko esli ih real'no est' v tablice.
+    """
+    eng = _get_engine()
+    with eng.begin() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'psi_measure_id'"
+            )
+        ).fetchall()
+        cols = [str(r[0]) for r in rows]
+        if not cols:
+            raise RuntimeError("Tablica psi_measure_id nedostupna")
+
+        def real_col(name: str) -> Optional[str]:
+            for col in cols:
+                if col.upper() == name.upper():
+                    return col
+            return None
+
+        values: Dict[str, Any] = {}
+        for name, val in (
+            ("MSK", msk),
+            ("File", filename),
+            ("Program_Type", program_type),
+            ("File_ID", file_id),
+            ("Operator", login),
+            ("ProtokolN", protokol_type),
+        ):
+            real = real_col(name)
+            if real is not None and val is not None:
+                values[real] = val
+        if not values:
+            raise RuntimeError("Net dannyh dlya vstavki v psi_measure_id")
+        col_sql = ", ".join(f"`{k}`" for k in values)
+        par_sql = ", ".join(f":{k}" for k in values)
+        conn.execute(
+            text(f"INSERT INTO `psi_measure_id` ({col_sql}) VALUES ({par_sql})"),
+            values,
+        )
+        new_id = conn.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+    return int(new_id or 0)
+
+
 def _table_columns(table: str) -> list:
     """Realnye kolonki tablicy v tekushchej BDs."""
     eng = _get_engine()
@@ -473,8 +532,18 @@ def save_corrected_measure(
     if psi_rows is None or psi_rows.empty:
         raise ValueError("Net strok psidata dlya sohraneniya")
 
-    new_mid = next_measure_id()
     eng = _get_engine()
+
+    # Measure_ID registrirovan srazu v psi_measure_id (kak v
+    # Temperature_Measure), tak chto nalezhenie ID pri parallel'nom
+    # sohranenii isklyucheno. Fallback - staryj MAX(Measure_ID)+1.
+    file_label = f"TOC_corr_from_{'_'.join(str(m) for m in source_mids)}"
+    try:
+        new_mid = register_measure_id(msk=msk, filename=file_label, login=login)
+    except Exception as e:
+        print(f"[TOC] psi_measure_id registraciya ne udalas ({e}); "
+              f"fallback MAX(Measure_ID)+1", flush=True)
+        new_mid = next_measure_id()
 
     psi = psi_rows.copy()
     psi["Measure_ID"] = new_mid
@@ -503,6 +572,12 @@ def save_corrected_measure(
             df.drop(columns=drop_extra, inplace=True, errors="ignore")
 
     psi = _align_df_to_table(psi, _main())
+    # priznaki korrekcii: KO / KO_F = 1 (dannye ispravleny modulem korrekcii)
+    _ko_cols = {str(c).upper(): c for c in _table_columns(_main())}
+    for flg in ("KO", "KO_F"):
+        real = _ko_cols.get(flg)
+        if real is not None:
+            psi[real] = 1
     if not temps.empty:
         temps = _align_df_to_table(temps, _temps())
 
