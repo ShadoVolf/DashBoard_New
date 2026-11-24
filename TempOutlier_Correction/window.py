@@ -295,7 +295,7 @@ def _on_msk_search(sender=None, app_data=None, user_data=None):
 
     # Даты/файлы/MID без жёсткого фильтра по Spec, если Spec не совпал
     _refresh_after_msk_search(chosen, spc_for_msk)
-    _log(f"MSK naydeno: {len(found)}, vybrano: {chosen}")
+    _log(f"MSK найдено: {len(found)}, выбрано: {chosen}")
 
 
 def _refresh_after_msk_search(msk: str, spc: Optional[str] = None):
@@ -335,7 +335,7 @@ def _refresh_after_msk_search(msk: str, spc: Optional[str] = None):
     labels = [_mid_label(r) for r in mids]
     if dpg.does_item_exist(MID_LIST):
         dpg.configure_item(MID_LIST, items=labels)
-    _log(f"Dostupno Measure_ID: {len(mids)} (MSK={msk})")
+    _log(f"Доступно Measure_ID: {len(mids)} (MSK={msk})")
 
 
 def _on_mid_search(sender=None, app_data=None, user_data=None):
@@ -993,7 +993,7 @@ def _on_retrain(sender=None, app_data=None, user_data=None):
 def _on_recalc_metrics(sender=None, app_data=None, user_data=None):
     base = _state.get("base_mid")
     if not base:
-        _log("Net bazovogo Measure_ID")
+        _log("нет базового Measure_ID")
         return
     temps = _state.get("_temps_for_summary")
     if temps is None or (isinstance(temps, pd.DataFrame) and temps.empty):
@@ -1202,19 +1202,19 @@ def _on_save(sender=None, app_data=None, user_data=None):
     base = _state.get("base_mid")
     corr_temps = _state.get("corrected_temps")
     if not base:
-        _log("Net base MID")
+        _log("Нет основного MID")
         return
     if not msk:
         meta = _state["selected_meta"].get(base, {})
         msk = str(meta.get("MSK") or "TOC")
     if corr_temps is None or corr_temps.empty:
-        _log("Net skorrektirovannyh temperatur - snachala Analiz")
+        _log("Нет скорректированных температур - сначала Анализ")
         return
 
     psi = _state["psi_df"]
     psi_base = psi[psi["Measure_ID"] == base].copy()
     if psi_base.empty:
-        _log("Net strok psidata dlya base MID")
+        _log("нет строк  psidata для base MID")
         return
 
     # Spc name dlya norm F,R,Q,C0,Cq,L (kak Archive)
@@ -1328,48 +1328,48 @@ def create_temp_outlier_window():
                 dpg.add_combo([], tag=FILE_COMBO, width=-1, callback=_refresh_available_mids)
 
                 dpg.add_separator()
-                dpg.add_text("Poisk MSK po chasti (lyuboe imya)")
+                dpg.add_text("Поиск по части МСК")
                 with dpg.group(horizontal=True):
                     dpg.add_input_text(
                         tag=MSK_INPUT,
                         width=200,
-                        hint="chast nomera",
+                        hint="Часть номера",
                         on_enter=True,
                         callback=_on_msk_search,
                     )
-                    dpg.add_button(label="Najti", callback=_on_msk_search, width=70)
+                    dpg.add_button(label="Найти", callback=_on_msk_search, width=70)
 
-                dpg.add_text("Poisk Measure_ID / MSK / File")
+                dpg.add_text("Поиск Measure_ID / MSK / File")
                 with dpg.group(horizontal=True):
                     dpg.add_input_text(
                         tag=MID_SEARCH,
                         width=200,
-                        hint="ID ili chast",
+                        hint="ID или часть",
                         on_enter=True,
                         callback=_on_mid_search,
                     )
-                    dpg.add_button(label="Najti", callback=_on_mid_search, width=70)
+                    dpg.add_button(label="Найти", callback=_on_mid_search, width=70)
 
                 dpg.add_separator()
-                dpg.add_text("Dostupnye Measure_ID")
+                dpg.add_text("Доступные Measure_ID")
                 dpg.add_listbox([], tag=MID_LIST, num_items=7, width=-1)
                 with dpg.group(horizontal=True):
-                    dpg.add_button(label="Dobavit", callback=_on_add_selected, width=100)
-                    dpg.add_button(label="Vse", callback=_on_add_all, width=60)
-                dpg.add_text("Vybrannye (raznye MSK OK)")
+                    dpg.add_button(label="Добавить", callback=_on_add_selected, width=100)
+                    dpg.add_button(label="Все", callback=_on_add_all, width=60)
+                dpg.add_text("Выбранные данные")
                 dpg.add_text(
-                    "[BASE] = osnovnoj zamer (ot nego otschet)",
+                    "[ОСН] = основной замер",
                     color=(140, 180, 220),
                 )
                 dpg.add_listbox([], tag=SELECTED_LIST, num_items=6, width=-1)
                 with dpg.group(horizontal=True):
                     dpg.add_button(
-                        label="Sdelat base",
+                        label="Сделать основным",
                         callback=_on_set_base_mid,
                         width=120,
                     )
-                    dpg.add_button(label="Ubrat", callback=_on_remove_selected, width=70)
-                    dpg.add_button(label="Ochistit", callback=_on_clear_selected, width=80)
+                    dpg.add_button(label="Удалить", callback=_on_remove_selected, width=70)
+                    dpg.add_button(label="Очистить", callback=_on_clear_selected, width=80)
 
                 dpg.add_separator()
                 dpg.add_button(label="Настройки NN", callback=lambda: toc_settings.open_settings_window(), width=-1)
@@ -1414,8 +1414,8 @@ def create_temp_outlier_window():
                     )
 
                 dpg.add_text(
-                    "Koleso myshi - smena nomera. Zheltaya krivaya - corrected. "
-                    "Pravki tochek - v okne Uvelichit grafik.",
+                    "Колесо мышки - смена номера. Желтая кривая - Скоректированная. "
+                    "Правка точек - в окне Увеличить график.",
                     color=(140, 180, 220),
                 )
                 with dpg.group(horizontal=True):
@@ -1454,4 +1454,4 @@ def create_temp_outlier_window():
 
     _register_for_window_manager()
     _cascade_bootstrap()
-    _log("Okno gotovo. Vyberite zamery (v t.ch. s raznymi MSK).")
+    _log("Окно готово. Выберите замеры ")
