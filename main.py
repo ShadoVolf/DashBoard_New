@@ -92,14 +92,14 @@ except:
 
 # Обновление программы
 '''****************************************************************************************************************'''
-
+'''
 print("Version", get_current_version())
 update_info = check_for_updates()
 print(update_info)
 if update_info:
     url, expected_md5 = update_info
     start_updater(url, expected_md5)
-
+'''
 '''******************************************************************************************************************'''
 
 dpg.create_viewport(title='MORION RESONATORS', width=monitors[0].width, height=monitors[0].height, x_pos=0, y_pos=0)
