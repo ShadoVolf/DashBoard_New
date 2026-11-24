@@ -507,10 +507,14 @@ def save_corrected_measure(
         temps = _align_df_to_table(temps, _temps())
 
     with eng.begin() as conn:
-        psi.to_sql(_main(), con=conn, if_exists="append", index=False, method="multi")
+        psi.to_sql(
+            _main(), con=conn, if_exists="append", index=False,
+            method="multi", chunksize=500,
+        )
         if not temps.empty:
             temps.to_sql(
-                _temps(), con=conn, if_exists="append", index=False, method="multi"
+                _temps(), con=conn, if_exists="append", index=False,
+                method="multi", chunksize=500,
             )
         try:
             conn.execute(

@@ -16,6 +16,8 @@ import pandas as pd
 
 from .constants import MAD_K, OUTLIER_MARKER, OUTLIER_PARAMS
 
+from . import learning as toc_learning
+
 ProgressCb = Optional[Callable[[float, str], None]]
 
 _ABS_FLOOR = {
@@ -217,6 +219,7 @@ def _align_grid(
     series_by_mid: Dict[int, pd.DataFrame],
     param: str,
     temp_tol: float = 0.51,
+    extra_bad: Optional[Dict[int, set]] = None,
 ) -> Tuple[List[float], Dict[int, List[Optional[float]]], Dict[int, List[bool]]]:
     all_t: List[float] = []
     for df in series_by_mid.values():
@@ -268,8 +271,14 @@ def _align_grid(
                     best_i = idx
             if best_i is not None and best_d <= temp_tol:
                 used.add(best_i)
-                vals.append(best)
-                wflags.append(bool(wbad[best_i]))
+                # tocki "sboya stenda" udalayutsya so vseh krivyh zamera
+                eb = (extra_bad or {}).get(mid) or set()
+                if eb and round(float(temps[best_i]), 2) in eb:
+                    vals.append(None)
+                    wflags.append(True)
+                else:
+                    vals.append(best)
+                    wflags.append(bool(wbad[best_i]))
             else:
                 vals.append(None)
                 wflags.append(True)
@@ -358,6 +367,7 @@ def build_corrected_curve_for_number(
     prefer_mid: Optional[int] = None,
     degree: int = 2,
     nn_options: Optional[Dict[str, bool]] = None,
+    extra_bad: Optional[Dict[str, Dict[int, set]]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], int]:
     mids = [int(m) for m in selected_mids]
     series_by_mid: Dict[int, pd.DataFrame] = {}
@@ -372,7 +382,10 @@ def build_corrected_curve_for_number(
     aligned_all: Dict[str, Any] = {}
 
     for param in params:
-        grid, aligned, within_bad = _align_grid(series_by_mid, param)
+        eb_mid = (extra_bad or {}).get(param, {})
+        grid, aligned, within_bad = _align_grid(
+            series_by_mid, param, extra_bad=eb_mid or None
+        )
         nn_scores = _nn_outlier_scores(grid, aligned, nn_options, param=param)
         aligned_all[param] = (grid, aligned, within_bad, nn_scores)
         for mid in series_by_mid:
@@ -496,8 +509,27 @@ def build_corrected_curve_for_number(
         protect_mask = np.asarray(protect, dtype=bool)
 
         if bad_mask.any():
-            fixed = regression_replace(temps_arr, vals_arr, bad_mask, degree=deg)
+            # TCN/seq2seq vosstanovlenie probelov vmesto poly-zapolneniya;
+            # bez modeli - interpolyaciya zamenyaet regression_replace.
+            use_tcn = bool(nn_options and nn_options.get("use_tcn_restore"))
+            fixed = None
+            reason = f"poly{deg}_fill"
+            if use_tcn:
+                try:
+                    fixed = toc_learning.tcn_restore_curve(
+                        vals_arr, bad_mask, param=param
+                    )
+                    if fixed is not None:
+                        reason = "tcn_restore"
+                except Exception as e:
+                    print(f"[TOC] tcn_restore failed: {e}", flush=True)
+                    fixed = None
+            if fixed is None:
+                fixed = regression_replace(temps_arr, vals_arr, bad_mask, degree=deg)
+                reason = f"poly{deg}_fill"
             for i in np.where(bad_mask)[0]:
+                if not np.isfinite(float(fixed[i])):
+                    continue
                 corrections.append({
                     "mid": base_mid,
                     "number": number,
@@ -505,10 +537,10 @@ def build_corrected_curve_for_number(
                     "temp": float(out_grid[i]),
                     "old": float(vals_arr[i]) if np.isfinite(vals_arr[i]) else None,
                     "new": float(fixed[i]),
-                    "reason": f"poly{deg}_fill",
+                    "reason": reason,
                 })
                 corr_vals[i] = float(fixed[i])
-                methods[i] = f"poly{deg}_fill"
+                methods[i] = reason
             vals_arr = np.asarray(corr_vals, dtype=float)
 
         # Sglazhivanie dlya F (poly3) - vsya krivaya
@@ -591,6 +623,131 @@ def detect_global_temp_failures(
     return failures
 
 
+def classify_temp_failures(
+    temps_df: pd.DataFrame,
+    measure_id: int,
+    params: Sequence[str] = OUTLIER_PARAMS,
+    min_fraction: float = 0.7,
+    sign_fraction: float = 0.8,
+    min_noise_numbers: int = 3,
+) -> List[Dict[str, Any]]:
+    """
+    Klassifikaciya sboev po patternu vseh N na odnoj T:
+      - "stand" (sboy stenda): na temperature T zametnoe otklonenie Odnogo
+        napravleniya vosproizvoditsya u >= min_fraction vseh N - takie T
+        udalayutsya so VSEH krivyh zamera i vosstanavlivayutsya model'yu;
+      - "noise" (shum): razbroshennye plohie tochki po mnogim N bez obshej T;
+      - "single" (edinichnyj rezonator): vybrosy lokalizovany v odnom N.
+    """
+    if temps_df is None or temps_df.empty:
+        return []
+    df = temps_df[temps_df["Measure_ID"] == measure_id].copy()
+    if df.empty:
+        return []
+    numbers = sorted(
+        df["N"].astype(str).str.strip().str.upper().unique().tolist()
+    )
+    n_total = len(numbers)
+    if n_total < 3:
+        return []
+    result: List[Dict[str, Any]] = []
+
+    for param in params:
+        if param not in df.columns:
+            continue
+        scatter: Dict[str, set] = {}
+        bad_gate: Dict[float, Dict[str, bool]] = {}
+        sign_gate: Dict[float, Dict[str, float]] = {}
+        for n in numbers:
+            sub = (
+                df[df["N"].astype(str).str.strip().str.upper() == str(n)]
+                .sort_values("Temp")
+            )
+            pts = [
+                (_safe_float(t), _safe_float(v))
+                for t, v in zip(sub["Temp"].tolist(), sub[param].tolist())
+            ]
+            pts = [
+                (t, v) for t, v in pts
+                if t is not None and v is not None
+                and np.isfinite(t) and np.isfinite(v)
+            ]
+            if len(pts) < 3:
+                continue
+            temps_arr = np.asarray([p[0] for p in pts], dtype=float)
+            vals_arr = np.asarray([p[1] for p in pts], dtype=float)
+            mine = set()
+            # svoi vybrosy: MAD + sosednij test (kak _within_curve_bad_mask)
+            mask_in = np.where(np.isfinite(vals_arr), vals_arr, OUTLIER_MARKER)
+            wbad = _within_curve_bad_mask(temps_arr, mask_in)
+            for i, wb in enumerate(wbad):
+                if wb:
+                    mine.add(round(float(temps_arr[i]), 2))
+            if mine:
+                scatter.setdefault(str(n), set()).update(mine)
+            # otkloneniya ot sosedej - potencialnyj "stand"
+            for i in range(1, len(pts) - 1):
+                pred = 0.5 * (vals_arr[i - 1] + vals_arr[i + 1])
+                if not np.isfinite(pred):
+                    continue
+                spread = abs(vals_arr[i - 1] - vals_arr[i + 1])
+                r = float(vals_arr[i] - pred)
+                t_r = round(float(temps_arr[i]), 2)
+                bad_gate.setdefault(t_r, {})[str(n)] = abs(r) > max(
+                    3.0 * spread, abs(pred) * 0.02 + 1e-6
+                )
+                sign_gate.setdefault(t_r, {})[str(n)] = 1.0 if r >= 0 else -1.0
+
+        stand: set = set()
+        for t_r, bgate in bad_gate.items():
+            bad_ns = [k for k, ok in bgate.items() if ok]
+            need = max(2, int(round(min_fraction * n_total)))
+            if len(bad_ns) < need:
+                continue
+            sgn = sign_gate.get(t_r, {})
+            pos = sum(1 for k in bad_ns if sgn.get(k, 0.0) > 0)
+            neg = len(bad_ns) - pos
+            dominant = max(pos, neg)
+            if len(bad_ns) and (dominant / len(bad_ns)) >= sign_fraction:
+                stand.add(t_r)
+                result.append({
+                    "mid": measure_id,
+                    "param": param,
+                    "temp": float(t_r),
+                    "class": "stand",
+                    "affected": len(bad_ns),
+                    "total": n_total,
+                    "reason": "global_temp_failure",
+                })
+
+        all_scatter = {
+            n: (s - stand) for n, s in scatter.items() if (s - stand)
+        }
+        if len(all_scatter) >= min_noise_numbers:
+            total_bad = sum(len(s) for s in all_scatter.values())
+            result.append({
+                "mid": measure_id,
+                "param": param,
+                "class": "noise",
+                "affected": len(all_scatter),
+                "total": n_total,
+                "bad_points": total_bad,
+                "reason": "noise_pattern",
+            })
+        elif len(all_scatter) == 1:
+            for n, s in all_scatter.items():
+                for t_r in sorted(s):
+                    result.append({
+                        "mid": measure_id,
+                        "param": param,
+                        "number": n,
+                        "temp": float(t_r),
+                        "class": "single",
+                        "reason": "single_resonator",
+                    })
+    return result
+
+
 def build_corrected_temps(
     temps_df: pd.DataFrame,
     selected_mids: Sequence[int],
@@ -628,9 +785,21 @@ def build_corrected_temps(
     report: Dict[str, Any] = {"per_number": {}, "global": [], "base_mid": None}
     base_votes: List[int] = []
 
-    for mid in selected_mids:
-        gfs = detect_global_temp_failures(temps_df, mid, params=params)
-        report["global"].extend(gfs)
+    # klassifikaciya sboev: stand-temperatury udalayutsya so vseh krivyh zamera
+    extra_bad: Dict[str, Dict[int, set]] = {}
+    if nn_options and nn_options.get("use_failure_classifier"):
+        for mid in selected_mids:
+            entries = classify_temp_failures(temps_df, mid, params=params)
+            report["global"].extend(entries)
+            for e in entries:
+                if e.get("class") == "stand":
+                    extra_bad.setdefault(e["param"], {}).setdefault(
+                        int(mid), set()
+                    ).add(round(float(e["temp"]), 2))
+    else:
+        for mid in selected_mids:
+            gfs = detect_global_temp_failures(temps_df, mid, params=params)
+            report["global"].extend(gfs)
 
     n_total = max(len(numbers), 1)
     for k, n in enumerate(numbers):
@@ -642,6 +811,7 @@ def build_corrected_temps(
             params=params,
             prefer_mid=prefer_mid,
             nn_options=nn_options,
+            extra_bad=extra_bad or None,
         )
         if not part.empty:
             parts.append(part)
