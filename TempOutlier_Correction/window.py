@@ -109,20 +109,22 @@ def _set_combo(tag: str, items: list, value: str = "") -> None:
 
 
 def _mid_label(r: dict, is_base: bool = False) -> str:
-    """ASCII-safe label: [ОСН] MID | MSK | Date | Nx"""
+    """ASCII-safe label: [BASE] MID | MSK | Date | Nx"""
     mid = r.get("Measure_ID", "")
     msk = r.get("MSK") or ""
     date = r.get("Date") or ""
     n = r.get("n_count") or "?"
-    prefix = "[ОСН] " if is_base else ""
+    prefix = "[BASE] " if is_base else ""
     return f"{prefix}{mid} | {msk} | {date} | N x {n}"
 
 
 def _mid_from_label(label: str) -> Optional[int]:
     try:
         s = str(label).strip()
-        if s.startswith("[ОСН]"):
-            s = s[len("[ОСН]"):].strip()
+        for pfx in ("[BASE]", "[OCH]", "[OSN]", "[ОСН]"):
+            if s.startswith(pfx):
+                s = s[len(pfx) :].strip()
+                break
         return int(s.split("|")[0].strip())
     except (TypeError, ValueError):
         return None
@@ -432,14 +434,14 @@ def _refresh_selected_list():
 
 
 def _on_set_base_mid(sender=None, app_data=None, user_data=None):
-    """Отметить выбранный в списке «Выбранные» замер как основной (от него ведём отсчёт)."""
+    """Otmetit vybrannyj v spiske Vybrannye zamer kak osnovnoj (base)."""
     if not dpg.does_item_exist(SELECTED_LIST):
         return
     selected = dpg.get_value(SELECTED_LIST) or []
     if isinstance(selected, str):
         selected = [selected]
     if not selected:
-        _log("Vyberite zamer v spiske «Vybrannye»")
+        _log("Vyberite zamer v spiske Vybrannye")
         return
     mid = _mid_from_label(selected[0])
     if mid is None or mid not in _state["selected_mids"]:
@@ -447,7 +449,7 @@ def _on_set_base_mid(sender=None, app_data=None, user_data=None):
         return
     _state["base_mid"] = mid
     _refresh_selected_list()
-    _log(f"Osnovnoj zamer: MID={mid}")
+    _log(f"Base measure: MID={mid}")
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +646,13 @@ def _on_analyze(sender=None, app_data=None, user_data=None):
             def _prog(pct, msg):
                 _update_progress(pct, msg)
 
+            spc_name = ""
+            try:
+                if dpg.does_item_exist(SPC_COMBO):
+                    spc_name = (dpg.get_value(SPC_COMBO) or "").strip()
+            except Exception:
+                pass
+            limits = toc_data.load_spc_param_limits(spc_name) if spc_name else {}
             corrected, corrections, report = toc_logic.build_corrected_temps(
                 temps_df,
                 mids,
@@ -651,6 +660,7 @@ def _on_analyze(sender=None, app_data=None, user_data=None):
                 prefer_mid=prefer,
                 progress=_prog,
                 nn_options=nn_opts,
+                spec_limits=limits,
             )
             _state["_worker_result"] = (corrected, corrections, report, mids)
             _progress_q.put(("result", 100.0, ""))
@@ -1207,6 +1217,24 @@ def _on_save(sender=None, app_data=None, user_data=None):
         _log("Net strok psidata dlya base MID")
         return
 
+    # Spc name dlya norm F,R,Q,C0,Cq,L (kak Archive)
+    spc_name = ""
+    if dpg.does_item_exist(SPC_COMBO):
+        spc_name = (dpg.get_value(SPC_COMBO) or "").strip()
+    if not spc_name and "Spc" in psi_base.columns:
+        vals = psi_base["Spc"].dropna().astype(str).str.strip()
+        if not vals.empty:
+            spc_name = str(vals.iloc[0])
+
+    # Parametry F,R,Q,C0,Cq,L: s zamera gde v norme, inache s base
+    psi_base = toc_data.apply_in_spec_params_to_psi(
+        psi_base,
+        psi,
+        _state["selected_mids"],
+        int(base),
+        spc_name or None,
+    )
+
     temps_for_metrics = corr_temps.copy()
     temps_for_metrics["Measure_ID"] = base
     psi_upd = toc_metrics.apply_metrics_to_psidata(
@@ -1300,36 +1328,48 @@ def create_temp_outlier_window():
                 dpg.add_combo([], tag=FILE_COMBO, width=-1, callback=_refresh_available_mids)
 
                 dpg.add_separator()
-                dpg.add_text("Поиск МСК по части (любое имя)")
+                dpg.add_text("Poisk MSK po chasti (lyuboe imya)")
                 with dpg.group(horizontal=True):
-                    dpg.add_input_text(tag=MSK_INPUT, width=200, hint="часть номера")
-                    dpg.add_button(label="Найти", callback=_on_msk_search, width=70)
+                    dpg.add_input_text(
+                        tag=MSK_INPUT,
+                        width=200,
+                        hint="chast nomera",
+                        on_enter=True,
+                        callback=_on_msk_search,
+                    )
+                    dpg.add_button(label="Najti", callback=_on_msk_search, width=70)
 
-                dpg.add_text("Поиск Measure_ID / МСК / File")
+                dpg.add_text("Poisk Measure_ID / MSK / File")
                 with dpg.group(horizontal=True):
-                    dpg.add_input_text(tag=MID_SEARCH, width=200, hint="ID или часть")
-                    dpg.add_button(label="Найти", callback=_on_mid_search, width=70)
+                    dpg.add_input_text(
+                        tag=MID_SEARCH,
+                        width=200,
+                        hint="ID ili chast",
+                        on_enter=True,
+                        callback=_on_mid_search,
+                    )
+                    dpg.add_button(label="Najti", callback=_on_mid_search, width=70)
 
                 dpg.add_separator()
-                dpg.add_text("Доступные Measure_ID")
+                dpg.add_text("Dostupnye Measure_ID")
                 dpg.add_listbox([], tag=MID_LIST, num_items=7, width=-1)
                 with dpg.group(horizontal=True):
-                    dpg.add_button(label="Добавить", callback=_on_add_selected, width=100)
-                    dpg.add_button(label="Все", callback=_on_add_all, width=60)
-                dpg.add_text("Выбранные (разные МСК допустимы)")
+                    dpg.add_button(label="Dobavit", callback=_on_add_selected, width=100)
+                    dpg.add_button(label="Vse", callback=_on_add_all, width=60)
+                dpg.add_text("Vybrannye (raznye MSK OK)")
                 dpg.add_text(
-                    "[ОСН] — основной замер, от него ведём отсчёт",
+                    "[BASE] = osnovnoj zamer (ot nego otschet)",
                     color=(140, 180, 220),
                 )
                 dpg.add_listbox([], tag=SELECTED_LIST, num_items=6, width=-1)
                 with dpg.group(horizontal=True):
                     dpg.add_button(
-                        label="Сделать основным",
+                        label="Sdelat base",
                         callback=_on_set_base_mid,
-                        width=140,
+                        width=120,
                     )
-                    dpg.add_button(label="Убрать", callback=_on_remove_selected, width=80)
-                    dpg.add_button(label="Очистить", callback=_on_clear_selected, width=80)
+                    dpg.add_button(label="Ubrat", callback=_on_remove_selected, width=70)
+                    dpg.add_button(label="Ochistit", callback=_on_clear_selected, width=80)
 
                 dpg.add_separator()
                 dpg.add_button(label="Настройки NN", callback=lambda: toc_settings.open_settings_window(), width=-1)
@@ -1374,8 +1414,8 @@ def create_temp_outlier_window():
                     )
 
                 dpg.add_text(
-                    "Колесо мыши - смена номера. Желтая кривая - corrected. "
-                    "Правки точек - в окне «Увеличить график».",
+                    "Koleso myshi - smena nomera. Zheltaya krivaya - corrected. "
+                    "Pravki tochek - v okne Uvelichit grafik.",
                     color=(140, 180, 220),
                 )
                 with dpg.group(horizontal=True):

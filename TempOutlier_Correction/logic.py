@@ -431,45 +431,67 @@ def build_corrected_curve_for_number(
     for c in extra_cols:
         out_df[c] = np.nan
 
-    # Параметры на одной температуре (не из OUTLIER_PARAMS):
-    # сначала из основного замера; если в точке нет значения — из любого другого,
-    # у которого есть конечное значение на этой температуре.
+    # Parametry na odnoj temperature (ne OUTLIER_PARAMS F/R):
+    # 1) s zamera gde znachenie v norme specifikacii (esli limity est)
+    # 2) inache s osnovnogo
+    # 3) inache s lyubogo drugogo gde est konechnoe znachenie
     if extra_cols and out_grid:
-        base_by_t = {}
-        if "Temp" in base_src.columns:
-            for _, row in base_src.iterrows():
-                try:
-                    base_by_t[round(float(row["Temp"]), 4)] = row
-                except (TypeError, ValueError):
-                    continue
-        others_by_t: Dict[float, list] = {}
+        from .data import value_in_spec
+
+        limits_map = getattr(
+            build_corrected_curve_for_number, "_spec_limits", None
+        ) or {}
+        rows_by_mid_t: Dict[int, Dict[float, Any]] = {}
         for mid, src in series_by_mid.items():
-            if mid == base_mid or "Temp" not in src.columns:
+            if "Temp" not in src.columns:
                 continue
+            bucket: Dict[float, Any] = {}
             for _, row in src.iterrows():
                 try:
-                    key = round(float(row["Temp"]), 4)
+                    bucket[round(float(row["Temp"]), 4)] = row
                 except (TypeError, ValueError):
                     continue
-                others_by_t.setdefault(key, []).append(row)
+            rows_by_mid_t[mid] = bucket
+
         for i, t in enumerate(out_grid):
             key = round(float(t), 4)
-            src_row = base_by_t.get(key)
             for c in extra_cols:
                 val = None
-                if src_row is not None and c in src_row.index:
-                    try:
-                        v = float(src_row[c])
-                        if np.isfinite(v) and v != OUTLIER_MARKER:
-                            val = v
-                    except (TypeError, ValueError):
-                        pass
-                if val is None:
-                    for alt in others_by_t.get(key, []):
-                        if c not in alt.index:
+                lim = limits_map.get(c) or limits_map.get(str(c).upper())
+                if lim:
+                    for mid, bucket in rows_by_mid_t.items():
+                        row = bucket.get(key)
+                        if row is None or c not in row.index:
                             continue
                         try:
-                            v = float(alt[c])
+                            v = float(row[c])
+                        except (TypeError, ValueError):
+                            continue
+                        if (
+                            np.isfinite(v)
+                            and v != OUTLIER_MARKER
+                            and value_in_spec(v, lim)
+                        ):
+                            val = v
+                            break
+                if val is None:
+                    row = rows_by_mid_t.get(base_mid, {}).get(key)
+                    if row is not None and c in row.index:
+                        try:
+                            v = float(row[c])
+                            if np.isfinite(v) and v != OUTLIER_MARKER:
+                                val = v
+                        except (TypeError, ValueError):
+                            pass
+                if val is None:
+                    for mid, bucket in rows_by_mid_t.items():
+                        if mid == base_mid:
+                            continue
+                        row = bucket.get(key)
+                        if row is None or c not in row.index:
+                            continue
+                        try:
+                            v = float(row[c])
                             if np.isfinite(v) and v != OUTLIER_MARKER:
                                 val = v
                                 break
@@ -807,10 +829,13 @@ def build_corrected_temps(
     prefer_mid: Optional[int] = None,
     progress: ProgressCb = None,
     nn_options: Optional[Dict[str, bool]] = None,
+    spec_limits: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], Dict[str, Any]]:
     selected_mids = list(selected_mids)
     if not selected_mids:
         return pd.DataFrame(), [], {}
+    # limits for extra-col pick (Q, C0, Cq, L, ...)
+    build_corrected_curve_for_number._spec_limits = dict(spec_limits or {})  # type: ignore[attr-defined]
 
     def _p(pct: float, msg: str) -> None:
         if progress:

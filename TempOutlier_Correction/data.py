@@ -382,7 +382,7 @@ def get_type_for_spc(spc: str) -> Optional[str]:
         return None
     eng = _get_engine()
     try:
-        # specification.Name + Type / Rtype / TypeName — пробуем типичные колонки
+        # specification.Name + Type / Rtype / TypeName - tipichnye kolonki
         for col in ("Type", "Rtype", "TypeName", "ResonatorType"):
             try:
                 sql = text(
@@ -394,7 +394,7 @@ def get_type_for_spc(spc: str) -> Optional[str]:
                     return str(row[0]).strip()
             except Exception:
                 continue
-        # fallback: Type из psidata по Spc
+        # fallback: Type iz psidata po Spc
         sql = text(
             f"SELECT Type FROM `{_main()}` "
             f"WHERE Spc = :spc AND Type IS NOT NULL AND Type != '' LIMIT 1"
@@ -406,6 +406,245 @@ def get_type_for_spc(spc: str) -> Optional[str]:
     except Exception as e:
         print(f"[TOC] get_type_for_spc: {e}", flush=True)
     return None
+
+
+# Parametry, po kotorym berem znacheniya s zamera "v norme" (kak Archive)
+SPEC_PICK_PARAMS = ("F", "R", "Q", "C0", "Cq", "L")
+
+
+def _safe_float_spc(v) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, str):
+        s = v.strip()
+        if not s or s.lower() == "no":
+            return None
+        try:
+            return float(s.replace(",", "."))
+        except (ValueError, TypeError):
+            return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_specification_row(spc_name: str) -> Optional[Dict[str, Any]]:
+    """Stroka specification po Name (kak Archive_View.load_specification)."""
+    spc_name = (spc_name or "").strip()
+    if not spc_name:
+        return None
+    eng = _get_engine()
+    try:
+        df = pd.read_sql(
+            text("SELECT * FROM `specification` WHERE Name = :n LIMIT 1"),
+            eng,
+            params={"n": spc_name},
+        )
+        if df.empty:
+            return None
+        return df.iloc[0].to_dict()
+    except Exception as e:
+        print(f"[TOC] load_specification_row: {e}", flush=True)
+        return None
+
+
+def load_spc_param_limits(
+    spc_name: str,
+    params: Sequence[str] = SPEC_PICK_PARAMS,
+) -> Dict[str, Dict[str, Optional[float]]]:
+    """Min/Max dlya parametrov F,R,Q,C0,Cq,L iz specification + spc_map_table.
+
+    Logika Use/Max/Min kak v Archive_View.load_spc_map_for_archive:
+    spc_map_table.Use / Max / Min - imena kolonok v specification.
+    Esli parametra net v karte ili Use!=1 - ego net v resultate.
+    """
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    row = load_specification_row(spc_name)
+    if not row:
+        return out
+    eng = _get_engine()
+    try:
+        spc_map = pd.read_sql(
+            text("SELECT * FROM `spc_map_table` ORDER BY ID"), eng
+        )
+    except Exception as e:
+        print(f"[TOC] load_spc_param_limits map: {e}", flush=True)
+        return out
+
+    want = {str(p).strip().upper() for p in params}
+    # aliasy Parameter_Name -> nash kod
+    aliases = {
+        "F": "F", "R": "R", "Q": "Q",
+        "C0": "C0", "Cq": "Cq", "CQ": "Cq", "L": "L",
+    }
+
+    for _, mr in spc_map.iterrows():
+        pname = str(mr.get("Parameter_Name") or mr.get("Parameter") or "").strip()
+        if not pname:
+            continue
+        key = aliases.get(pname) or aliases.get(pname.upper())
+        if key is None:
+            # pryamoe sovpadenie s nashim spiskom
+            if pname.upper() in want:
+                key = pname.upper() if pname.upper() != "CQ" else "Cq"
+            else:
+                continue
+        if key.upper() not in want and key not in params:
+            continue
+
+        use_col = mr.get("Use")
+        use_val = 0
+        if use_col is not None and str(use_col).strip() not in ("", "nan"):
+            # Use - imya kolonki specification ili litera 1
+            if str(use_col).strip() in ("1", "0"):
+                use_val = int(str(use_col).strip())
+            else:
+                use_val = int(_safe_float_spc(row.get(str(use_col))) or 0)
+        if use_val != 1:
+            continue
+
+        max_col = mr.get("Max")
+        min_col = mr.get("Min")
+        mx = _safe_float_spc(row.get(str(max_col))) if max_col is not None else None
+        mn = _safe_float_spc(row.get(str(min_col))) if min_col is not None else None
+        # esli Max/Min - literaly chisel v mape
+        if mx is None:
+            mx = _safe_float_spc(max_col)
+        if mn is None:
+            mn = _safe_float_spc(min_col)
+        if mx is None and mn is None:
+            continue
+        out[key] = {"min": mn, "max": mx}
+
+    # pryamye kolonki F_min/F_max i t.p. esli map pust
+    if not out:
+        for p in params:
+            mn = _safe_float_spc(row.get(f"{p}_min") or row.get(f"{p}min") or row.get(f"Min_{p}"))
+            mx = _safe_float_spc(row.get(f"{p}_max") or row.get(f"{p}max") or row.get(f"Max_{p}"))
+            if mn is not None or mx is not None:
+                out[p] = {"min": mn, "max": mx}
+    return out
+
+
+def value_in_spec(
+    value: Any,
+    limits: Optional[Dict[str, Optional[float]]],
+) -> bool:
+    """True esli value v [min; max] (otsutstvuyushchaya granica - ne proveryaetsya)."""
+    if not limits:
+        return False
+    v = _safe_float_spc(value)
+    if v is None:
+        return False
+    mn = limits.get("min")
+    mx = limits.get("max")
+    if mn is not None and v < mn:
+        return False
+    if mx is not None and v > mx:
+        return False
+    return True
+
+
+def pick_params_from_measurements(
+    psi_df: pd.DataFrame,
+    measure_ids: Sequence[int],
+    number: str,
+    base_mid: int,
+    limits: Dict[str, Dict[str, Optional[float]]],
+    params: Sequence[str] = SPEC_PICK_PARAMS,
+) -> Dict[str, Any]:
+    """Dlya kazhdogo parametra: znachenie s zamera, gde ono v norme;
+    esli takogo net - s osnovnogo (base_mid).
+
+    Beretsya lyuboj zamer, gde param v [Min;Max]. Neskolko - pervyj podhodyashchij.
+    """
+    result: Dict[str, Any] = {}
+    if psi_df is None or psi_df.empty or not measure_ids:
+        return result
+    n = str(number or "").strip().upper()
+    sub = psi_df.copy()
+    if "Measure_ID" in sub.columns:
+        sub = sub[sub["Measure_ID"].isin([int(m) for m in measure_ids])]
+    if "N" in sub.columns and n:
+        sub = sub[sub["N"].astype(str).str.strip().str.upper() == n]
+    if sub.empty:
+        return result
+
+    by_mid: Dict[int, pd.Series] = {}
+    for mid, g in sub.groupby("Measure_ID"):
+        by_mid[int(mid)] = g.iloc[0]
+
+    base_row = by_mid.get(int(base_mid))
+    for param in params:
+        col = None
+        for c in sub.columns:
+            if str(c).strip() == param or str(c).strip().upper() == param.upper():
+                col = c
+                break
+        if col is None:
+            continue
+        lim = limits.get(param) or limits.get(param.upper())
+        chosen = None
+        chosen_mid = None
+        if lim:
+            for mid, row in by_mid.items():
+                val = row.get(col)
+                if value_in_spec(val, lim):
+                    chosen = val
+                    chosen_mid = mid
+                    break
+        if chosen is None and base_row is not None:
+            chosen = base_row.get(col)
+            chosen_mid = int(base_mid)
+        if chosen is not None:
+            result[param] = {
+                "value": chosen,
+                "mid": chosen_mid,
+                "in_spec": bool(lim and value_in_spec(chosen, lim)),
+            }
+    return result
+
+
+def apply_in_spec_params_to_psi(
+    psi_base: pd.DataFrame,
+    psi_all: pd.DataFrame,
+    selected_mids: Sequence[int],
+    base_mid: int,
+    spc_name: Optional[str],
+    params: Sequence[str] = SPEC_PICK_PARAMS,
+) -> pd.DataFrame:
+    """Podstavit v psi_base (stroki osnovnogo zamera) parametry F,R,Q,C0,Cq,L
+    s zamera, gde oni v norme (inache ostavit s base).
+    """
+    if psi_base is None or psi_base.empty:
+        return psi_base
+    limits = load_spc_param_limits(spc_name or "", params=params) if spc_name else {}
+    out = psi_base.copy()
+    if "N" not in out.columns:
+        return out
+    for idx, row in out.iterrows():
+        n = str(row.get("N") or "").strip().upper()
+        if not n:
+            continue
+        picked = pick_params_from_measurements(
+            psi_all, selected_mids, n, int(base_mid), limits, params=params
+        )
+        for param, info in picked.items():
+            if param in out.columns:
+                out.at[idx, param] = info["value"]
+            else:
+                # popytka case-insensitive
+                for c in out.columns:
+                    if str(c).strip().upper() == param.upper():
+                        out.at[idx, c] = info["value"]
+                        break
+    return out
 
 
 def search_measure_id(partial: str, limit: int = 50) -> List[Dict[str, Any]]:
