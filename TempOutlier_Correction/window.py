@@ -1241,6 +1241,17 @@ def _on_save(sender=None, app_data=None, user_data=None):
         psi_base, temps_for_metrics, base, spec=_state.get("spec_params") or None
     )
 
+    # File osnovnogo zamera -> "<File> (TOC)"
+    base_file = ""
+    meta = _state.get("selected_meta", {}).get(base) or {}
+    if meta.get("File"):
+        base_file = str(meta.get("File") or "").strip()
+    if not base_file and "File" in psi_base.columns:
+        vals = psi_base["File"].dropna().astype(str).str.strip()
+        vals = vals[vals != ""]
+        if not vals.empty:
+            base_file = str(vals.iloc[0])
+
     try:
         new_mid = toc_data.save_corrected_measure(
             psi_upd,
@@ -1248,8 +1259,10 @@ def _on_save(sender=None, app_data=None, user_data=None):
             msk=msk,
             source_mids=_state["selected_mids"],
             login="toc",
+            base_file=base_file or None,
         )
-        _log(f"Sohraneno kak Measure_ID={new_mid}")
+        file_shown = toc_data._make_toc_filename(base_file, _state["selected_mids"])
+        _log(f"Sohraneno Measure_ID={new_mid}, File={file_shown}")
     except Exception as e:
         _log(f"Oshibka sohraneniya: {e}")
         traceback.print_exc()
@@ -1358,7 +1371,7 @@ def create_temp_outlier_window():
                     dpg.add_button(label="Все", callback=_on_add_all, width=60)
                 dpg.add_text("Выбранные данные")
                 dpg.add_text(
-                    "[ОСН] = основной замер",
+                    "[BASE] = основной замер",
                     color=(140, 180, 220),
                 )
                 dpg.add_listbox([], tag=SELECTED_LIST, num_items=6, width=-1)
@@ -1366,7 +1379,7 @@ def create_temp_outlier_window():
                     dpg.add_button(
                         label="Сделать основным",
                         callback=_on_set_base_mid,
-                        width=120,
+                        width=140,
                     )
                     dpg.add_button(label="Удалить", callback=_on_remove_selected, width=70)
                     dpg.add_button(label="Очистить", callback=_on_clear_selected, width=80)

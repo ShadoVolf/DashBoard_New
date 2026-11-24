@@ -860,22 +860,49 @@ def _align_df_to_table(df: pd.DataFrame, table: str) -> pd.DataFrame:
     return out
 
 
+def _make_toc_filename(base_file: Optional[str], source_mids: Sequence[int] = ()) -> str:
+    """Imya fajla: File osnovnogo zamera + ' (TOC)'.
+    Esli File pustoj - fallback TOC_corr_from_<mids> (TOC).
+    """
+    name = (base_file or "").strip()
+    if not name:
+        mids = "_".join(str(m) for m in (source_mids or [])[:8]) or "corr"
+        name = f"TOC_corr_from_{mids}"
+    low = name.lower()
+    for sfx in (" (toc)", "(toc)", " (TOC)", "(TOC)"):
+        if low.endswith(sfx.lower()):
+            name = name[: -len(sfx)].rstrip()
+            break
+    return f"{name} (TOC)"
+
+
 def save_corrected_measure(
     psi_rows: pd.DataFrame,
     temp_rows: pd.DataFrame,
     msk: str,
     source_mids: Sequence[int],
     login: str = "toc",
+    base_file: Optional[str] = None,
 ) -> int:
     if psi_rows is None or psi_rows.empty:
         raise ValueError("Net strok psidata dlya sohraneniya")
 
     eng = _get_engine()
 
+    # Imya fajla = File osnovnogo zamera + " (TOC)"
+    if not base_file and "File" in psi_rows.columns:
+        try:
+            vals = psi_rows["File"].dropna().astype(str).str.strip()
+            vals = vals[vals != ""]
+            if not vals.empty:
+                base_file = str(vals.iloc[0])
+        except Exception:
+            base_file = None
+    file_label = _make_toc_filename(base_file, source_mids)
+
     # Measure_ID registrirovan srazu v psi_measure_id (kak v
     # Temperature_Measure), tak chto nalezhenie ID pri parallel'nom
     # sohranenii isklyucheno. Fallback - staryj MAX(Measure_ID)+1.
-    file_label = f"TOC_corr_from_{'_'.join(str(m) for m in source_mids)}"
     try:
         new_mid = register_measure_id(msk=msk, filename=file_label, login=login)
     except Exception as e:
@@ -888,7 +915,7 @@ def save_corrected_measure(
     if "MSK" in psi.columns:
         psi["MSK"] = msk
     for col, val in (
-        ("File", f"TOC_corr_from_{'_'.join(str(m) for m in source_mids)}"),
+        ("File", file_label),
         ("Virtual_Data", 1),
     ):
         if col in psi.columns:
