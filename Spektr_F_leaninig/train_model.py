@@ -2,6 +2,7 @@
 """
 sklearn MLP + HGB, единый интерактив, авто-подбор через RandomizedSearchCV.
 Auto-stop: OFF. Прогресс: MLP (verbose), HGB (verbose=1), search (verbose=2).
+Метрики лучшей модели пишутся в БД (таблица model_metrics).
 """
 import os, sys, time
 import numpy as np, pandas as pd
@@ -12,14 +13,19 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler, StandardScaler
 import joblib
+
 from training_common import (
     TARGET, FILTR_MIN, FILTR_MAX, MIN_PER_SPC, MIN_TRAIN, TEST_SIZE, RANDOM_STATE,
     get_engine, load_raw, clean_data, get_features, interactive_setup,
     print_diag, report_predictions, safe_name, save_index,
-    save_model_metrics, make_metrics_row,        # <-- NEW
+    save_model_metrics, make_metrics_row,        # <-- сохранение в БД
 )
-OUT_DIR = "models_sklearn"
 
+OUT_DIR = "models_sklearn"
+BACKEND = "sklearn"
+
+
+# ---------------------------------------------------------------- модели
 
 def make_mlp(verbose=False, **kw):
     p = dict(
@@ -82,7 +88,9 @@ def auto_search(base, space, X, y, tag, n_iter=10):
     return search.best_estimator_
 
 
-def train_group(sub, feats, out_dir, tag, auto_search_on):
+# ---------------------------------------------------------------- обучение
+
+def train_group(sub, feats, out_dir, tag, auto_search_on, fmax):
     print(f"\n=== {tag} (n={len(sub)}, features={feats}) ===")
     if len(sub) < MIN_TRAIN:
         print(f"[skip] мало данных: {len(sub)} < {MIN_TRAIN}")
@@ -149,9 +157,19 @@ def train_group(sub, feats, out_dir, tag, auto_search_on):
     }, path)
     print(f"Сохранено: {path}")
 
-    return {"dir": tag, "n_train": int(len(Xtr)), "n_test": int(len(Xte)),
-            "features": list(feats), "metrics": res, "best": best}
+    return {
+        "dir":      tag,
+        "n_train":  int(len(Xtr)),
+        "n_test":   int(len(Xte)),
+        "features": list(feats),
+        "metrics":  res,
+        "best":     best,
+        # fmax пробрасываем в spec, чтобы make_metrics_row взял его оттуда
+        "fmax":     float(fmax),
+    }
 
+
+# ---------------------------------------------------------------- main
 
 def main():
     print("=== sklearn | auto-stop: OFF ===")
@@ -175,17 +193,18 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     index = {
         "scope": scope, "spc_filter": "РК731", "fmax": setup["fmax"],
-        "target": TARGET, "features": feats, "backend": "sklearn",
+        "target": TARGET, "features": feats, "backend": BACKEND,
         "auto_stop": False, "models": {},
     }
-    all_rows = []                                   # <-- NEW
+    all_rows = []   # строки для model_metrics
 
     if scope.startswith("global"):
-        spec = train_group(df, feats, OUT_DIR, "global", setup["auto_search"])
+        spec = train_group(df, feats, OUT_DIR, "global",
+                           setup["auto_search"], setup["fmax"])
         if spec:
             index["models"]["*"] = spec
             all_rows.append(make_metrics_row(
-                spec, "*", scope, df, setup["fmax"], "sklearn"))
+                spec, "*", scope, df, setup["fmax"], BACKEND))
     else:
         counts = df.groupby("Spc").size().sort_values(ascending=False)
         total, skipped = len(counts), []
@@ -194,12 +213,14 @@ def main():
             if n < MIN_PER_SPC:
                 skipped.append((spc, n)); continue
             sub = df[df["Spc"] == spc]
-            spec = train_group(sub, feats, OUT_DIR, "spc_" + safe_name(spc), setup["auto_search"])
+            spec = train_group(sub, feats, OUT_DIR,
+                               "spc_" + safe_name(spc),
+                               setup["auto_search"], setup["fmax"])
             if spec is None:
                 skipped.append((spc, n)); continue
             index["models"][spc] = spec
             all_rows.append(make_metrics_row(
-                spec, spc, scope, sub, setup["fmax"], "sklearn"))
+                spec, spc, scope, sub, setup["fmax"], BACKEND))
 
         if skipped:
             print(f"\nПропущено Spc: {len(skipped)}")
@@ -207,7 +228,10 @@ def main():
                 print(f"  {spc!r:40s} n={n}")
 
     save_index(os.path.join(OUT_DIR, "index.json"), index)
-    save_model_metrics(engine, all_rows)            # <-- NEW
+
+    # ---- сохранение метрик в БД (единая таблица model_metrics) ----
+    print(f"\n=== Сохранение метрик в БД ({len(all_rows)} строк) ===")
+    save_model_metrics(engine, all_rows)
 
 
 if __name__ == "__main__":

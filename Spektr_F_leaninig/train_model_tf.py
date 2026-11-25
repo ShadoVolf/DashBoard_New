@@ -20,9 +20,9 @@ from training_common import (
 )
 
 OUT_DIR        = "models_tf"
-TF_EPOCHS      = 400           # финальное обучение
+TF_EPOCHS      = 500           # финальное обучение
 TF_EPOCHS_CV   = 150           # для авто-поиска
-TF_BATCH       = 256
+TF_BATCH       = 128
 PROGRESS_EVERY = 20
 
 # --- сетка для авто-поиска ---
@@ -32,7 +32,7 @@ TF_CONFIGS = [
     {"hidden": (128, 128, 64, 32), "lr": 5e-4, "batch": 256},
     {"hidden": (256, 128, 64), "lr": 5e-4, "batch": 128},
 ]
-DEFAULT_CFG = {"hidden": (128, 64, 32), "lr": 1e-3, "batch": TF_BATCH}
+DEFAULT_CFG = {"hidden": (256, 128, 32, 64,32), "lr": 1e-3, "batch": TF_BATCH}
 
 
 # ---------------- модель ----------------
@@ -224,10 +224,6 @@ def main():
 
     save_index(os.path.join(OUT_DIR, "index.json"), index)
     save_model_metrics(engine, all_rows)
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":

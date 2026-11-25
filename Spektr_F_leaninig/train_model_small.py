@@ -22,7 +22,7 @@ from training_common import (
     get_engine, load_raw, clean_data, print_diag,
     report_predictions, safe_name, save_index,
     prompt_yn, prompt_float,
-    save_small_model_metrics, SMALL_METRICS_TABLE,
+    save_model_metrics, make_metrics_row,     # <-- было: save_small_model_metrics, SMALL_METRICS_TABLE
 )
 
 OUT_DIR = "models_small"
@@ -119,23 +119,40 @@ def main():
             results.append(spec)
 
     if results:
-        rows = [{k: r[k] for k in
-                 ("nominal", "spc", "model_type",
-                  "pct_lt50_train", "pct_lt50_test",
-                  "n_train", "n_test", "mean_delta")}
-                for r in results]
-        save_small_model_metrics(engine, rows, SMALL_METRICS_TABLE)
+        all_rows = []
+        for r in results:
+            # make_metrics_row ожидает spec с ключами n_train / n_test / metrics
+            spec = {
+                "n_train": r["n_train"],
+                "n_test": r["n_test"],
+                "metrics": r["metrics"],  # {"train": res_tr, "test": res_te}
+            }
+            sub_spc = df[df["Spc"] == r["spc"]]
+            row = make_metrics_row(
+                spec,
+                spc_key=r["spc"],
+                scope="small",
+                sub=sub_spc,
+                fmax=fmax,
+                backend="small",  # → model_type = "small"
+            )
+            # mean_delta кладём в extra как JSON (полезно для анализа)
+            row["extra"] = f'{{"mean_delta": {r["mean_delta"]}}}'
+            all_rows.append(row)
+
+        save_model_metrics(engine, all_rows)  # <-- общая таблица model_metrics
         print(f"\nОбработано Spc: {len(results)}")
 
     index = {
         "model_type": "mean_delta",
-        "min_small":  MIN_SMALL,
-        "max_small":  MAX_SMALL,
-        "fmax":       fmax,
-        "db_table":   SMALL_METRICS_TABLE,
-        "models":     {r["spc"]: r for r in results},
+        "min_small": MIN_SMALL,
+        "max_small": MAX_SMALL,
+        "fmax": fmax,
+        "db_table": "model_metrics",  # <-- было: SMALL_METRICS_TABLE
+        "models": {r["spc"]: r for r in results},
     }
     save_index(os.path.join(OUT_DIR, "index.json"), index)
+
 
 
 if __name__ == "__main__":
