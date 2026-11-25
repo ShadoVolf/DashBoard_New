@@ -3,6 +3,7 @@
 Общие утилиты для всех training-скриптов (sklearn / TF / Torch):
 единый интерактив, единая очистка, единые метрики на остатках.
 """
+import os
 import re
 import numpy as np, pandas as pd
 from sqlalchemy import create_engine, text
@@ -31,7 +32,7 @@ MIN_TRAIN    = 20
 TEST_SIZE    = 0.2
 RANDOM_STATE = 42
 
-
+MODEL_METRICS_TABLE = "model_metrics"
 # ---------------- интерактив ----------------
 
 def prompt_yn(label, default_yes=False):
@@ -447,63 +448,149 @@ def save_small_model_metrics(engine, rows, table=SMALL_METRICS_TABLE):
     # ---------------- метрики моделей: сохранение в БД ----------------
 
 
-MODEL_METRICS_TABLE = "model_metrics"
 
+
+def dump_model_blob(bundle_or_path) -> bytes:
+    """Сериализация модели в bytes (joblib). path -> load + dump."""
+    import io
+    import joblib
+    if isinstance(bundle_or_path, (bytes, bytearray)):
+        return bytes(bundle_or_path)
+    if isinstance(bundle_or_path, str) and os.path.isfile(bundle_or_path):
+        obj = joblib.load(bundle_or_path)
+        buf = io.BytesIO()
+        joblib.dump(obj, buf)
+        return buf.getvalue()
+    buf = io.BytesIO()
+    joblib.dump(bundle_or_path, buf)
+    return buf.getvalue()
+
+
+def dump_tf_model_blob(model, meta: dict) -> bytes:
+    """Keras model + meta -> joblib pack (arch_json + weights_bytes)."""
+    import io
+    import os
+    import tempfile
+    import joblib
+
+    arch = model.to_json()
+    with tempfile.NamedTemporaryFile(suffix=".weights.h5", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        model.save_weights(tmp_path)
+        with open(tmp_path, "rb") as f:
+            weights_bytes = f.read()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+    pack = {
+        "kind": "tensorflow",
+        "arch_json": arch,
+        "weights_bytes": weights_bytes,
+        "features": list(meta.get("features") or []),
+        "target": meta.get("target", TARGET),
+        "filtr_bounds": meta.get("filtr_bounds", (FILTR_MIN, FILTR_MAX)),
+        "scaler_x": meta.get("scaler_x") or meta.get("sx"),
+        "scaler_y": meta.get("scaler_y") or meta.get("sy"),
+        "cfg": meta.get("cfg"),
+    }
+    buf = io.BytesIO()
+    joblib.dump(pack, buf)
+    return buf.getvalue()
 
 def ensure_model_metrics_table(engine, table=MODEL_METRICS_TABLE):
-    """Создаёт общую таблицу метрик всех моделей, если её нет."""
+    """Создаёт таблицу метрик + колонки model_blob/features при необходимости."""
     ddl = text(f"""
-         CREATE TABLE IF NOT EXISTS {table} (
-             id INT AUTO_INCREMENT PRIMARY KEY,
-             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-             scope VARCHAR(32) NULL,
-             spc VARCHAR(255) NULL,
-             nominal DOUBLE NULL,
-             backend VARCHAR(32) NULL,
-             model_type VARCHAR(64) NULL,
-             n_train INT NULL,
-             n_test INT NULL,
-             pct_lt50_train DOUBLE NULL,
-             pct_lt50_test DOUBLE NULL,
-             mae_train DOUBLE NULL,
-             mae_test DOUBLE NULL,
-             rmse_train DOUBLE NULL,
-             rmse_test DOUBLE NULL,
-             fmax DOUBLE NULL,
-             extra TEXT NULL
-         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-     """)
+        CREATE TABLE IF NOT EXISTS `{table}` (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            scope VARCHAR(32) NULL,
+            spc VARCHAR(255) NULL,
+            nominal DOUBLE NULL,
+            backend VARCHAR(32) NULL,
+            model_type VARCHAR(64) NULL,
+            n_train INT NULL,
+            n_test INT NULL,
+            pct_lt50_train DOUBLE NULL,
+            pct_lt50_test DOUBLE NULL,
+            mae_train DOUBLE NULL,
+            mae_test DOUBLE NULL,
+            rmse_train DOUBLE NULL,
+            rmse_test DOUBLE NULL,
+            fmax DOUBLE NULL,
+            extra TEXT NULL,
+            model_blob LONGBLOB NULL,
+            features TEXT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
     with engine.begin() as conn:
         conn.execute(ddl)
+    # дописать колонки, если таблица уже была без них
+    cols = pd.read_sql(text(f"SHOW COLUMNS FROM `{table}`"), engine)
+    names = {str(x).lower() for x in cols["Field"].tolist()}
+    with engine.begin() as conn:
+        if "model_blob" not in names:
+            conn.execute(text(
+                f"ALTER TABLE `{table}` ADD COLUMN `model_blob` LONGBLOB NULL"
+            ))
+        if "features" not in names:
+            conn.execute(text(
+                f"ALTER TABLE `{table}` ADD COLUMN `features` TEXT NULL"
+            ))
 
 
 def save_model_metrics(engine, rows, table=MODEL_METRICS_TABLE):
-    """rows: список dict'ов; недостающие колонки заполняются NULL."""
+    """
+    rows: list[dict]. Опциональные ключи model_blob (bytes), features (list|str).
+    """
+    import json
     if not rows:
         print(f"  [db] нет строк для записи в {table}")
         return
     ensure_model_metrics_table(engine, table)
-    df = pd.DataFrame(rows)
-    cols = ("scope", "spc", "nominal", "backend", "model_type",
-            "n_train", "n_test", "pct_lt50_train", "pct_lt50_test",
-            "mae_train", "mae_test", "rmse_train", "rmse_test",
-            "fmax", "extra")
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    df = df[list(cols)]
-    df.to_sql(table, engine, if_exists="append", index=False)
-    print(f"  [db] записано в {table}: {len(df)} строк")
+
+    base_cols = (
+        "scope", "spc", "nominal", "backend", "model_type",
+        "n_train", "n_test", "pct_lt50_train", "pct_lt50_test",
+        "mae_train", "mae_test", "rmse_train", "rmse_test",
+        "fmax", "extra", "features",
+    )
+    inserted = 0
+    with engine.begin() as conn:
+        for row in rows:
+            data = {}
+            for c in base_cols:
+                v = row.get(c)
+                if c == "features" and isinstance(v, (list, tuple)):
+                    v = json.dumps(list(v), ensure_ascii=False)
+                data[c] = v
+            keys = ", ".join(f"`{k}`" for k in data.keys())
+            vals = ", ".join(f":{k}" for k in data.keys())
+            conn.execute(
+                text(f"INSERT INTO `{table}` ({keys}) VALUES ({vals})"),
+                data,
+            )
+            rid = conn.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+            blob = row.get("model_blob")
+            if blob is not None:
+                if not isinstance(blob, (bytes, bytearray)):
+                    blob = dump_model_blob(blob)
+                conn.execute(
+                    text(f"UPDATE `{table}` SET model_blob = :b WHERE id = :id"),
+                    {"b": bytes(blob), "id": int(rid)},
+                )
+            inserted += 1
+    print(f"  [db] записано в {table}: {inserted} строк (с blob где передан)")
 
 
-def make_metrics_row(spec, spc_key, scope, sub, fmax, backend):
+def make_metrics_row(spec, spc_key, scope, sub, fmax, backend,
+                     model_blob=None, features=None):
     """
-    Универсальный конструктор строки для model_metrics.
-    spec  — то, что вернул train_group();
-            sklearn: {"metrics": {"mlp": {"train","test"}, "hgb": {...}}, "best": ...}
-            TF/torch: {"metrics": {"train","test"}, ...}
-    spc_key — "*" для global, иначе имя Spc;
-    sub     — DataFrame этой группы (для среднего Nominal);
+    Конструктор строки model_metrics.
+    model_blob: bytes | path | object (joblib)
+    features: list[str]
     """
     m = spec["metrics"]
     best = spec.get("best")
@@ -518,6 +605,14 @@ def make_metrics_row(spec, spc_key, scope, sub, fmax, backend):
     if sub is not None and "Nominal" in getattr(sub, "columns", []):
         if len(sub):
             nominal = float(sub["Nominal"].mean())
+
+    feats = features or list(spec.get("features") or [])
+    blob = None
+    if model_blob is not None:
+        try:
+            blob = dump_model_blob(model_blob)
+        except Exception as e:
+            print(f"  [db] dump_model_blob: {e}")
 
     return {
         "scope": scope,
@@ -535,12 +630,14 @@ def make_metrics_row(spec, spc_key, scope, sub, fmax, backend):
         "rmse_test": float(te["rmse"]),
         "fmax": float(fmax),
         "extra": None,
+        "features": feats,
+        "model_blob": blob,
     }
 
 # ============================================================================
 #  Метрики моделей: сохранение в БД (единая таблица для всех бэкендов)
 # ============================================================================
 
-MODEL_METRICS_TABLE = "model_metrics"
+
 
 
