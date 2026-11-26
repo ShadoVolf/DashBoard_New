@@ -44,6 +44,7 @@ _COL_ALIASES = {
     "path": ("path", "Path", "model_path", "file_path", "filepath", "FilePath",
              "joblib_path", "storage_path"),
     "metrics_json": ("metrics", "metrics_json", "Metrics", "meta", "Meta"),
+    "extra": ("extra", "Extra", "extra_json", "params", "Params"),
     "active": ("active", "is_active", "Active", "enabled"),
     "target": ("target", "Target", "target_col"),
 }
@@ -236,6 +237,91 @@ def _materialize_tf_bundle(bundle: dict) -> dict:
     return out
 
 
+def _materialize_pytorch_bundle(bundle: dict) -> dict:
+    """
+    Собрать PyTorch MLP из pack:
+      {kind=pytorch, state_dict_bytes|state_dict, n_in, hidden, scaler_x, scaler_y}.
+    Возвращает dict с ключом "model" = callable(X_np) -> y_np (уже с inverse scaler_y).
+    """
+    if not isinstance(bundle, dict):
+        return bundle
+    m = bundle.get("model")
+    if callable(m) and not isinstance(m, (bytes, bytearray, str, dict)):
+        return bundle
+
+    try:
+        import torch
+        import torch.nn as nn
+    except Exception as e:
+        raise RuntimeError(
+            f"PyTorch не установлен или не импортируется: {e}. "
+            "Установите torch для моделей kind=pytorch."
+        ) from e
+
+    n_in = bundle.get("n_in")
+    hidden = bundle.get("hidden")
+    if n_in is None or not hidden:
+        raise RuntimeError("pytorch pack: нет n_in/hidden")
+
+    class MLP(nn.Module):
+        def __init__(self, n_in_, hidden_):
+            super().__init__()
+            layers_ = []
+            prev = int(n_in_)
+            for h in hidden_:
+                layers_ += [nn.Linear(prev, int(h)), nn.ReLU()]
+                prev = int(h)
+            layers_.append(nn.Linear(prev, 1))
+            self.net = nn.Sequential(*layers_)
+
+        def forward(self, x):
+            return self.net(x).squeeze(-1)
+
+    model = MLP(int(n_in), list(hidden))
+    sd = bundle.get("state_dict")
+    if sd is None:
+        raw = bundle.get("state_dict_bytes")
+        if raw is None:
+            raise RuntimeError("pytorch pack: нет state_dict / state_dict_bytes")
+        sd = torch.load(io.BytesIO(bytes(raw)), map_location="cpu", weights_only=False)
+    model.load_state_dict(sd)
+    model.eval()
+
+    sx = bundle.get("scaler_x") or bundle.get("sx")
+    sy = bundle.get("scaler_y") or bundle.get("sy")
+
+    def _predict_fn(X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=float)
+        if sx is not None:
+            X_in = sx.transform(X)
+        else:
+            X_in = X
+        with torch.no_grad():
+            t = torch.tensor(X_in, dtype=torch.float32)
+            ys = model(t).numpy()
+        if sy is not None:
+            try:
+                ys = sy.inverse_transform(ys.reshape(-1, 1)).ravel()
+            except Exception:
+                ys = np.asarray(ys, dtype=float).ravel()
+        else:
+            ys = np.asarray(ys, dtype=float).ravel()
+        return ys
+
+    out = dict(bundle)
+    out["model"] = _predict_fn
+    out["_torch_module"] = model
+    out["kind"] = "pytorch"
+    return out
+
+
+def _is_mean_delta_pack(b: Any) -> bool:
+    if not isinstance(b, dict):
+        return False
+    k = str(b.get("kind") or b.get("type") or "").lower()
+    return k in ("mean_delta", "small") or "mean_delta" in b
+
+
 @dataclass
 class ModelSpec:
     kind: str = "db"
@@ -253,6 +339,9 @@ class ModelSpec:
     filtr_bounds: Tuple[float, float] = (-500.0, 500.0)
     backend: str = ""
     db_id: Optional[int] = None
+    # для small/mean_delta: mean_delta из extra или blob (без blob тоже работает)
+    mean_delta: Optional[float] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
     _blob: Optional[bytes] = field(default=None, repr=False)
     _bundle: Any = field(default=None, repr=False)
 
@@ -287,6 +376,47 @@ class ModelSpec:
         except Exception as e:
             print(f"[Knowledge/models] ensure_weights id={self.db_id}: {e}", flush=True)
 
+    def _is_small_backend(self) -> bool:
+        bt = f"{self.backend} {self.model_type}".lower()
+        return "small" in bt or "mean_delta" in bt
+
+    def _try_build_mean_delta_bundle(self) -> Optional[dict]:
+        """Собрать pack mean_delta без blob: из mean_delta / extra / БД.extra."""
+        mean_d = self.mean_delta
+        if mean_d is None and isinstance(self.extra, dict):
+            mean_d = self.extra.get("mean_delta")
+        if mean_d is None and self.db_id is not None:
+            try:
+                eng = _get_engine()
+                cols = pd.read_sql(text("SHOW COLUMNS FROM model_metrics"), eng)
+                col_names = [str(x) for x in cols["Field"].tolist()]
+                extra_col = _pick_col(col_names, _COL_ALIASES["extra"])
+                if extra_col:
+                    q = text(
+                        f"SELECT `{extra_col}` FROM model_metrics "
+                        f"WHERE `{_pick_col(col_names, _COL_ALIASES['id']) or 'id'}` = :id LIMIT 1"
+                    )
+                    with eng.connect() as conn:
+                        row = conn.execute(q, {"id": int(self.db_id)}).fetchone()
+                    if row and row[0] is not None:
+                        parsed = _parse_metrics_json(row[0])
+                        mean_d = parsed.get("mean_delta")
+                        if mean_d is not None:
+                            self.extra = {**(self.extra or {}), **parsed}
+            except Exception as e:
+                print(f"[Knowledge/models] mean_delta from extra id={self.db_id}: {e}", flush=True)
+        if mean_d is None:
+            return None
+        return {
+            "kind": "mean_delta",
+            "type": "mean_delta",
+            "mean_delta": float(mean_d),
+            "nominal": self.nominal,
+            "features": ["F", "Nominal"],
+            "spc": self.spc_key,
+            "filtr_bounds": self.filtr_bounds,
+        }
+
     def load(self):
         if self._bundle is not None:
             return self._bundle
@@ -297,9 +427,15 @@ class ModelSpec:
         elif self.path:
             self._bundle = joblib.load(self.path)
         else:
+            # small / mean_delta: blob не обязателен — достаточно mean_delta в extra
+            if self._is_small_backend():
+                pack = self._try_build_mean_delta_bundle()
+                if pack is not None:
+                    self._bundle = pack
+                    return self._bundle
             raise RuntimeError(
                 f"Model '{self.name}' (id={self.db_id}): net model_blob v model_metrics "
-                f"(zapustite migrate_models_tf_to_db.py)"
+                f"(zapustite migrate_models_tf_to_db.py ili backfill_small_blobs.py)"
             )
         if isinstance(self._bundle, dict):
             if not self.features:
@@ -310,11 +446,54 @@ class ModelSpec:
             if self._bundle.get("kind") == "tensorflow" and "arch_json" in self._bundle:
                 self._bundle = _materialize_tf_bundle(self._bundle)
             elif self._bundle.get("kind") == "pytorch":
-                raise RuntimeError("pytorch blob: ispolzuyte otdelnyy loader")
+                self._bundle = _materialize_pytorch_bundle(self._bundle)
+            # mean_delta / small: без материализации, pred считается в predict()
         return self._bundle
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         b = self.load()
+
+        # --- small / mean_delta: pred = F * Nominal - mean_delta ---
+        if _is_mean_delta_pack(b) or self._is_small_backend():
+            mean_d = None
+            if isinstance(b, dict):
+                mean_d = b.get("mean_delta")
+                if mean_d is None and isinstance(b.get("extra"), dict):
+                    mean_d = b["extra"].get("mean_delta")
+            if mean_d is None:
+                mean_d = self.mean_delta
+            if mean_d is None and isinstance(self.extra, dict):
+                mean_d = self.extra.get("mean_delta")
+            if mean_d is None:
+                raise RuntimeError(
+                    f"Model '{self.name}' (id={self.db_id}): mean_delta pack без mean_delta"
+                )
+            mean_d = float(mean_d)
+            work = df.copy()
+            for col in ("F", "Nominal"):
+                if col not in work.columns:
+                    try:
+                        from .data import resolve_column
+                        src = resolve_column(work, col)
+                        if src and src in work.columns:
+                            work[col] = pd.to_numeric(work[src], errors="coerce")
+                        else:
+                            work[col] = np.nan
+                    except Exception:
+                        work[col] = np.nan
+                else:
+                    work[col] = pd.to_numeric(work[col], errors="coerce")
+            pred = np.full(len(df), np.nan, dtype=float)
+            # позиционная маска (не label-index) — иначе IndexError при не-RangeIndex
+            ok_mask = (work["F"].notna() & work["Nominal"].notna()).to_numpy()
+            if ok_mask.any():
+                pred[ok_mask] = (
+                    work["F"].to_numpy(dtype=float)[ok_mask]
+                    * work["Nominal"].to_numpy(dtype=float)[ok_mask]
+                    - mean_d
+                )
+            return pred
+
         model = b["model"] if isinstance(b, dict) and "model" in b else b
         feats = self.features or (
             list(b.get("features") or DEFAULT_FEATURES)
@@ -344,10 +523,23 @@ class ModelSpec:
                 work[c] = pd.to_numeric(work[c], errors="coerce")
             else:
                 work[c] = pd.to_numeric(work[src], errors="coerce")
-        ok = work.dropna(subset=feats)
-        if len(ok) == 0:
+        # позиционная маска: len(pred)==len(df), индексы строк df могут быть 13, 40, ...
+        ok_mask = work[feats].notna().all(axis=1).to_numpy()
+        if not ok_mask.any():
             return pred
-        X = ok[feats].to_numpy(dtype=float)
+        X = work.loc[ok_mask, feats].to_numpy(dtype=float)
+
+        kind = (b.get("kind") if isinstance(b, dict) else None) or ""
+        backend = (b.get("backend") if isinstance(b, dict) else None) or ""
+        is_pytorch = str(kind).lower() == "pytorch" or str(backend).lower() in (
+            "pytorch", "torch",
+        )
+
+        # PyTorch: model уже callable (из _materialize_pytorch_bundle), scalers внутри
+        if is_pytorch and callable(model):
+            yp = np.asarray(model(X), dtype=float).reshape(-1)
+            pred[ok_mask] = yp
+            return pred
 
         # TensorFlow pack: scaler_x / scaler_y (как в Spektr_F_leaninig.train_model_tf*)
         sx = b.get("scaler_x") if isinstance(b, dict) else None
@@ -363,11 +555,14 @@ class ModelSpec:
         else:
             X_in = X
 
-        # keras Model.predict vs sklearn
-        try:
-            yp = model.predict(X_in, verbose=0)
-        except TypeError:
-            yp = model.predict(X_in)
+        # keras Model.predict vs sklearn / callable
+        if callable(model) and not hasattr(model, "predict"):
+            yp = model(X_in)
+        else:
+            try:
+                yp = model.predict(X_in, verbose=0)
+            except TypeError:
+                yp = model.predict(X_in)
         yp = np.asarray(yp, dtype=float).reshape(-1)
 
         if is_tf and sy is not None:
@@ -376,7 +571,7 @@ class ModelSpec:
             except Exception:
                 pass
 
-        pred[ok.index.to_numpy()] = yp
+        pred[ok_mask] = yp
         return pred
 
 
@@ -465,6 +660,17 @@ def discover_models(search_dirs: Optional[Sequence[str]] = None) -> List[ModelSp
         if cmap.get("path") and pd.notna(row.get(cmap["path"])):
             file_path = str(row[cmap["path"]]).strip()
 
+        extra: Dict[str, Any] = {}
+        if cmap.get("extra") and pd.notna(row.get(cmap["extra"])):
+            extra = _parse_metrics_json(row[cmap["extra"]])
+        mean_delta = _as_float(extra.get("mean_delta")) if extra else None
+        # small без features в БД — F, Nominal
+        bt = f"{backend} {model_type}".lower()
+        if ("small" in bt or "mean_delta" in bt) and (
+            not features or features == list(DEFAULT_FEATURES)
+        ):
+            features = ["F", "Nominal"]
+
         display = name
         if spc_key and spc_key != "*":
             display = f"{name} [{spc_key}]"
@@ -487,6 +693,8 @@ def discover_models(search_dirs: Optional[Sequence[str]] = None) -> List[ModelSp
             filtr_bounds=bounds,
             backend=backend,
             db_id=db_id,
+            mean_delta=mean_delta,
+            extra=extra,
         ))
 
     found.sort(key=lambda m: -m.test_score)
