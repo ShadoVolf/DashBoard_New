@@ -21,6 +21,12 @@ except ImportError as _e:
     print(f"[TempOutlier_Correction] module not available: {_e}")
     create_temp_outlier_window = None
 
+try:
+    from Knowledge import create_knowledge_window
+except ImportError as _e:
+    print(f"[Knowledge] module not available: {_e}")
+    create_knowledge_window = None
+
 # Создание главного меню
 def create_main_menu(dpg):
     # Защита от повторного создания
@@ -92,6 +98,12 @@ def create_main_menu(dpg):
                     label="Виртуальный замер",
                     callback=show_virtual_measure,
                     tag='VirtualMeasure_Menu'
+                )
+            if create_knowledge_window is not None:
+                dpg.add_menu_item(
+                    label="Точность настройки Спектр",
+                    callback=lambda: create_knowledge_window(),
+                    tag="Knowledge_Menu",
                 )
             with dpg.menu(label="Утилиты", tag='Measure_Utils_Menu'):
                 dpg.add_menu_item(label="Добавление АЧХ",
