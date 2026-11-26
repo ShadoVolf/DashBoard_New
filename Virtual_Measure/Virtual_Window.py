@@ -1262,6 +1262,120 @@ def _on_num_mode_changed(sender=None, data=None):
         _log_exc("_on_num_mode_changed", e)
 
 
+
+def _show_numbers_dialog():
+    try:
+        mid_str = _get_combo_value('vbase_mid_combo')
+        if not mid_str:
+            dpg.set_value(NEW_MID_LABEL,
+                          "Не выбран базовый Measure_ID")
+            return
+        try:
+            mid = int(mid_str)
+        except ValueError:
+            return
+
+        all_numbers = vd.get_all_numbers(mid)
+        if not all_numbers:
+            dpg.set_value(NEW_MID_LABEL,
+                          "Нет номеров в базовом замере")
+            return
+
+        if dpg.does_item_exist(NUMBERS_TAG):
+            dpg.delete_item(NUMBERS_TAG)
+
+        sw, sh = _layout.screen_size()
+        w = max(400, min(600, int(sw * 0.35)))
+        h = max(400, min(700, int(sh * 0.60)))
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        selected_set = set(_state.get('numbers') or [])
+
+        # сохраняем список номеров, чтобы счётчик не ходил в БД
+        _state['dialog_numbers'] = list(all_numbers)
+
+        with dpg.window(label="Выбор номеров", tag=NUMBERS_TAG,
+                        modal=True, width=w, height=h, pos=(x, y),
+                        no_collapse=True):
+            dpg.add_text(f"Всего номеров: {len(all_numbers)}",
+                         color=(180, 220, 255))
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Выбрать все",
+                               callback=lambda: _select_all_numbers(
+                                   all_numbers, True))
+                dpg.add_button(label="Снять все",
+                               callback=lambda: _select_all_numbers(
+                                   all_numbers, False))
+            # динамический счётчик выбранных номеров
+            dpg.add_text("Выбрано: 0",
+                         tag='vnum_dialog_counter',
+                         color=(180, 255, 180))
+            dpg.add_separator()
+            with dpg.child_window(width=-1, height=-60, border=True):
+                for n in all_numbers:
+                    dpg.add_checkbox(
+                        label=n, tag=f"vnum_chk_{n}",
+                        default_value=(n in selected_set),
+                        callback=_update_dialog_counter)
+            dpg.add_separator()
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Применить", width=140, height=28,
+                    callback=lambda: _apply_numbers_selection(
+                        all_numbers))
+                dpg.add_button(
+                    label="Отмена", width=140, height=28,
+                    callback=lambda: dpg.delete_item(NUMBERS_TAG))
+
+        # начальная инициализация счётчика (учёт уже выбранных)
+        _update_dialog_counter()
+    except Exception as e:
+        _log_exc("_show_numbers_dialog", e)
+
+
+def _select_all_numbers(all_numbers, value):
+    try:
+        for n in all_numbers:
+            tag = f"vnum_chk_{n}"
+            if dpg.does_item_exist(tag):
+                dpg.set_value(tag, value)
+        # после массового изменения обновляем счётчик
+        _update_dialog_counter()
+    except Exception as e:
+        _log_exc("_select_all_numbers", e)
+
+
+def _update_dialog_counter(sender=None, data=None):
+    """Обновляет счётчик выбранных номеров внутри диалога."""
+    try:
+        if not dpg.does_item_exist('vnum_dialog_counter'):
+            return
+        all_numbers = _state.get('dialog_numbers') or []
+        count = 0
+        for n in all_numbers:
+            tag = f"vnum_chk_{n}"
+            if dpg.does_item_exist(tag) and dpg.get_value(tag):
+                count += 1
+        dpg.set_value('vnum_dialog_counter',
+                      f"Выбрано: {count} из {len(all_numbers)}")
+    except Exception as e:
+        _log_exc("_update_dialog_counter", e)
+
+
+def _apply_numbers_selection(all_numbers):
+    try:
+        selected = []
+        for n in all_numbers:
+            tag = f"vnum_chk_{n}"
+            if dpg.does_item_exist(tag) and dpg.get_value(tag):
+                selected.append(n)
+        _state['numbers'] = selected
+        _refresh_numbers_list_label()
+        dpg.delete_item(NUMBERS_TAG)
+    except Exception as e:
+        _log_exc("_apply_numbers_selection", e)
+
+
 def _refresh_numbers_list_label():
     try:
         n = len(_state.get('numbers') or [])
@@ -1272,8 +1386,7 @@ def _refresh_numbers_list_label():
     except Exception as e:
         _log_exc("_refresh_numbers_list_label", e)
 
-
-def _show_numbers_dialog():
+def _show_numbers_dialog_11():
     try:
         mid_str = _get_combo_value('vbase_mid_combo')
         if not mid_str:
@@ -1331,28 +1444,7 @@ def _show_numbers_dialog():
         _log_exc("_show_numbers_dialog", e)
 
 
-def _select_all_numbers(all_numbers, value):
-    try:
-        for n in all_numbers:
-            tag = f"vnum_chk_{n}"
-            if dpg.does_item_exist(tag):
-                dpg.set_value(tag, value)
-    except Exception as e:
-        _log_exc("_select_all_numbers", e)
 
-
-def _apply_numbers_selection(all_numbers):
-    try:
-        selected = []
-        for n in all_numbers:
-            tag = f"vnum_chk_{n}"
-            if dpg.does_item_exist(tag) and dpg.get_value(tag):
-                selected.append(n)
-        _state['numbers'] = selected
-        _refresh_numbers_list_label()
-        dpg.delete_item(NUMBERS_TAG)
-    except Exception as e:
-        _log_exc("_apply_numbers_selection", e)
 
 
 def _get_selected_numbers():
