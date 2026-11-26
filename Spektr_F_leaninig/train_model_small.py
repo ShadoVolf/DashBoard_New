@@ -13,6 +13,7 @@
 в таблицу small_model_metrics.
 """
 import os
+import json
 import numpy as np
 from sklearn.model_selection import train_test_split
 import joblib
@@ -22,7 +23,7 @@ from training_common import (
     get_engine, load_raw, clean_data, print_diag,
     report_predictions, safe_name, save_index,
     prompt_yn, prompt_float,
-    save_model_metrics, make_metrics_row,     # <-- было: save_small_model_metrics, SMALL_METRICS_TABLE
+    save_model_metrics, make_metrics_row, dump_model_blob,
 )
 
 OUT_DIR = "models_small"
@@ -128,6 +129,25 @@ def main():
                 "metrics": r["metrics"],  # {"train": res_tr, "test": res_te}
             }
             sub_spc = df[df["Spc"] == r["spc"]]
+            # blob для Knowledge: kind=mean_delta (pred = F*Nominal - mean_delta)
+            pack = {
+                "kind": "mean_delta",
+                "type": "mean_delta",
+                "spc": r["spc"],
+                "mean_delta": float(r["mean_delta"]),
+                "nominal": float(r["nominal"]),
+                "features": ["F", "Nominal"],
+                "target": TARGET,
+                "filtr_bounds": (FILTR_MIN, FILTR_MAX),
+                "n_train": r["n_train"],
+                "n_test": r["n_test"],
+                "metrics": r["metrics"],
+            }
+            try:
+                model_blob = dump_model_blob(pack)
+            except Exception as e:
+                print(f"  [small] dump blob failed spc={r['spc']!r}: {e}")
+                model_blob = None
             row = make_metrics_row(
                 spec,
                 spc_key=r["spc"],
@@ -135,9 +155,14 @@ def main():
                 sub=sub_spc,
                 fmax=fmax,
                 backend="small",  # → model_type = "small"
+                model_blob=model_blob,
+                features=["F", "Nominal"],
             )
             # mean_delta кладём в extra как JSON (полезно для анализа)
-            row["extra"] = f'{{"mean_delta": {r["mean_delta"]}}}'
+            row["extra"] = json.dumps(
+                {"mean_delta": r["mean_delta"], "kind": "mean_delta"},
+                ensure_ascii=False,
+            )
             all_rows.append(row)
 
         save_model_metrics(engine, all_rows)  # <-- общая таблица model_metrics
