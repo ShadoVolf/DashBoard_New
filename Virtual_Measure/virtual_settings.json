@@ -11,13 +11,13 @@
     "last_param": ""
   },
   "last_used": {
-    "rtype": "РК450",
-    "spc": "РК450-10М-144-1",
-    "msk": "23-439",
-    "measure_id": "158671",
+    "rtype": "РК411ЭБ",
+    "spc": "РК411ЭБ-6ДУ-108,2Мгц",
+    "msk": "826-45",
+    "measure_id": "259985",
     "only_good": false,
-    "machine_type": "Saunders",
-    "machine_sn": "76648"
+    "machine_type": "KH7700",
+    "machine_sn": "0271"
   },
   "nn": {
     "mlp_enabled": true,
