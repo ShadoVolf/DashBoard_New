@@ -51,4 +51,29 @@ PARAM_ALIASES = {
     "Filtr_Freq": ("Filtr_Freq", "filtr_freq", "FiltrFreq"),
 }
 
+# Канонические имена -> возможные имена колонок в psidata
+# Используется normalize_psi_columns / resolve_column
+COLUMN_ALIASES = {
+    "Number": ("Number", "N", "Num", "nomer", "Номер", "number"),
+    "F": ("F", "F0", "Freq", "freq"),
+    "R": ("R", "R1", "Rs", "ESR"),
+    "Q": ("Q", "Q0", "Ql", "QL"),
+    "C0": ("C0", "C_0", "c0"),
+    "Cq": ("Cq", "C1", "CQ", "cq0", "C_q", "C_1", "cq"),
+    "L": ("L", "Lq", "L1", "LQ"),
+    "Nominal": ("Nominal", "nominal", "Nom", "nom"),
+    "Ref_f": ("Ref_f", "Ref_F", "ref_f", "REF_F"),
+    "Filtr_Freq": ("Filtr_Freq", "filtr_freq", "FiltrFreq", "filtrfreq"),
+    "ID": ("ID", "Id", "id"),
+    "Measure_ID": ("Measure_ID", "MeasureId", "measure_id", "MID"),
+    "MSK": ("MSK", "Msk", "msk"),
+    "Spc": ("Spc", "SPC", "spc", "Spec"),
+}
+
+# Колонки, которые показываем в таблице результатов
+TABLE_COLUMNS = (
+    "Number", "F", "R", "Q", "C0", "Cq",
+    "Nominal", "Filtr_Freq_pred",
+)
+
 DEFAULT_MODELS_SUBDIR = "models_sklearn"

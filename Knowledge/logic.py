@@ -68,9 +68,9 @@ def predict_for_measure(
     result = kn_models.run_prediction(model, df)
     # порядок колонок для отображения
     prefer = [
-        "ID", "Measure_ID", "MSK", "Number", "Spc",
-        "F", "R", "Q", "C0", "Cq", "C1", "L", "Nominal",
+        "Number", "F", "R", "Q", "C0", "Cq", "C1", "L", "Nominal",
         "Ref_f", TARGET_COL, "Filtr_Freq_pred",
+        "ID", "Measure_ID", "MSK", "Spc",
     ]
     cols = [c for c in prefer if c in result.columns]
     rest = [c for c in result.columns if c not in cols]
@@ -108,9 +108,9 @@ def save_predictions(measure_id: int, result_df: pd.DataFrame) -> int:
 def export_result(result_df: pd.DataFrame, path: str) -> str:
     # компактный набор для выгрузки
     prefer = [
-        "ID", "Measure_ID", "MSK", "Number", "Spc",
-        "F", "R", "Q", "C0", "Cq", "C1", "Nominal",
+        "Number", "F", "R", "Q", "C0", "Cq", "C1", "Nominal",
         TARGET_COL, "Filtr_Freq_pred",
+        "ID", "Measure_ID", "MSK", "Spc",
     ]
     cols = [c for c in prefer if c in result_df.columns]
     export_df = result_df[cols] if cols else result_df

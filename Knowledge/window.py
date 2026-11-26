@@ -38,6 +38,7 @@ from .constants import (
     SAVE_DB_BTN,
     SPC_COMBO,
     STATUS_TAG,
+    TABLE_COLUMNS,
     TYPE_COMBO,
     WIN_TAG,
 )
@@ -330,12 +331,15 @@ def do_predict(sender=None, app_data=None):
             only_missing = bool(dpg.get_value(ONLY_MISSING_CHECK))
 
         work = df
-        if only_missing and "Filtr_Freq" in df.columns:
-            ff = pd.to_numeric(df["Filtr_Freq"], errors="coerce")
-            work = df[ff.isna()].copy()
-            if work.empty:
-                _log("Все строки уже имеют Filtr_Freq")
-                return
+        if only_missing:
+            ff_col = kn_data.resolve_column(df, "Filtr_Freq")
+            if ff_col is not None:
+                ff = pd.to_numeric(df[ff_col], errors="coerce")
+                work = df[ff.isna()].copy()
+                if work.empty:
+                    _log("Все строки уже имеют Filtr_Freq")
+                    return
+            # если колонки Filtr_Freq нет — предсказываем по всем строкам
 
         result = kn_logic.predict_for_measure(work, model)
         if only_missing and len(result) < len(df):
@@ -425,6 +429,35 @@ def do_print(sender=None, app_data=None):
         traceback.print_exc()
 
 
+def _fmt_cell(col: str, val) -> str:
+    """Форматирование ячеек таблицы по требованиям UI."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        try:
+            if pd.isna(val):
+                return ""
+        except Exception:
+            pass
+        if val is None:
+            return ""
+    try:
+        if col == "Number":
+            s = str(int(val)) if str(val).strip().lstrip("-").isdigit() else str(val)
+            return s[:8]
+        if col in ("F", "R"):
+            return f"{float(val):.1f}"[:6]
+        if col == "Q":
+            return f"{float(val):.1f}"[:8]
+        if col in ("C0", "Cq", "C1"):
+            return f"{float(val):.2f}"[:6]
+        if col in ("Filtr_Freq_pred", "Filtr_Freq"):
+            return f"{int(round(float(val)))}"
+        if isinstance(val, float):
+            return f"{val:.6g}"
+        return str(val)
+    except (TypeError, ValueError):
+        return str(val) if val is not None else ""
+
+
 def _fill_result_table(df: pd.DataFrame, show_pred: bool = False):
     if not dpg.does_item_exist(RESULT_TABLE):
         return
@@ -438,30 +471,32 @@ def _fill_result_table(df: pd.DataFrame, show_pred: bool = False):
     if df is None or df.empty:
         return
 
-    # Filtr_Freq из таблицы убран; pred показываем только после предсказания
-    show_cols = [
-        c for c in (
-            "ID", "Number", "MSK", "Spc", "F", "R", "Q", "C0", "Cq",
-            "Nominal", "Filtr_Freq_pred",
-        ) if c in df.columns
-    ]
+    # Number, F, R, Q, C0, Cq, Nominal + всегда Filtr_Freq_pred после предсказания
+    # колонку Filtr_Freq в таблицу не показываем
+    show_cols = [c for c in TABLE_COLUMNS if c in df.columns]
+    if "Number" not in show_cols:
+        n_col = kn_data.resolve_column(df, "Number")
+        if n_col is not None and n_col not in show_cols:
+            show_cols = [n_col] + show_cols
+
+    # Filtr_Freq_pred показываем всегда, если колонка есть (независимо от Filtr_Freq и галочки)
+    if "Filtr_Freq_pred" in df.columns and "Filtr_Freq_pred" not in show_cols:
+        show_cols.append("Filtr_Freq_pred")
     if not show_pred:
+        # при простой загрузке pred ещё нет — не резервируем пустую колонку
         show_cols = [c for c in show_cols if c != "Filtr_Freq_pred"]
+
+    # убрать Filtr_Freq из отображения на всякий случай
+    show_cols = [c for c in show_cols if str(c).lower() not in ("filtr_freq",)]
+
     if not show_cols:
-        show_cols = [c for c in df.columns if str(c).lower() != "filtr_freq"][:12]
+        show_cols = [c for c in df.columns if str(c).lower() not in ("filtr_freq",)][:12]
 
     view = df[show_cols].head(500)
     for _, row in view.iterrows():
         with dpg.table_row(parent=RESULT_TABLE):
             for c in show_cols:
-                val = row[c]
-                if pd.isna(val):
-                    txt = ""
-                elif isinstance(val, float):
-                    txt = f"{val:.6g}"
-                else:
-                    txt = str(val)
-                dpg.add_text(txt)
+                dpg.add_text(_fmt_cell(c, row[c]))
 
 
 # ---------------------------------------------------------------------------
@@ -563,10 +598,7 @@ def create_knowledge_window():
                     scrollY=True,
                     height=-40,
                 ):
-                    for col in (
-                        "ID", "Number", "MSK", "Spc", "F", "R", "Q", "C0", "Cq",
-                        "Nominal", "Filtr_Freq_pred",
-                    ):
+                    for col in TABLE_COLUMNS:
                         dpg.add_table_column(label=col)
 
         dpg.add_text("Готово", tag=STATUS_TAG)

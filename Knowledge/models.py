@@ -174,6 +174,68 @@ def _score_from_row(row: pd.Series, cmap: Dict[str, Optional[str]], metrics: Dic
     return 0.0
 
 
+
+def _materialize_tf_bundle(bundle: dict) -> dict:
+    """
+    Собрать Keras-модель из pack {kind=tensorflow, arch_json, weights_bytes, scaler_*}.
+    Возвращает dict с ключом "model" (готовый keras.Model).
+    """
+    import os
+    import tempfile
+
+    if not isinstance(bundle, dict):
+        return bundle
+    # уже есть живая модель
+    m = bundle.get("model")
+    if m is not None and not isinstance(m, (bytes, bytearray, str, dict)):
+        return bundle
+
+    arch = bundle.get("arch_json")
+    weights = bundle.get("weights_bytes")
+    if not arch:
+        raise RuntimeError("tensorflow pack: нет arch_json")
+
+    try:
+        from tensorflow import keras
+    except Exception as e:
+        raise RuntimeError(
+            f"TensorFlow не установлен или не импортируется: {e}. "
+            "Установите tensorflow для моделей kind=tensorflow."
+        ) from e
+
+    model = keras.models.model_from_json(arch)
+    if weights is not None:
+        raw = bytes(weights)
+        tmp_path = None
+        try:
+            # save_weights писал .weights.h5
+            with tempfile.NamedTemporaryFile(suffix=".weights.h5", delete=False) as tmp:
+                tmp.write(raw)
+                tmp_path = tmp.name
+            model.load_weights(tmp_path)
+        except Exception:
+            # fallback: обычный .h5
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+            with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+                tmp.write(raw)
+                tmp_path = tmp.name
+            model.load_weights(tmp_path)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    out = dict(bundle)
+    out["model"] = model
+    return out
+
+
 @dataclass
 class ModelSpec:
     kind: str = "db"
@@ -261,18 +323,60 @@ class ModelSpec:
         pred = np.full(len(df), np.nan, dtype=float)
         if not feats:
             return pred
+        # Алиасы колонок (Cq/cq0/C1, Number/N, ...)
+        try:
+            from .data import resolve_column
+        except Exception:
+            resolve_column = None  # type: ignore
         work = df.copy()
         for c in feats:
-            if c not in work.columns:
+            src = None
+            if resolve_column is not None:
+                try:
+                    src = resolve_column(work, c)
+                except Exception:
+                    src = None
+            if src is None:
+                src = c if c in work.columns else None
+            if src is None:
                 work[c] = np.nan
-            else:
+            elif src == c:
                 work[c] = pd.to_numeric(work[c], errors="coerce")
+            else:
+                work[c] = pd.to_numeric(work[src], errors="coerce")
         ok = work.dropna(subset=feats)
         if len(ok) == 0:
             return pred
         X = ok[feats].to_numpy(dtype=float)
-        yp = model.predict(X)
-        pred[ok.index.to_numpy()] = np.asarray(yp, dtype=float)
+
+        # TensorFlow pack: scaler_x / scaler_y (как в Spektr_F_leaninig.train_model_tf*)
+        sx = b.get("scaler_x") if isinstance(b, dict) else None
+        sy = b.get("scaler_y") if isinstance(b, dict) else None
+        is_tf = isinstance(b, dict) and (
+            b.get("kind") == "tensorflow"
+            or b.get("backend") == "tensorflow"
+            or sx is not None
+        )
+
+        if is_tf and sx is not None:
+            X_in = sx.transform(X)
+        else:
+            X_in = X
+
+        # keras Model.predict vs sklearn
+        try:
+            yp = model.predict(X_in, verbose=0)
+        except TypeError:
+            yp = model.predict(X_in)
+        yp = np.asarray(yp, dtype=float).reshape(-1)
+
+        if is_tf and sy is not None:
+            try:
+                yp = sy.inverse_transform(yp.reshape(-1, 1)).ravel()
+            except Exception:
+                pass
+
+        pred[ok.index.to_numpy()] = yp
         return pred
 
 

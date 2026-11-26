@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, text
 
 from Options import get_connection_string
 
-from .constants import ALL_MSK, REF_F_COL, TARGET_COL
+from .constants import ALL_MSK, COLUMN_ALIASES, REF_F_COL, TARGET_COL
 
 _engine = None
 
@@ -26,6 +26,43 @@ def _get_engine():
 
 def _main() -> str:
     return "psidata"
+
+
+# ---------------------------------------------------------------------------
+# Алиасы колонок (N/Number, cq0/Cq, filtr_freq/Filtr_Freq, ...)
+# ---------------------------------------------------------------------------
+
+def resolve_column(df: pd.DataFrame, logical: str) -> Optional[str]:
+    """Найти реальную колонку в df по каноническому имени."""
+    if df is None or getattr(df, "empty", True):
+        return None
+    cols_lower = {str(c).strip().lower(): c for c in df.columns}
+    for cand in COLUMN_ALIASES.get(logical, (logical,)):
+        if cand in df.columns:
+            return cand
+        key = str(cand).lower()
+        if key in cols_lower:
+            return cols_lower[key]
+    return None
+
+
+def normalize_psi_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Привести колонки к каноническим именам:
+    Number, F, R, Q, C0, Cq, Filtr_Freq, ...
+    Не перезаписывает уже существующие канонические колонки.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    for logical in COLUMN_ALIASES:
+        if logical in out.columns:
+            continue
+        src_col = resolve_column(out, logical)
+        if src_col is not None and src_col != logical:
+            out[logical] = out[src_col]
+    return out
+
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +270,7 @@ def load_psi_by_measure_id(measure_id: int) -> pd.DataFrame:
     eng = _get_engine()
     q = text(f"SELECT * FROM `{_main()}` WHERE Measure_ID = :mid")
     df = pd.read_sql(q, eng, params={"mid": int(measure_id)})
-    return df
+    return normalize_psi_columns(df)
 
 
 def load_psi_by_msk_numbers(
@@ -255,7 +292,7 @@ def load_psi_by_msk_numbers(
         cond += " AND Spc = :spc"
         params["spc"] = spc
     q = text(f"SELECT * FROM `{_main()}` WHERE {cond}")
-    return pd.read_sql(q, eng, params=params)
+    return normalize_psi_columns(pd.read_sql(q, eng, params=params))
 
 
 def load_psi_filtered(
@@ -284,7 +321,7 @@ def load_psi_filtered(
         params["dt"] = date
     where = " AND ".join(conds)
     q = text(f"SELECT * FROM `{_main()}` WHERE {where} LIMIT 5000")
-    return pd.read_sql(q, eng, params=params)
+    return normalize_psi_columns(pd.read_sql(q, eng, params=params))
 
 
 def resolve_ref_f_mhz(row: pd.Series) -> Optional[float]:
