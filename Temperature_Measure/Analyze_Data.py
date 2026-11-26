@@ -9,6 +9,9 @@ from datetime import datetime
 from tabulate import tabulate
 
 from Temperature_Measure.measure_data_class import MEASURE_DATA
+from Temperature_Measure.spc_matching import (parse_temp_list, temps_match,
+                                              load_types_compatible,
+                                              nominal_matches, nominal_exact)
 
 
 def load_measure_file_data(file_inf: str):
@@ -943,12 +946,8 @@ def find_closest_specs(row, df_nom: pd.DataFrame):
         # Фильтруем все спецификации с минимальной разницей
         candidates = df_nom[df_nom['F_diff_ppm'] == min_diff_ppm]
         print('Find_closest', 'Candidates', candidates)
-        # Фильтруем список спецификаций по наличию емкости
-        if row['CL_Metod'] == 'PHYSICAL':  # Если метод не EQREACT то фильтруем по нагрузочной емкости
-            if row['FL'] > 0:
-                candidates = candidates[candidates['Cn(pF)'] > 0]
-            else:
-                candidates = candidates[candidates['Cn(pF)'] == 0]
+        # Подбор по ёмкости нагрузки убран: сравнение значений CL между
+        # файлом и спецификацией отбраковывало корректные номенклатуры.
         if not candidates.empty:
             nominal_freq = round(candidates['частота'].iloc[0])  # Округляем до Гц
             specs = candidates['наименование'].tolist()  # Список спецификаций
@@ -975,10 +974,12 @@ def get_multy_spec(row):
     sql = "Select * from spc_special"
     # Получаем список возможных спецификаций
     spc_df = pd.read_sql(sql, engine)
-    str_list1 = [str(int(x)) for x in temp_list]
+    # Гибкое сопоставление: устойчиво к формату записи (25 vs 25.0,
+    # разделители, покрытие, вложенность диапазонов, IoU)
+    data_temps = parse_temp_list(temp_list)
     for index, spc_ in spc_df.iterrows():
-        db_temps = spc_['Temps'].split(" ")  # список температур
-        if sorted(str_list1) == sorted(db_temps):
+        db_temps = parse_temp_list(spc_['Temps'])  # список температур
+        if temps_match(db_temps, data_temps):
             result.append(spc_['Multy_Spc_Name'])
     return result
 
@@ -1010,26 +1011,282 @@ def test_temp_interval_points(data, spc_list):
     if spc_df.empty:
         return []
 
-    data_temps = set(data['Temp_List'])
-    data_len = len(data['Temp_List'])
+    data_temps = parse_temp_list(data['Temp_List'])
 
     def check_temps(temp_str):
-        if not temp_str:
-            return False
-        try:
-            db_temps = list(map(float, temp_str.split()))
-            return (
-                    set(db_temps) == data_temps and
-                    len(db_temps) == data_len
-            ) or (
-                    set(db_temps).issubset(data_temps) and
-                    data_len >= len(db_temps))
-        except (ValueError, AttributeError):
-            return False
+        # Гибкое сопоставление профилей: точное совпадение (±0.5 °C),
+        # покрытие профиля измерением, вложенность диапазонов или
+        # большое пересечение. Некорректный формат больше не роняет
+        # сравнение строк температур.
+        return temps_match(temp_str, data_temps)
 
     spc_df['Temps_test'] = spc_df['Temperatures'].apply(check_temps)
 
     return spc_df[spc_df['Temps_test']]['Name'].tolist()
+
+
+# ============================================================================
+# Подбор спецификаций под тип резонатора (гибкий + нейросетевой)
+# ============================================================================
+
+SPEC_FIELDS_SQL = """
+    SELECT s.`Name`, s.`ID`, s.`Nominal`, s.`LoadType`, s.`Loadvalue`,
+           s.`Multy`, s.`NameR`, s.`Profile`,
+           tp.`Temperatures` AS ProfileTemps
+    FROM `specification` s
+    LEFT JOIN `temperatureprofile` tp
+    ON s.`Profile` = tp.`Name`
+"""
+
+
+def _series_get(row, key):
+    try:
+        return row.get(key)
+    except Exception:
+        return None
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [v for v in value if v is not None and str(v) != 'nan']
+    try:
+        if pd.isna(value):
+            return []
+    except (TypeError, ValueError):
+        pass
+    return [value]
+
+
+def _to_float(value, default=0.0):
+    try:
+        return float(str(value).strip().replace(',', '.'))
+    except (TypeError, ValueError):
+        return default
+
+
+def _spec_row_to_dict(spec_row) -> dict:
+    """Строка specification → словарь признаков спецификации."""
+    try:
+        multy = int(float(spec_row.get('Multy', 0) or 0)) != 0
+    except (TypeError, ValueError):
+        multy = str(spec_row.get('Multy', 0)).strip() in ('True', 'true')
+    profile_temps = spec_row.get('ProfileTemps')
+    return {
+        'name': str(spec_row.get('Name') or ''),
+        'id': str(spec_row.get('ID') or ''),
+        'nominal': _to_float(spec_row.get('Nominal')),   # МГц
+        'load_type': str(spec_row.get('LoadType') or ''),
+        'load_value': _to_float(spec_row.get('Loadvalue')),
+        'multy': multy,
+        'rtype': str(spec_row.get('NameR') or ''),
+        'profile_temps': None if profile_temps is None else str(profile_temps),
+    }
+
+
+def _row_to_ctx(row) -> dict:
+    """
+    Строка конфигурации файла → контекст признаков подбора
+    (см. Virtual_Measure.Spc_Search_NN.build_feature_vector).
+    """
+    temps = parse_temp_list(_series_get(row, 'Temp_List'))
+    ref_hz = _to_float(_series_get(row, 'Target_Hz'))
+    if ref_hz <= 0:
+        # Target_Hz отбрасывается при формировании итогового датафрейма,
+        # номинал из get_nominal уже в Гц
+        ref_hz = _to_float(_series_get(row, 'Номинал'))
+    cl_metod = str(_series_get(row, 'CL_Metod') or 'SERIES')
+    linked = set()
+    for key in ('Spec_list', 'SpcName', 'Specs_ID', 'SpcID'):
+        linked.update(str(v) for v in _as_list(_series_get(row, key)))
+    return {
+        'ref_hz': ref_hz,
+        'cl_metod': cl_metod,
+        'cl_value': _series_get(row, 'CL_Value'),
+        'temps': temps,
+        'linked': linked,
+    }
+
+
+def _rule_score(ctx: dict, spec: dict) -> float:
+    """Правило совместимости (резерв при недоступной модели NN)."""
+    score = 0.0
+    cl_metod = str(ctx.get('cl_metod') or '')
+    cl_value = _to_float(ctx.get('cl_value'))
+    if spec['load_type'] == cl_metod:
+        score += 2.0
+    elif load_types_compatible(cl_metod, spec['load_type']):
+        score += 1.0
+    spec_hz = spec['nominal'] * 1e6
+    if nominal_exact(spec_hz, ctx.get('ref_hz')):
+        score += 2.0
+    elif nominal_matches(spec_hz, ctx.get('ref_hz')):
+        score += 1.0
+    if ctx.get('cl_value') and cl_value > 0:
+        if abs(spec['load_value'] - cl_value) / max(1.0, cl_value) <= 0.05:
+            score += 0.5
+    linked = ctx.get('linked') or ()
+    if spec['name'] in linked or spec['id'] in linked:
+        score += 1.0
+    return score
+
+
+def _rank_spec_dicts(ctx: dict, candidates, rtype=None):
+    """
+    Кандидаты (словари спецификаций) → [(имя, оценка)] по убыванию.
+    Сначала ансамбль NN (Spc_Search_NN, kind='spcnn'), при недоступности
+    модели — корпусное правило _rule_score.
+    """
+    if not candidates:
+        return []
+    try:
+        from Virtual_Measure import Spc_Search_NN
+        rtype = rtype or ctx.get('rtype')
+        ranked = Spc_Search_NN.rank_spec_candidates(ctx, candidates,
+                                                    rtype=rtype)
+        if ranked:
+            return [(d['name'], p) for d, p in ranked]
+    except Exception as e:
+        print(f"rank_spec_candidates (NN): {e}", flush=True)
+    print("Модель spcnn недоступна, подбор по правилу совместимости",
+          flush=True)
+    scored = [(d, _rule_score(ctx, d)) for d in candidates]
+    scored.sort(key=lambda dp: dp[1], reverse=True)
+    return [(d['name'], s) for d, s in scored]
+
+
+def _load_spec_fields(spc_names):
+    """Загружает поля спецификаций (нагрузка, номинал, профиль) по именам."""
+    if not spc_names:
+        return pd.DataFrame()
+    engine = create_engine(str(get_connection_string()))
+    placeholders = ','.join(['%s'] * len(spc_names))
+    sql = SPEC_FIELDS_SQL + f" WHERE s.`Name` IN ({placeholders})"
+    try:
+        return pd.read_sql(sql, engine, params=tuple(spc_names))
+    except Exception as e:
+        print(f"_load_spec_fields: {e}", flush=True)
+        return pd.DataFrame()
+
+
+def rank_spec_candidates(ctx: dict, spc_names, rtype=None):
+    """
+    Ранжирует спецификации по именам для контекста измерительного файла.
+    Кандидаты сначала пропускаются через гибкую проверку температурного
+    профиля (temps_match); фильтра по ёмкости нагрузки нет.
+    """
+    if not spc_names:
+        return []
+    spec_df = _load_spec_fields(list(spc_names))
+    if spec_df.empty:
+        return []
+    data_temps = parse_temp_list(ctx.get('temps'))
+    candidates = []
+    for _, spec_row in spec_df.iterrows():
+        d = _spec_row_to_dict(spec_row)
+        if not temps_match(parse_temp_list(d.get('profile_temps')),
+                           data_temps):
+            continue
+        candidates.append(d)
+    return _rank_spec_dicts(ctx, candidates, rtype=rtype)
+
+
+def find_spc_for_resonator(rtype, ctx=None, row=None, use_nn=True):
+    """
+    Надёжный подбор спецификаций под тип резонатора (NameR):
+      1) берутся ВСЕ спецификации заданного типа из specification;
+      2) гибкий фильтр по температурному профилю файла;
+      3) ранжирование ансамблем NN (kind='spcnn'), резерв — правило
+         совместимости (_rule_score).
+    :param rtype: тип резонатора (specification.NameR)
+    :param ctx: контекст из _row_to_ctx (или row из конфигурации файла)
+    :param row: строка конфигурации файла (если ctx не задан)
+    :param use_nn: использовать нейросетевое ранжирование
+    :return: [(имя спецификации, оценка)] по убыванию оценки
+    """
+    if ctx is None and row is not None:
+        ctx = _row_to_ctx(row)
+    if not ctx:
+        return []
+    engine = create_engine(str(get_connection_string()))
+    if rtype:
+        sql = SPEC_FIELDS_SQL + " WHERE s.`NameR` = %s AND s.`Name` <> ''"
+        params = (rtype,)
+    else:
+        sql = (SPEC_FIELDS_SQL +
+               " WHERE s.`NameR` IS NOT NULL AND s.`NameR` <> '' "
+               "AND s.`Name` <> ''")
+        params = None
+    try:
+        spec_df = pd.read_sql(sql, engine, params=params)
+    except Exception as e:
+        print(f"find_spc_for_resonator: {e}", flush=True)
+        return []
+    if spec_df.empty:
+        return []
+    data_temps = parse_temp_list(ctx.get('temps'))
+    candidates = []
+    for _, spec_row in spec_df.iterrows():
+        d = _spec_row_to_dict(spec_row)
+        if not temps_match(parse_temp_list(d.get('profile_temps')),
+                           data_temps):
+            continue
+        candidates.append(d)
+    if not use_nn:
+        scored = [(d, _rule_score(ctx, d)) for d in candidates]
+        scored.sort(key=lambda dp: dp[1], reverse=True)
+        return [(d['name'], s) for d, s in scored]
+    return _rank_spec_dicts(ctx, candidates, rtype=rtype)
+
+
+def build_spc_candidate_list(row):
+    """
+    Формирует итоговый список спецификаций (SpcName) для строки
+    конфигурации файла:
+      * базовые кандидаты find_closest_specs (Spec_list) и привязки PSI
+        (SpcID / Specs_ID → nomeklatura_rk_psi);
+      * мульти-спецификации spc_special (гибкое совпадение интервала);
+      * гибкая проверка температурного профиля (temps_match);
+      * ранжирование нейросетью Spc_Search_NN (kind='spcnn'), резерв —
+        правило совместимости (_rule_score).
+    """
+    names = []
+    for key in ('Spec_list', 'SpcName'):
+        for v in _as_list(_series_get(row, key)):
+            v = str(v)
+            if v and v not in names:
+                names.append(v)
+    ids = []
+    for key in ('Specs_ID', 'SpcID'):
+        ids.extend(_as_list(_series_get(row, key)))
+    if ids:
+        try:
+            df_psi = get_psi_specification(ids)
+            for v in df_psi['SpcName'].tolist():
+                v = str(v)
+                if v and v not in names:
+                    names.append(v)
+        except Exception as e:
+            print(f"build_spc_candidate_list (psi): {e}", flush=True)
+    try:
+        for v in get_multy_spec(row):
+            v = str(v)
+            if v and v not in names:
+                names.append(v)
+    except Exception as e:
+        print(f"build_spc_candidate_list (multy): {e}", flush=True)
+
+    ctx = _row_to_ctx(row)
+    if not ctx or not names:
+        return names
+    try:
+        ranked = rank_spec_candidates(ctx, names)
+        if ranked:
+            return [name for name, _score in ranked]
+    except Exception as e:
+        print(f"build_spc_candidate_list (rank): {e}", flush=True)
+    return names
 
 
 def get_psi_specification(spc_id):
