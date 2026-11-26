@@ -16,7 +16,7 @@ from training_common import (
     TARGET, FILTR_MIN, FILTR_MAX, MIN_PER_SPC, MIN_TRAIN, TEST_SIZE, RANDOM_STATE,
     get_engine, load_raw, clean_data, get_features, interactive_setup,
     print_diag, report_predictions, safe_name, save_index,
-    save_model_metrics, make_metrics_row,
+    save_model_metrics, make_metrics_row, dump_torch_model_blob,
 )
 
 OUT_DIR         = "models_torch"
@@ -158,12 +158,25 @@ def train_group(sub, feats, out_dir, tag, auto_search_on):
     d = os.path.join(out_dir, tag)
     os.makedirs(d, exist_ok=True)
     torch.save(b["state_dict"], os.path.join(d, "model.pt"))
-    joblib.dump({k: v for k, v in b.items() if k != "state_dict"},
-                os.path.join(d, "bundle.pkl"))
+    meta = {k: v for k, v in b.items() if k != "state_dict"}
+    meta["features"] = list(feats)
+    meta["target"] = TARGET
+    meta["filtr_bounds"] = (FILTR_MIN, FILTR_MAX)
+    meta["cfg"] = cfg
+    joblib.dump(meta, os.path.join(d, "bundle.pkl"))
     print(f"Сохранено: {d}")
 
-    return {"dir": tag, "n_train": int(len(Xtr)), "n_test": int(len(Xte)),
-            "features": list(feats), "metrics": res, "cfg": cfg}
+    blob = dump_torch_model_blob(b["state_dict"], meta)
+
+    return {
+        "dir": tag,
+        "n_train": int(len(Xtr)),
+        "n_test": int(len(Xte)),
+        "features": list(feats),
+        "metrics": res,
+        "cfg": cfg,
+        "model_blob": blob,
+    }
 
 
 def main():
@@ -197,9 +210,10 @@ def main():
     if scope.startswith("global"):
         spec = train_group(df, feats, OUT_DIR, "global", setup["auto_search"])
         if spec:
-            index["models"]["*"] = spec
+            index["models"]["*"] = {k: v for k, v in spec.items() if k != "model_blob"}
             all_rows.append(make_metrics_row(
-                spec, "*", scope, df, setup["fmax"], "pytorch"))
+                spec, "*", scope, df, setup["fmax"], "pytorch",
+                model_blob=spec.get("model_blob"), features=spec.get("features")))
     else:
         counts = df.groupby("Spc").size().sort_values(ascending=False)
         total, skipped = len(counts), []
@@ -212,9 +226,10 @@ def main():
                                "spc_" + safe_name(spc), setup["auto_search"])
             if spec is None:
                 skipped.append((spc, n)); continue
-            index["models"][spc] = spec
+            index["models"][spc] = {k: v for k, v in spec.items() if k != "model_blob"}
             all_rows.append(make_metrics_row(
-                spec, spc, scope, sub, setup["fmax"], "pytorch"))
+                spec, spc, scope, sub, setup["fmax"], "pytorch",
+                model_blob=spec.get("model_blob"), features=spec.get("features")))
 
         if skipped:
             print(f"\nПропущено Spc: {len(skipped)}")

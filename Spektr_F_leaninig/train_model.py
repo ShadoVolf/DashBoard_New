@@ -147,25 +147,26 @@ def train_group(sub, feats, out_dir, tag, auto_search_on, fmax):
     d = os.path.join(out_dir, tag)
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, "model.joblib")
-    joblib.dump({
+    bundle = {
         "model":        best_model,
         "name":         best,
         "features":     list(feats),
         "target":       TARGET,
         "metrics":      res,
         "filtr_bounds": (FILTR_MIN, FILTR_MAX),
-    }, path)
+    }
+    joblib.dump(bundle, path)
     print(f"Сохранено: {path}")
 
     return {
-        "dir":      tag,
-        "n_train":  int(len(Xtr)),
-        "n_test":   int(len(Xte)),
-        "features": list(feats),
-        "metrics":  res,
-        "best":     best,
-        # fmax пробрасываем в spec, чтобы make_metrics_row взял его оттуда
-        "fmax":     float(fmax),
+        "dir":         tag,
+        "n_train":     int(len(Xtr)),
+        "n_test":      int(len(Xte)),
+        "features":    list(feats),
+        "metrics":     res,
+        "best":        best,
+        "fmax":        float(fmax),
+        "model_blob":  path,  # dump_model_blob загрузит joblib
     }
 
 
@@ -204,7 +205,8 @@ def main():
         if spec:
             index["models"]["*"] = spec
             all_rows.append(make_metrics_row(
-                spec, "*", scope, df, setup["fmax"], BACKEND))
+                spec, "*", scope, df, setup["fmax"], BACKEND,
+                model_blob=spec.get("model_blob"), features=spec.get("features")))
     else:
         counts = df.groupby("Spc").size().sort_values(ascending=False)
         total, skipped = len(counts), []
@@ -220,7 +222,8 @@ def main():
                 skipped.append((spc, n)); continue
             index["models"][spc] = spec
             all_rows.append(make_metrics_row(
-                spec, spc, scope, sub, setup["fmax"], BACKEND))
+                spec, spc, scope, sub, setup["fmax"], BACKEND,
+                model_blob=spec.get("model_blob"), features=spec.get("features")))
 
         if skipped:
             print(f"\nПропущено Spc: {len(skipped)}")

@@ -16,7 +16,7 @@ from training_common import (
     TARGET, FILTR_MIN, FILTR_MAX, MIN_PER_SPC, MIN_TRAIN, TEST_SIZE, RANDOM_STATE,
     get_engine, load_raw, clean_data, get_features, interactive_setup,
     print_diag, report_predictions, safe_name, save_index,
-    save_model_metrics, make_metrics_row,
+    save_model_metrics, make_metrics_row, dump_tf_model_blob,
 )
 
 OUT_DIR        = "models_tf"
@@ -159,12 +159,25 @@ def train_group(sub, feats, out_dir, tag, auto_search_on):
     d = os.path.join(out_dir, tag)
     os.makedirs(d, exist_ok=True)
     b["model"].save(os.path.join(d, "model.keras"))
-    joblib.dump({k: v for k, v in b.items() if k != "model"},
-                os.path.join(d, "bundle.pkl"))
+    meta = {k: v for k, v in b.items() if k != "model"}
+    meta["features"] = list(feats)
+    meta["target"] = TARGET
+    meta["filtr_bounds"] = (FILTR_MIN, FILTR_MAX)
+    meta["cfg"] = cfg
+    joblib.dump(meta, os.path.join(d, "bundle.pkl"))
     print(f"Сохранено: {d}")
 
-    return {"dir": tag, "n_train": int(len(Xtr)), "n_test": int(len(Xte)),
-            "features": list(feats), "metrics": res, "cfg": cfg}
+    blob = dump_tf_model_blob(b["model"], meta)
+
+    return {
+        "dir": tag,
+        "n_train": int(len(Xtr)),
+        "n_test": int(len(Xte)),
+        "features": list(feats),
+        "metrics": res,
+        "cfg": cfg,
+        "model_blob": blob,
+    }
 
 
 # ---------------- main ----------------
@@ -200,7 +213,8 @@ def main():
         if spec:
             index["models"]["*"] = spec
             all_rows.append(make_metrics_row(
-                spec, "*", scope, df, setup["fmax"], "tensorflow"))
+                spec, "*", scope, df, setup["fmax"], "tensorflow",
+                model_blob=spec.get("model_blob"), features=spec.get("features")))
     else:
         counts = df.groupby("Spc").size().sort_values(ascending=False)
         total, skipped = len(counts), []
@@ -215,7 +229,8 @@ def main():
                 skipped.append((spc, n)); continue
             index["models"][spc] = spec
             all_rows.append(make_metrics_row(
-                spec, spc, scope, sub, setup["fmax"], "tensorflow"))
+                spec, spc, scope, sub, setup["fmax"], "tensorflow",
+                model_blob=spec.get("model_blob"), features=spec.get("features")))
 
         if skipped:
             print(f"\nПропущено Spc: {len(skipped)}")
