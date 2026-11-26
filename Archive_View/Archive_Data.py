@@ -1627,3 +1627,1285 @@ def parse_numbers_input(text) -> list[str] | None:
 def find_measure_ids_by_numbers(numbers: list[str],
                                 only_good: bool = False) -> list[int]:
     """
+    Поиск Measure_ID по номерам резонаторов.
+
+    Для основной таблицы (psidata) — через справочник
+    psidata_resonator_lookup с fallback на psidata.
+    Для временной/архивной — прямой запрос по N IN (...)
+    (справочник индексирует только psidata).
+    """
+    if not numbers:
+        return []
+
+    numbers_set = {str(n).strip().upper() for n in numbers if str(n).strip()}
+    if not numbers_set:
+        return []
+
+    table = _main()
+    from sqlalchemy import bindparam
+
+    # --- Не основная таблица: прямой запрос, без lookup ------------------
+    if table != 'psidata':
+        engine = create_engine(str(get_connection_string()))
+        cond = ["UPPER(TRIM(N)) IN :nums", "Measure_ID IS NOT NULL"]
+        if only_good:
+            cond.append("Status2 = 'Good'")
+        stmt = (f"SELECT DISTINCT Measure_ID FROM `{table}` "
+                f"WHERE " + " AND ".join(cond) + " ORDER BY Measure_ID")
+        sql = text(stmt).bindparams(bindparam("nums", expanding=True))
+        try:
+            return pd.read_sql(sql, engine,
+                               params={'nums': list(numbers_set)}
+                               )['Measure_ID'].tolist()
+        except Exception as e:
+            print(f"[Archive] Ошибка поиска по {table}: {e}")
+            return []
+
+    # --- Основная таблица: lookup + fallback ----------------------------
+    from . import Archive_Lookup
+
+    engine = create_engine(str(get_connection_string()))
+
+    # 1) Справочник -------------------------------------------------------
+    found_numbers, found_mids, _ = Archive_Lookup.find_in_lookup(
+        numbers_set, engine=engine)
+
+    # 2) Fallback: variant 3 — прямой поиск по индексу N ------------------
+    missing = numbers_set - found_numbers
+    if missing:
+        try:
+            stmt = ("SELECT DISTINCT N, Measure_ID FROM psidata "
+                    "WHERE N IN :nums AND Measure_ID IS NOT NULL")
+            sql = text(stmt).bindparams(bindparam("nums", expanding=True))
+            df_fb = pd.read_sql(sql, engine, params={'nums': list(missing)})
+            if not df_fb.empty:
+                fb_pairs, fb_nums, fb_mids = [], set(), set()
+                for _, r in df_fb.iterrows():
+                    n_raw, mid_raw = r['N'], r['Measure_ID']
+                    if pd.isna(n_raw) or pd.isna(mid_raw):
+                        continue
+                    n_norm = str(n_raw).strip().upper()
+                    mid = int(mid_raw)
+                    fb_nums.add(n_norm)
+                    fb_mids.add(mid)
+                    fb_pairs.append((mid, n_norm))
+
+                found_numbers |= fb_nums
+                found_mids |= fb_mids
+
+                # Self-heal — следующий раз найдётся через справочник
+                try:
+                    Archive_Lookup.add_pairs_to_lookup(fb_pairs, engine=engine)
+                except Exception as e:
+                    print(f"[Archive] Self-heal ошибка: {e}")
+        except Exception as e:
+            print(f"[Archive] Fallback поиск ошибка: {e}")
+
+    # 3) Фильтр only_good через psidata (с батчингом IN) ------------------
+    if only_good and found_mids:
+        try:
+            good_mids = set()
+            mids_list = list(found_mids)
+            chunk = 1000
+            for i in range(0, len(mids_list), chunk):
+                part = mids_list[i:i + chunk]
+                sql = text(
+                    "SELECT DISTINCT Measure_ID FROM psidata "
+                    "WHERE Measure_ID IN :mids AND Status2 = 'Good'"
+                ).bindparams(bindparam("mids", expanding=True))
+                dfg = pd.read_sql(sql, engine, params={'mids': part})
+                good_mids |= {int(x) for x in dfg['Measure_ID'].unique()}
+            found_mids = good_mids
+        except Exception as e:
+            print(f"[Archive] only_good фильтр ошибка: {e}")
+
+    return sorted(found_mids)
+
+
+def find_measure_ids_by_numbers_old(numbers: list[str],
+                                only_good: bool = False) -> list[int]:
+    """
+    Найти все Measure_ID, содержащие указанные номера (по активной таблице).
+    Ищет без учёта регистра и пробелов: UPPER(TRIM(N)) IN :nums.
+    """
+    if not numbers:
+        return []
+
+    from sqlalchemy import bindparam
+
+    engine = create_engine(str(get_connection_string()))
+    table = _main()
+    cond = ["UPPER(TRIM(N)) IN :nums", "Measure_ID IS NOT NULL"]
+    if only_good:
+        cond.append("Status2 = 'Good'")
+    stmt = (f"SELECT DISTINCT Measure_ID FROM `{table}` WHERE "
+            + " AND ".join(cond) + " ORDER BY Measure_ID")
+    sql = text(stmt).bindparams(bindparam("nums", expanding=True))
+
+    try:
+        return pd.read_sql(sql, engine,
+                           params={'nums': list(numbers)}
+                           )['Measure_ID'].tolist()
+    except Exception as e:
+        print(f"[Archive] Ошибка поиска Measure_ID по номерам: {e}")
+        return []
+
+
+def load_archive_by_numbers(numbers: list[str],
+                            mode: str = 'Только номер',
+                            only_good: bool = False,
+                            found_mids: list[int] | None = None
+                            ) -> pd.DataFrame:
+    """
+    Загрузка записей из активной таблицы по номерам.
+
+    mode:
+      'Только номер' — только строки с указанными номерами;
+      'Вся МСК'      — все строки замеров, содержащих указанные номера.
+    """
+    if not numbers:
+        return pd.DataFrame()
+
+    numbers_set = {str(n).strip().upper() for n in numbers if str(n).strip()}
+    if not numbers_set:
+        return pd.DataFrame()
+
+    if found_mids is None:
+        found_mids = find_measure_ids_by_numbers(
+            list(numbers_set), only_good=only_good)
+    if not found_mids:
+        return pd.DataFrame()
+
+    from sqlalchemy import bindparam
+    engine = create_engine(str(get_connection_string()))
+    table = _main()
+
+    cond = ["Measure_ID IN :mids"]
+    params = {'mids': list(found_mids)}
+    if only_good:
+        cond.append("Status2 = 'Good'")
+
+    stmt = (f"SELECT * FROM `{table}` WHERE " + " AND ".join(cond) +
+            " ORDER BY Measure_ID, N")
+    sql = text(stmt).bindparams(bindparam("mids", expanding=True))
+
+    try:
+        df = pd.read_sql(sql, engine, params=params)
+    except Exception as e:
+        print(f"[Archive] Ошибка загрузки по номерам: {e}")
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    if mode == 'Только номер' and 'N' in df.columns:
+        mask = (df['N'].astype(str).str.strip().str.upper()
+                .isin(numbers_set))
+        df = df[mask].reset_index(drop=True)
+
+    return df
+
+
+def load_archive_by_numbers_old(numbers: list[str],
+                            mode: str = 'Только номер',
+                            only_good: bool = False) -> pd.DataFrame:
+    """
+    Загрузка записей из активной таблицы по номерам.
+
+    mode:
+      'Только номер' - только строки с введёнными номерами
+      'Вся МСК'      - все строки всех замеров, содержащих эти номера
+    """
+    if not numbers:
+        return pd.DataFrame()
+
+    mids = find_measure_ids_by_numbers(numbers, only_good=only_good)
+    if not mids:
+        return pd.DataFrame()
+
+    from sqlalchemy import bindparam
+
+    engine = create_engine(str(get_connection_string()))
+    table = _main()
+    cond = ["Measure_ID IN :mids"]
+    params = {'mids': list(mids)}
+    if only_good:
+        cond.append("Status2 = 'Good'")
+    if mode == 'Только номер':
+        cond.append("UPPER(TRIM(N)) IN :nums")
+        params['nums'] = list(numbers)
+
+    stmt = (f"SELECT * FROM `{table}` WHERE " + " AND ".join(cond) +
+            " ORDER BY Measure_ID, N")
+    sql = text(stmt).bindparams(bindparam("mids", expanding=True))
+    if mode == 'Только номер':
+        sql = sql.bindparams(bindparam("nums", expanding=True))
+
+    try:
+        return pd.read_sql(sql, engine, params=params)
+    except Exception as e:
+        print(f"[Archive] Ошибка загрузки по номерам: {e}")
+        return pd.DataFrame()
+
+
+def load_archive_temperatures_by_mids(measure_ids: list[int]) -> pd.DataFrame:
+    """Температуры по списку Measure_ID за один запрос (активная таблица)."""
+    if not measure_ids:
+        return pd.DataFrame()
+
+    from sqlalchemy import bindparam
+
+    engine = create_engine(str(get_connection_string()))
+    table = _temps()
+    sql = text(f"SELECT * FROM `{table}` WHERE Measure_ID IN :mids "
+               f"ORDER BY Measure_ID, N, Temp")
+    sql = sql.bindparams(bindparam("mids", expanding=True))
+    try:
+        return pd.read_sql(sql, engine,
+                           params={'mids': list(measure_ids)})
+    except Exception as e:
+        print(f"[Archive] Ошибка загрузки температур по mids: {e}")
+        return pd.DataFrame()
+
+
+def search_archive_msk(partial: str | None = None) -> list[str]:
+    """
+    Поиск МСК по неполному номеру в активной таблице замеров.
+
+    Примеры:
+        partial='456'     -> 25-2456, 25-2456*, 25-2456` и т.п.
+        partial='25-2456' -> все МСК, содержащие '25-2456'
+    """
+    if not partial:
+        return []
+
+    partial = str(partial).strip()
+    if not partial:
+        return []
+
+    engine = create_engine(str(get_connection_string()))
+    table = _main()
+    sql = (
+        f"SELECT DISTINCT MSK FROM `{table}` "
+        f"WHERE MSK IS NOT NULL AND MSK LIKE :pat "
+        f"ORDER BY MSK"
+    )
+    try:
+        df = pd.read_sql(
+            text(sql),
+            engine,
+            params={'pat': f'%{partial}%'}
+        )
+        return df['MSK'].dropna().astype(str).tolist()
+    except Exception as e:
+        print(f"[Archive] Ошибка поиска МСК: {e}")
+        return []
+
+def _compute_param_masks(mapped, spc_map):
+    if spc_map is None or spc_map.empty:
+        return {}
+    param_masks = {}
+    for _, spc_item in spc_map.iterrows():
+        param = spc_item['Parameter']
+        col = resolve_param_column(mapped, param, spc_item)   # ← spc_item!
+        if col is None:
+            continue
+        values = pd.to_numeric(mapped[col], errors='coerce')
+        mask = values.notna()
+        mn, mx = spc_item.get('Min'), spc_item.get('Max')
+        if mn is not None and not pd.isna(mn):
+            mask &= values >= float(mn)
+        if mx is not None and not pd.isna(mx):
+            mask &= values <= float(mx)
+        param_masks[param] = mask
+
+    for rsp in [p for p in param_masks if p.startswith('Rsp')]:
+        spfr = f"SPFR_{rsp[3:]}"
+        if spfr in param_masks:
+            param_masks[rsp] = (~param_masks[spfr]) | param_masks[rsp]
+    for spfr in [p for p in param_masks if p.startswith('SPFR_')]:
+        param_masks[spfr] = pd.Series(True, index=mapped.index, dtype=bool)
+    return param_masks
+
+def _compute_param_masks_3(mapped, spc_map):
+    if spc_map is None or spc_map.empty:
+        return {}
+
+    param_masks = {}
+    for _, spc_item in spc_map.iterrows():
+        param = spc_item['Parameter']
+        col = resolve_param_column(mapped, param)
+        if col is None:
+            continue
+        values = pd.to_numeric(mapped[col], errors='coerce')
+        mask = values.notna()
+        min_val = spc_item.get('Min')
+        max_val = spc_item.get('Max')
+        if min_val is not None and not pd.isna(min_val):
+            mask &= values >= float(min_val)
+        if max_val is not None and not pd.isna(max_val):
+            mask &= values <= float(max_val)
+        param_masks[param] = mask
+
+    # Rsp/SPFR
+    for rsp_param in [p for p in param_masks if p.startswith('Rsp')]:
+        rsp_index = rsp_param[3:]
+        spfr_param = f"SPFR_{rsp_index}"
+        if spfr_param in param_masks:
+            param_masks[rsp_param] = (
+                (~param_masks[spfr_param]) | param_masks[rsp_param])
+    for spfr_param in [p for p in param_masks if p.startswith('SPFR_')]:
+        param_masks[spfr_param] = pd.Series(
+            True, index=mapped.index, dtype=bool)
+
+    return param_masks
+
+
+
+
+def _compute_spec_status(mapped: pd.DataFrame,
+                         spc_map: pd.DataFrame) -> pd.Series:
+    """
+    Общий статус изделия с учётом логики Rsp/SPFR
+    (аналог Make_Measure).
+    """
+    param_masks = _compute_param_masks(mapped, spc_map)
+    if not param_masks:
+        return pd.Series(True, index=mapped.index, dtype=bool)
+
+    overall = pd.Series(True, index=mapped.index, dtype=bool)
+    for mask in param_masks.values():
+        overall &= mask
+    return overall
+
+
+
+
+def load_tu_parameters_for_spec(spc_name: str) -> dict | None:
+    """
+    Загружает параметры ТУ для спецификации.
+
+    Каскад:
+      1. specification.Name = spc_name → NameR (тип резонатора), TU (имя ТУ)
+      2. tu.TUName = TU AND tu.ResonatorName = NameR → TUIndex
+         (если не найдено — без фильтра по резонатору)
+      3. tu_parameters.TU_ID = TUIndex (или TU = TUName)
+
+    Возвращает:
+    {
+        'tu_index': int,
+        'tu_name': str,
+        'spc_name': str,
+        'rtype': str,
+        'tu_row': dict,   # строка tu_parameters
+    }
+    или None.
+    """
+    if not spc_name:
+        return None
+    engine = create_engine(str(get_connection_string()))
+    try:
+        spc_df = pd.read_sql(
+            text("SELECT * FROM specification WHERE Name = :n LIMIT 1"),
+            engine, params={'n': spc_name})
+        if spc_df.empty:
+            print(f"[Archive] spec '{spc_name}' not found")
+            return None
+        spc_row = spc_df.iloc[0]
+        rtype = _safe_str(spc_row.get('NameR'))
+        tu_name = _safe_str(spc_row.get('TU'))
+        if not tu_name:
+            print(f"[Archive] spec '{spc_name}' has empty TU")
+            return None
+
+        tu_df = pd.read_sql(
+            text("SELECT TUIndex, TUName FROM tu "
+                 "WHERE TUName = :tu AND ResonatorName = :rt LIMIT 1"),
+            engine, params={'tu': tu_name, 'rt': rtype})
+        if tu_df.empty:
+            tu_df = pd.read_sql(
+                text("SELECT TUIndex, TUName FROM tu "
+                     "WHERE TUName = :tu LIMIT 1"),
+                engine, params={'tu': tu_name})
+        if tu_df.empty:
+            print(f"[Archive] TU '{tu_name}' not found")
+            return None
+        tu_index = int(tu_df.iloc[0]['TUIndex'])
+
+        tp_df = pd.read_sql(
+            text("SELECT * FROM tu_parameters "
+                 "WHERE TU_ID = :i OR TU = :tu LIMIT 1"),
+            engine, params={'i': tu_index, 'tu': tu_name})
+        if tp_df.empty:
+            print(f"[Archive] tu_parameters for TU '{tu_name}' "
+                  f"(index {tu_index}) not found")
+            return None
+
+        return {
+            'tu_index': tu_index,
+            'tu_name': tu_name,
+            'spc_name': spc_name,
+            'rtype': rtype,
+            'tu_row': tp_df.iloc[0].to_dict(),
+        }
+    except Exception as e:
+        print(f"[Archive] load_tu_parameters_for_spec error: {e}")
+        traceback.print_exc()
+        return None
+
+def build_presentation_params(spc_name: str, tu_data: dict) -> list[dict]:
+    print(f"\n{'='*70}")
+    print(f"[Presentation] build_presentation_params для Spc: {spc_name!r}")
+    print(f"{'='*70}")
+
+    spc_df = load_specification(spc_name)
+    if spc_df.empty:
+        print(f"[Presentation] Спецификация не найдена!")
+        return []
+    spec_row = spc_df.iloc[0]
+
+    engine = create_engine(str(get_connection_string()))
+    try:
+        spc_map_table = pd.read_sql(
+            "SELECT * FROM spc_map_table ORDER BY ID", engine)
+    except Exception as e:
+        print(f"[Presentation] spc_map_table недоступна: {e}")
+        return []
+
+    try:
+        dopusk_map = pd.read_sql(
+            "SELECT * FROM spc_dopusk_map_table ORDER BY ID", engine)
+    except Exception:
+        dopusk_map = pd.DataFrame()
+
+    field_map = get_psidata_field_map()
+    tu_row = (tu_data or {}).get('tu_row') or {}
+    if not tu_row:
+        print(f"[Presentation] tu_row пуст!")
+        return []
+
+    # --- Предварительный просмотр ---
+    present_ids = set()
+    for n in range(1, 10):
+        id_field = 'Parametr_ID' if n == 7 else f'Parametr_{n}_ID'
+        pid = _safe_int(tu_row.get(id_field))
+        if pid is not None:
+            present_ids.add(pid)
+
+    print(f"[Presentation] ID в ТУ ({len(present_ids)}): {sorted(present_ids)}")
+    has_param_30 = 30 in present_ids
+    print(f"[Presentation] Есть параметр 30 (ABS): {has_param_30}")
+
+    # --- Включены ли Fmax(15) и Fmin(16) в спецификации? ---
+    p15 = spc_map_table[spc_map_table['ID'] == 15]
+    p16 = spc_map_table[spc_map_table['ID'] == 16]
+    use_15 = (_safe_str(p15.iloc[0]['Use']) if not p15.empty else '')
+    use_16 = (_safe_str(p16.iloc[0]['Use']) if not p16.empty else '')
+    fmax_use = _safe_int(spec_row.get(use_15), default=0) if use_15 else 0
+    fmin_use = _safe_int(spec_row.get(use_16), default=0) if use_16 else 0
+    print(f"[Presentation] Fmax(15).Use({use_15})={fmax_use}, "
+          f"Fmin(16).Use({use_16})={fmin_use}")
+
+    result = []
+    seen_ids = set()
+
+    for n in range(1, 10):
+        id_field = 'Parametr_ID' if n == 7 else f'Parametr_{n}_ID'
+        param_id = _safe_int(tu_row.get(id_field))
+
+        if param_id is None or param_id in seen_ids:
+            continue
+
+        # Пропускаем 15/16, если есть 30 в ТУ
+        if param_id in (15, 16) and has_param_30:
+            print(f"[Presentation] N={n}: ID={param_id} пропущен "
+                  f"(есть ID=30 в ТУ)")
+            continue
+
+        smt = spc_map_table[spc_map_table['ID'] == param_id]
+        if smt.empty:
+            print(f"[Presentation] N={n}: ID={param_id} нет в spc_map_table")
+            continue
+        smt = smt.iloc[0]
+
+        # --- ПРОВЕРКА Use с учётом ID=30 ---
+        if param_id == 30:
+            # Для 30 смотрим Use не его самого (Fmaxm),
+            # а 15 и 16 (Fmx и Fmn)
+            if fmax_use != 1 or fmin_use != 1:
+                print(f"[Presentation] N={n}: ID=30 (ABS) — "
+                      f"15/16 не включены (Fmx={fmax_use}, "
+                      f"Fmn={fmin_use}), пропуск")
+                continue
+            print(f"[Presentation] N={n}: ID=30 (ABS) — включён по Fmax+Fmin")
+        else:
+            use_field = _safe_str(smt.get('Use'))
+            if not use_field:
+                print(f"[Presentation] N={n}: ID={param_id} без Use-колонки")
+                continue
+            use_val = _safe_int(spec_row.get(use_field), default=0)
+            if use_val != 1:
+                print(f"[Presentation] N={n}: ID={param_id} "
+                      f"Use={use_field}={use_val}, пропуск")
+                continue
+
+        param_name = _safe_str(smt.get('Parameter_Name'))
+        if not param_name:
+            continue
+
+        field = param_name
+
+        # --- Нормы (Max/Min) ---
+        mx_f = _safe_str(smt.get('Max'))
+        mn_f = _safe_str(smt.get('Min'))
+
+        if param_id == 30:
+            fmax_row = spc_map_table[spc_map_table['ID'] == 15]
+            if not fmax_row.empty:
+                mx_f = _safe_str(fmax_row.iloc[0].get('Max'))
+                mn_f = _safe_str(fmax_row.iloc[0].get('Min'))
+                print(f"[Presentation] N={n}: ID=30 → нормы из ID=15: "
+                      f"Max={mx_f}, Min={mn_f}")
+
+        max_tu = _safe_float(spec_row.get(mx_f)) if mx_f else None
+        min_tu = _safe_float(spec_row.get(mn_f)) if mn_f else None
+
+        has_mx = max_tu is not None and not pd.isna(max_tu)
+        has_mn = min_tu is not None and not pd.isna(min_tu)
+
+        # --- Нормы ОТК ---
+        units = None
+        pct = None
+        if not dopusk_map.empty:
+            dm = dopusk_map[dopusk_map['Parameter'] == param_name]
+            if not dm.empty:
+                u_f = _safe_str(dm.iloc[0].get('Dopusk_units'))
+                p_f = _safe_str(dm.iloc[0].get('Dopusk_%'))
+                units = _safe_float(spec_row.get(u_f)) if u_f else None
+                pct = _safe_float(spec_row.get(p_f)) if p_f else None
+
+        max_otk = max_tu
+        min_otk = min_tu
+        use_units = units is not None and units > 0
+        use_pct = pct is not None and pct > 0
+        if use_units and use_pct:
+            use_pct = False
+
+        if has_mx:
+            if use_units:
+                max_otk = float(max_tu) - float(units)
+            elif use_pct:
+                max_otk = (float(max_tu)
+                           - abs(float(max_tu)) * float(pct) / 100.0)
+        if has_mn:
+            if use_units:
+                min_otk = float(min_tu) + float(units)
+            elif use_pct:
+                min_otk = (float(min_tu)
+                           + abs(float(min_tu)) * float(pct) / 100.0)
+
+        print(f"[Presentation] N={n}: ID={param_id} '{param_name}' "
+              f"field='{field}' Max_ТУ={max_tu} Min_ТУ={min_tu} "
+              f"Max_ОТК={max_otk} Min_ОТК={min_otk}")
+
+        result.append({
+            'field': field,
+            'param': param_name,
+            'name': _safe_str(tu_row.get(f'Parametr_{n}_Name')) or param_name,
+            'units': _safe_str(tu_row.get(f'Parametr_{n}_Units')),
+            'max_tu': max_tu,
+            'min_tu': min_tu,
+            'max_otk': max_otk,
+            'min_otk': min_otk,
+            'has_max': has_mx,
+            'has_min': has_mn,
+            'has_norm': has_mx or has_mn,
+            'cntrl': _safe_str(tu_row.get(f'Parametr_{n}_Cntrl_P')),
+            'norm_p': _safe_str(tu_row.get(f'Parametr_{n}_Norm_P')),
+            'norm_otk': _safe_str(tu_row.get(f'Parametr_{n}_Norm_OTK')),
+        })
+        seen_ids.add(param_id)
+
+    print(f"[Presentation] Итого параметров: {len(result)}")
+    print(f"[Presentation] Параметры: {[p['param'] for p in result]}")
+    print(f"{'='*70}\n")
+    return result
+
+def build_presentation_params_99(spc_name: str, tu_data: dict) -> list[dict]:
+    print(f"\n{'=' * 70}")
+    print(f"[Presentation] build_presentation_params для Spc: {spc_name!r}")
+    print(f"{'=' * 70}")
+
+    spc_df = load_specification(spc_name)
+    if spc_df.empty:
+        print(f"[Presentation] Спецификация не найдена!")
+        return []
+    spec_row = spc_df.iloc[0]
+
+    engine = create_engine(str(get_connection_string()))
+    try:
+        spc_map_table = pd.read_sql(
+            "SELECT * FROM spc_map_table ORDER BY ID", engine)
+    except Exception as e:
+        print(f"[Presentation] spc_map_table недоступна: {e}")
+        return []
+
+    try:
+        dopusk_map = pd.read_sql(
+            "SELECT * FROM spc_dopusk_map_table ORDER BY ID", engine)
+    except Exception as e:
+        dopusk_map = pd.DataFrame()
+
+    field_map = get_psidata_field_map()
+    tu_row = (tu_data or {}).get('tu_row') or {}
+    if not tu_row:
+        print(f"[Presentation] tu_row пуст!")
+        return []
+
+    # --- ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР: собираем все ID, которые есть в ТУ ---
+    present_ids = set()
+    for n in range(1, 10):
+        id_field = 'Parametr_ID' if n == 7 else f'Parametr_{n}_ID'
+        pid = _safe_int(tu_row.get(id_field))
+        if pid is not None:
+            present_ids.add(pid)
+
+    print(f"[Presentation] ID в ТУ ({len(present_ids)}): {sorted(present_ids)}")
+
+    has_param_30 = 30 in present_ids
+    print(f"[Presentation] Есть параметр 30 (ABS): {has_param_30}")
+
+    result = []
+    seen_ids = set()
+
+    for n in range(1, 10):
+        id_field = 'Parametr_ID' if n == 7 else f'Parametr_{n}_ID'
+        param_id = _safe_int(tu_row.get(id_field))
+
+        if param_id is None:
+            continue
+        if param_id in seen_ids:
+            print(f"[Presentation] N={n}: ID={param_id} уже обработан, пропуск")
+            continue
+
+        # --- ПРОПУСКАЕМ 15 (Fmax) и 16 (Fmin), если есть 30 (ABS) ---
+        if param_id in (15, 16) and has_param_30:
+            print(f"[Presentation] N={n}: ID={param_id} пропущен (есть ID=30)")
+            continue
+
+        smt = spc_map_table[spc_map_table['ID'] == param_id]
+        if smt.empty:
+            print(f"[Presentation] N={n}: ID={param_id} нет в spc_map_table")
+            continue
+        smt = smt.iloc[0]
+
+        use_field = _safe_str(smt.get('Use'))
+        if not use_field:
+            print(f"[Presentation] N={n}: ID={param_id} без Use-колонки")
+            continue
+        use_val = _safe_int(spec_row.get(use_field), default=0)
+        if use_val != 1:
+            print(f"[Presentation] N={n}: ID={param_id} Use={use_field}={use_val}, пропуск")
+            continue
+
+        param_name = _safe_str(smt.get('Parameter_Name'))
+        if not param_name:
+            print(f"[Presentation] N={n}: ID={param_id} без Parameter_Name")
+            continue
+
+        field = param_name  # в data_df колонки называются по Parameter_Name
+
+        # --- ОПРЕДЕЛЕНИЕ НОРМ (Max/Min) ---
+        mx_f = _safe_str(smt.get('Max'))
+        mn_f = _safe_str(smt.get('Min'))
+
+        # Для параметра 30 принудительно берем нормы из Fmax (ID 15)
+        if param_id == 30:
+            fmax_row = spc_map_table[spc_map_table['ID'] == 15]
+            if not fmax_row.empty:
+                mx_f = _safe_str(fmax_row.iloc[0].get('Max'))
+                mn_f = _safe_str(fmax_row.iloc[0].get('Min'))
+                print(f"[Presentation] N={n}: ID=30 → нормы из ID=15: Max={mx_f}, Min={mn_f}")
+
+        max_tu = _safe_float(spec_row.get(mx_f)) if mx_f else None
+        min_tu = _safe_float(spec_row.get(mn_f)) if mn_f else None
+
+        has_mx = max_tu is not None and not pd.isna(max_tu)
+        has_mn = min_tu is not None and not pd.isna(min_tu)
+
+        # --- РАСЧЕТ НОРМ ОТК ---
+        units = None
+        pct = None
+        if not dopusk_map.empty:
+            dm = dopusk_map[dopusk_map['Parameter'] == param_name]
+            if not dm.empty:
+                u_f = _safe_str(dm.iloc[0].get('Dopusk_units'))
+                p_f = _safe_str(dm.iloc[0].get('Dopusk_%'))
+                units = _safe_float(spec_row.get(u_f)) if u_f else None
+                pct = _safe_float(spec_row.get(p_f)) if p_f else None
+
+        max_otk = max_tu
+        min_otk = min_tu
+        use_units = units is not None and units > 0
+        use_pct = pct is not None and pct > 0
+        if use_units and use_pct:
+            use_pct = False
+
+        if has_mx:
+            if use_units:
+                max_otk = float(max_tu) - float(units)
+            elif use_pct:
+                max_otk = (float(max_tu)
+                           - abs(float(max_tu)) * float(pct) / 100.0)
+        if has_mn:
+            if use_units:
+                min_otk = float(min_tu) + float(units)
+            elif use_pct:
+                min_otk = (float(min_tu)
+                           + abs(float(min_tu)) * float(pct) / 100.0)
+
+        print(f"[Presentation] N={n}: ID={param_id} '{param_name}' "
+              f"field='{field}' Max_ТУ={max_tu} Min_ТУ={min_tu} "
+              f"Max_ОТК={max_otk} Min_ОТК={min_otk}")
+
+        result.append({
+            'field': field,
+            'param': param_name,
+            'name': _safe_str(tu_row.get(f'Parametr_{n}_Name')) or param_name,
+            'units': _safe_str(tu_row.get(f'Parametr_{n}_Units')),
+            'max_tu': max_tu,
+            'min_tu': min_tu,
+            'max_otk': max_otk,
+            'min_otk': min_otk,
+            'has_max': has_mx,
+            'has_min': has_mn,
+            'has_norm': has_mx or has_mn,
+            'cntrl': _safe_str(tu_row.get(f'Parametr_{n}_Cntrl_P')),
+            'norm_p': _safe_str(tu_row.get(f'Parametr_{n}_Norm_P')),
+            'norm_otk': _safe_str(tu_row.get(f'Parametr_{n}_Norm_OTK')),
+        })
+        seen_ids.add(param_id)
+
+    print(f"[Presentation] Итого параметров: {len(result)}")
+    print(f"[Presentation] Параметры: {[p['param'] for p in result]}")
+    print(f"{'=' * 70}\n")
+    return result
+def build_presentation_params_10(spc_name: str, tu_data: dict) -> list[dict]:
+    """
+    Возвращает список параметров для предъявительского протокола.
+    """
+    spc_df = load_specification(spc_name)
+    if spc_df.empty:
+        return []
+    spec_row = spc_df.iloc[0]
+
+    engine = create_engine(str(get_connection_string()))
+    try:
+        spc_map_table = pd.read_sql(
+            "SELECT * FROM spc_map_table ORDER BY ID", engine)
+    except Exception as e:
+        print(f"[Archive] spc_map_table недоступна: {e}")
+        return []
+
+    try:
+        dopusk_map = pd.read_sql(
+            "SELECT * FROM spc_dopusk_map_table ORDER BY ID", engine)
+    except Exception as e:
+        dopusk_map = pd.DataFrame()
+
+    field_map = get_psidata_field_map()
+    tu_row = (tu_data or {}).get('tu_row') or {}
+    if not tu_row:
+        return []
+
+    # --- ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР: собираем все ID, которые есть в ТУ ---
+    present_ids = set()
+    for n in range(1, 10):
+        id_field = 'Parametr_ID' if n == 7 else f'Parametr_{n}_ID'
+        pid = _safe_int(tu_row.get(id_field))
+        if pid is not None:
+            present_ids.add(pid)
+
+    has_param_30 = 30 in present_ids
+
+    result = []
+    seen_ids = set()
+
+    for n in range(1, 10):
+        id_field = 'Parametr_ID' if n == 7 else f'Parametr_{n}_ID'
+        param_id = _safe_int(tu_row.get(id_field))
+
+        if param_id is None or param_id in seen_ids:
+            continue
+
+        # --- ПРОПУСКАЕМ 15 (Fmax) и 16 (Fmin), если есть 30 (ABS) ---
+        if param_id in (15, 16) and has_param_30:
+            continue
+
+        smt = spc_map_table[spc_map_table['ID'] == param_id]
+        if smt.empty:
+            continue
+        smt = smt.iloc[0]
+
+        use_field = _safe_str(smt.get('Use'))
+        if not use_field:
+            continue
+        if _safe_int(spec_row.get(use_field), default=0) != 1:
+            continue
+
+        param_name = _safe_str(smt.get('Parameter_Name'))
+        if not param_name:
+            continue
+
+        # --- ОПРЕДЕЛЕНИЕ КОЛОНКИ С ДАННЫМИ ---
+        # data_df всегда использует имена параметров (Parameter_Name),
+        # поэтому передаем param_name вместо физического field
+        field = param_name
+
+        # --- ОПРЕДЕЛЕНИЕ НОРМ (Max/Min) ---
+        mx_f = _safe_str(smt.get('Max'))
+        mn_f = _safe_str(smt.get('Min'))
+
+        # Для параметра 30 принудительно берем нормы из Fmax (ID 15)
+        if param_id == 30:
+            fmax_row = spc_map_table[spc_map_table['ID'] == 15]
+            if not fmax_row.empty:
+                mx_f = _safe_str(fmax_row.iloc[0].get('Max'))
+                mn_f = _safe_str(fmax_row.iloc[0].get('Min'))
+
+        max_tu = _safe_float(spec_row.get(mx_f)) if mx_f else None
+        min_tu = _safe_float(spec_row.get(mn_f)) if mn_f else None
+
+        has_mx = max_tu is not None and not pd.isna(max_tu)
+        has_mn = min_tu is not None and not pd.isna(min_tu)
+
+        # --- РАСЧЕТ НОРМ ОТК (С ТЕХЗАПАСОМ) ---
+        units = None
+        pct = None
+        if not dopusk_map.empty:
+            dm = dopusk_map[dopusk_map['Parameter'] == param_name]
+            if not dm.empty:
+                u_f = _safe_str(dm.iloc[0].get('Dopusk_units'))
+                p_f = _safe_str(dm.iloc[0].get('Dopusk_%'))
+                units = _safe_float(spec_row.get(u_f)) if u_f else None
+                pct = _safe_float(spec_row.get(p_f)) if p_f else None
+
+        max_otk = max_tu
+        min_otk = min_tu
+        use_units = units is not None and units > 0
+        use_pct = pct is not None and pct > 0
+        if use_units and use_pct:
+            use_pct = False
+
+        if has_mx:
+            if use_units:
+                max_otk = float(max_tu) - float(units)
+            elif use_pct:
+                max_otk = (float(max_tu)
+                           - abs(float(max_tu)) * float(pct) / 100.0)
+        if has_mn:
+            if use_units:
+                min_otk = float(min_tu) + float(units)
+            elif use_pct:
+                min_otk = (float(min_tu)
+                           + abs(float(min_tu)) * float(pct) / 100.0)
+
+        result.append({
+            'field': field,
+            'param': param_name,
+            'name': _safe_str(tu_row.get(f'Parametr_{n}_Name')) or param_name,
+            'units': _safe_str(tu_row.get(f'Parametr_{n}_Units')),
+            'max_tu': max_tu,
+            'min_tu': min_tu,
+            'max_otk': max_otk,
+            'min_otk': min_otk,
+            'has_max': has_mx,
+            'has_min': has_mn,
+            'has_norm': has_mx or has_mn,
+            'cntrl': _safe_str(tu_row.get(f'Parametr_{n}_Cntrl_P')),  # Метод контроля
+            'norm_p': _safe_str(tu_row.get(f'Parametr_{n}_Norm_P')),  # Пункт ТУ
+            'norm_otk': _safe_str(tu_row.get(f'Parametr_{n}_Norm_OTK')),
+        })
+        seen_ids.add(param_id)
+
+    return result
+def build_presentation_params_9(spc_name: str, tu_data: dict) -> list[dict]:
+    """
+    Возвращает список параметров для предъявительского протокола.
+
+    Источник порядка и имён — tu_parameters:
+        Parametr_N_ID  →  spc_map_table.ID  (для N=7: Parametr_ID)
+    Для каждого активного в спецификации параметра собираются:
+        * field   — Field в таблице замеров (через psidata_map_table)
+        * param   — Parameter_Name из spc_map_table
+        * name    — tu_parameters.Parametr_N_Name  (заголовок столбца)
+        * max_tu, min_tu   — нормы ТУ из specification
+        * max_otk, min_otk — нормы с техзапасом
+        * cntrl    — tu_parameters.Parametr_N_Cntrl_P
+        * norm_p   — tu_parameters.Parametr_N_Norm_P
+        * norm_otk — tu_parameters.Parametr_N_Norm_OTK
+        * has_norm — True, если задан хотя бы Max или Min
+    """
+    spc_df = load_specification(spc_name)
+    if spc_df.empty:
+        return []
+    spec_row = spc_df.iloc[0]
+
+    engine = create_engine(str(get_connection_string()))
+    try:
+        spc_map_table = pd.read_sql(
+            "SELECT * FROM spc_map_table ORDER BY ID", engine)
+    except Exception as e:
+        print(f"[Archive] spc_map_table недоступна: {e}")
+        return []
+
+    try:
+        dopusk_map = pd.read_sql(
+            "SELECT * FROM spc_dopusk_map_table ORDER BY ID", engine)
+    except Exception as e:
+        print(f"[Archive] spc_dopusk_map_table недоступна: {e} "
+              f"→ техзапас не применяется")
+        dopusk_map = pd.DataFrame()
+
+    field_map = get_psidata_field_map()
+    tu_row = (tu_data or {}).get('tu_row') or {}
+    if not tu_row:
+        return []
+
+    # --- ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР: собираем все ID, которые есть в ТУ ---
+    # Это нужно, чтобы понять, есть ли параметр 30 (ABS(Fmax, Fmin))
+    present_ids = set()
+    for n in range(1, 10):
+        id_field = 'Parametr_ID' if n == 7 else f'Parametr_{n}_ID'
+        pid = _safe_int(tu_row.get(id_field))
+        if pid is not None:
+            present_ids.add(pid)
+
+    has_param_30 = 30 in present_ids
+
+    result = []
+    seen_ids = set()
+
+    for n in range(1, 10):
+        id_field = 'Parametr_ID' if n == 7 else f'Parametr_{n}_ID'
+        param_id = _safe_int(tu_row.get(id_field))
+
+        if param_id is None or param_id in seen_ids:
+            continue
+
+        # --- ПРОПУСКАЕМ 15 (Fmax) и 16 (Fmin), если есть 30 (ABS) ---
+        if param_id in (15, 16) and has_param_30:
+            continue
+
+        smt = spc_map_table[spc_map_table['ID'] == param_id]
+        if smt.empty:
+            continue
+        smt = smt.iloc[0]
+
+        use_field = _safe_str(smt.get('Use'))
+        if not use_field:
+            continue
+        if _safe_int(spec_row.get(use_field), default=0) != 1:
+            continue
+
+        param_name = _safe_str(smt.get('Parameter_Name'))
+        if not param_name:
+            continue
+
+        # --- ОПРЕДЕЛЕНИЕ КОЛОНКИ С ДАННЫМИ ---
+        if param_name == 'ABS(Fmax, Fmin)':
+            field = 'Fmaxm'  # Берем из вычисленной колонки
+        else:
+            field = field_map.get(param_name, param_name)
+
+        # --- ОПРЕДЕЛЕНИЕ НОРМ (Max/Min) ---
+        mx_f = _safe_str(smt.get('Max'))
+        mn_f = _safe_str(smt.get('Min'))
+
+        # Для параметра 30 принудительно берем нормы из Fmax (ID 15)
+        if param_id == 30:
+            fmax_row = spc_map_table[spc_map_table['ID'] == 15]
+            if not fmax_row.empty:
+                mx_f = _safe_str(fmax_row.iloc[0].get('Max'))
+                mn_f = _safe_str(fmax_row.iloc[0].get('Min'))
+
+        max_tu = _safe_float(spec_row.get(mx_f)) if mx_f else None
+        min_tu = _safe_float(spec_row.get(mn_f)) if mn_f else None
+
+        has_mx = max_tu is not None and not pd.isna(max_tu)
+        has_mn = min_tu is not None and not pd.isna(min_tu)
+
+        # --- РАСЧЕТ НОРМ ОТК (С ТЕХЗАПАСОМ) ---
+        units = None
+        pct = None
+        if not dopusk_map.empty:
+            dm = dopusk_map[dopusk_map['Parameter'] == param_name]
+            if not dm.empty:
+                u_f = _safe_str(dm.iloc[0].get('Dopusk_units'))
+                p_f = _safe_str(dm.iloc[0].get('Dopusk_%'))
+                units = _safe_float(spec_row.get(u_f)) if u_f else None
+                pct = _safe_float(spec_row.get(p_f)) if p_f else None
+
+        max_otk = max_tu
+        min_otk = min_tu
+        use_units = units is not None and units > 0
+        use_pct = pct is not None and pct > 0
+        if use_units and use_pct:
+            use_pct = False
+
+        if has_mx:
+            if use_units:
+                max_otk = float(max_tu) - float(units)
+            elif use_pct:
+                max_otk = (float(max_tu)
+                           - abs(float(max_tu)) * float(pct) / 100.0)
+        if has_mn:
+            if use_units:
+                min_otk = float(min_tu) + float(units)
+            elif use_pct:
+                min_otk = (float(min_tu)
+                           + abs(float(min_tu)) * float(pct) / 100.0)
+
+        result.append({
+            'field': field,
+            'param': param_name,
+            'name': _safe_str(tu_row.get(f'Parametr_{n}_Name')) or param_name,
+            'units': _safe_str(tu_row.get(f'Parametr_{n}_Units')),
+            'max_tu': max_tu,
+            'min_tu': min_tu,
+            'max_otk': max_otk,
+            'min_otk': min_otk,
+            'has_max': has_mx,
+            'has_min': has_mn,
+            'has_norm': has_mx or has_mn,
+            'cntrl': _safe_str(tu_row.get(f'Parametr_{n}_Cntrl_P')),  # Метод контроля
+            'norm_p': _safe_str(tu_row.get(f'Parametr_{n}_Norm_P')),  # Пункт ТУ
+            'norm_otk': _safe_str(tu_row.get(f'Parametr_{n}_Norm_OTK')),
+        })
+        seen_ids.add(param_id)
+
+    return result
+
+def build_presentation_params_3(spc_name: str, tu_data: dict) -> list[dict]:
+    """
+    Возвращает список параметров для предъявительского протокола.
+
+    Источник порядка и имён — tu_parameters:
+        Parametr_N_ID  →  spc_map_table.ID  (для N=7: Parametr_ID)
+    Для каждого активного в спецификации параметра собираются:
+        * field   — Field в таблице замеров (через psidata_map_table)
+        * param   — Parameter_Name из spc_map_table
+        * name    — tu_parameters.Parametr_N_Name  (заголовок столбца)
+        * max_tu, min_tu   — нормы ТУ из specification
+        * max_otk, min_otk — нормы с техзапасом
+        * cntrl    — tu_parameters.Parametr_N_Cntrl_P
+        * norm_p   — tu_parameters.Parametr_N_Norm_P
+        * norm_otk — tu_parameters.Parametr_N_Norm_OTK
+        * has_norm — True, если задан хотя бы Max или Min
+    """
+    spc_df = load_specification(spc_name)
+    if spc_df.empty:
+        return []
+    spec_row = spc_df.iloc[0]
+
+    engine = create_engine(str(get_connection_string()))
+    try:
+        spc_map_table = pd.read_sql(
+            "SELECT * FROM spc_map_table ORDER BY ID", engine)
+    except Exception as e:
+        print(f"[Archive] spc_map_table недоступна: {e}")
+        return []
+
+    try:
+        dopusk_map = pd.read_sql(
+            "SELECT * FROM spc_dopusk_map_table ORDER BY ID", engine)
+    except Exception as e:
+        print(f"[Archive] spc_dopusk_map_table недоступна: {e} "
+              f"→ техзапас не применяется")
+        dopusk_map = pd.DataFrame()
+
+    field_map = get_psidata_field_map()
+    tu_row = (tu_data or {}).get('tu_row') or {}
+    if not tu_row:
+        return []
+
+    result = []
+    seen_ids = set()
+
+    for n in range(1, 10):
+        id_field = 'Parametr_ID' if n == 7 else f'Parametr_{n}_ID'
+        param_id = _safe_int(tu_row.get(id_field))
+        if param_id is None or param_id in seen_ids:
+            continue
+
+        smt = spc_map_table[spc_map_table['ID'] == param_id]
+        if smt.empty:
+            continue
+        smt = smt.iloc[0]
+
+        use_field = _safe_str(smt.get('Use'))
+        if not use_field:
+            continue
+        if _safe_int(spec_row.get(use_field), default=0) != 1:
+            continue
+
+        param_name = _safe_str(smt.get('Parameter_Name'))
+        if not param_name:
+            continue
+        field = field_map.get(param_name, param_name)
+
+        mx_f = _safe_str(smt.get('Max'))
+        mn_f = _safe_str(smt.get('Min'))
+        max_tu = _safe_float(spec_row.get(mx_f)) if mx_f else None
+        min_tu = _safe_float(spec_row.get(mn_f)) if mn_f else None
+
+        has_mx = max_tu is not None and not pd.isna(max_tu)
+        has_mn = min_tu is not None and not pd.isna(min_tu)
+
+        units = None
+        pct = None
+        if not dopusk_map.empty:
+            dm = dopusk_map[dopusk_map['Parameter'] == param_name]
+            if not dm.empty:
+                u_f = _safe_str(dm.iloc[0].get('Dopusk_units'))
+                p_f = _safe_str(dm.iloc[0].get('Dopusk_%'))
+                units = _safe_float(spec_row.get(u_f)) if u_f else None
+                pct   = _safe_float(spec_row.get(p_f)) if p_f else None
+
+        max_otk = max_tu
+        min_otk = min_tu
+        use_units = units is not None and units > 0
+        use_pct   = pct   is not None and pct   > 0
+        if use_units and use_pct:
+            use_pct = False
+
+        if has_mx:
+            if use_units:
+                max_otk = float(max_tu) - float(units)
+            elif use_pct:
+                max_otk = (float(max_tu)
+                           - abs(float(max_tu)) * float(pct) / 100.0)
+        if has_mn:
+            if use_units:
+                min_otk = float(min_tu) + float(units)
+            elif use_pct:
+                min_otk = (float(min_tu)
+                           + abs(float(min_tu)) * float(pct) / 100.0)
+
+        result.append({
+            'field': field,
+            'param': param_name,
+            'name': _safe_str(tu_row.get(f'Parametr_{n}_Name')) or param_name,
+            'units': _safe_str(tu_row.get(f'Parametr_{n}_Units')),
+            'max_tu': max_tu,
+            'min_tu': min_tu,
+            'max_otk': max_otk,
+            'min_otk': min_otk,
+            'has_max': has_mx,
+            'has_min': has_mn,
+            'has_norm': has_mx or has_mn,
+            'cntrl': _safe_str(tu_row.get(f'Parametr_{n}_Cntrl_P')),
+            'norm_p': _safe_str(tu_row.get(f'Parametr_{n}_Norm_P')),
+            'norm_otk': _safe_str(tu_row.get(f'Parametr_{n}_Norm_OTK')),
+        })
+        seen_ids.add(param_id)
+
+    return result
+
+def get_next_protocol_number_archive() -> int:
+    """Получить следующий номер протокола из таблицы psi_measure_protokol_id."""
+    engine = create_engine(str(get_connection_string()))
+    try:
+        df = pd.read_sql(
+            "SELECT MAX(CAST(ProtokolN AS UNSIGNED)) AS mx FROM psi_measure_protokol_id",
+            engine
+        )
+        if not df.empty:
+            mx = df.iloc[0]['mx']
+            if pd.notna(mx):
+                return int(mx) + 1
+    except Exception as e:
+        print(f"[Archive] Ошибка получения номера протокола: {e}")
+    return 1
+def save_protocol_to_db(protokol_n: int, msk: str, file_name: str, measure_id: int, count: int, spc: str) -> int:
+    """Сохранить информацию о созданном протоколе в psi_measure_protokol_id.
+    Возвращает Measure_protokol_ID."""
+    from datetime import datetime
+    engine = create_engine(str(get_connection_string()))
+    try:
+        with engine.begin() as conn:
+            res = conn.execute(text("""
+                INSERT INTO `psi_measure_protokol_id` 
+                (`ProtokolN`, `MSK`, `File`, `Measure_ID`, `dataR`, `Count`, `Spc`)
+                VALUES (:pn, :msk, :file, :mid, :dataR, :count, :spc)
+            """), {
+                'pn': protokol_n,
+                'msk': msk,
+                'file': file_name,
+                'mid': measure_id,
+                'dataR': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'count': count,
+                'spc': spc
+            })
+            new_id = res.lastrowid
+        print(f"[Archive] Протокол N {protokol_n} сохранён (ID={new_id})")
+        return new_id
+    except Exception as e:
+        print(f"[Archive] Ошибка сохранения в psi_measure_protokol_id: {e}")
+        return None
+
+def save_protocol_to_db_12(protokol_n: int, msk: str, file_name: str, measure_id: int, count: int, spc: str):
+    """Сохранить информацию о созданном протоколе в psi_measure_protokol_id."""
+    from datetime import datetime
+    engine = create_engine(str(get_connection_string()))
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO `psi_measure_protokol_id` 
+                (`ProtokolN`, `MSK`, `File`, `Measure_ID`, `dataR`, `Count`, `Spc`)
+                VALUES (:pn, :msk, :file, :mid, :dataR, :count, :spc)
+            """), {
+                'pn': protokol_n,
+                'msk': msk,
+                'file': file_name,
+                'mid': measure_id,
+                'dataR': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'count': count,
+                'spc': spc
+            })
+        print(f"[Archive] Протокол N {protokol_n} сохранён в psi_measure_protokol_id")
+    except Exception as e:
+        print(f"[Archive] Ошибка сохранения в psi_measure_protokol_id: {e}")
+
+
+def log_protocol_creation(measure_id: int, protokol_n: int):
+    """Логирование операции создания протокола в отдельную таблицу."""
+    from .Archive_ActionsLog import get_operator
+    from datetime import datetime
+    engine = create_engine(str(get_connection_string()))
+    try:
+        with engine.begin() as conn:
+            # Создаем таблицу, если её нет
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS `protocol_creation_log` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `measure_id` INT,
+                    `protokol_n` INT,
+                    `action` VARCHAR(50) DEFAULT 'create_presentation',
+                    `operator` VARCHAR(100),
+                    `created_at` DATETIME
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO `protocol_creation_log` 
+                (`measure_id`, `protokol_n`, `action`, `operator`, `created_at`)
+                VALUES (:mid, :pn, 'create_presentation', :op, :dt)
+            """), {
+                'mid': measure_id,
+                'pn': protokol_n,
+                'op': get_operator(),
+                'dt': datetime.now()
+            })
+        print(f"[Archive] Запись в журнал создания протоколов добавлена (ID={measure_id})")
+    except Exception as e:
+        print(f"[Archive] Ошибка записи в журнал: {e}")
