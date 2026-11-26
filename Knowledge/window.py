@@ -476,6 +476,10 @@ def do_export(sender=None, app_data=None):
         path = os.path.join(out_dir, f"Knowledge_FiltrFreq_{mid}_{ts}.csv")
         kn_logic.export_result(result, path)
         _log(f"Экспорт: {path}")
+        try:
+            kn_report.open_pdf(path)  # os.startfile / xdg-open — и для csv
+        except Exception:
+            pass
     except Exception as e:
         _log(f"Ошибка экспорта: {e}")
         traceback.print_exc()
@@ -490,17 +494,40 @@ def do_print(sender=None, app_data=None):
             _log("Нет данных для печати")
             return
         mid = _state.get("measure_id") or "-"
+        spc = ""
+        if dpg.does_item_exist(SPC_COMBO):
+            spc = (dpg.get_value(SPC_COMBO) or "").strip()
+        if not spc and result is not None:
+            for c in ("Spc", "SPC", "spc"):
+                if c in result.columns:
+                    vals = result[c].dropna().astype(str).str.strip()
+                    vals = vals[vals != ""]
+                    if not vals.empty:
+                        spc = str(vals.iloc[0])
+                        break
+        msk = ""
+        if dpg.does_item_exist(MSK_COMBO):
+            msk = (dpg.get_value(MSK_COMBO) or "").strip()
         view = {
             "Operator": "Knowledge",
-            "Protokol_Type": "Filtr_Freq",
-            "MSK": dpg.get_value(MSK_COMBO) if dpg.does_item_exist(MSK_COMBO) else "",
-            "Spc": dpg.get_value(SPC_COMBO) if dpg.does_item_exist(SPC_COMBO) else "",
+            "Protokol_Type": "ПСИ",
+            "MSK": msk,
+            "Spc": spc,
+            "Full_Msk": msk,
         }
-        path = kn_report.print_or_export(result, mid, view_data=view, prefer_pdf=True)
-        _log(f"Протокол: {path}")
+        _set_busy(True)
+        _set_progress(0.2, f"Формирование PDF-протокола MID={mid} Spc={spc!r}…")
+        path = kn_report.print_or_export(
+            result, mid, view_data=view, prefer_pdf=True, open_after=True
+        )
+        _set_progress(1.0, f"Протокол: {path}")
     except Exception as e:
         _log(f"Ошибка печати: {e}")
         traceback.print_exc()
+    finally:
+        _set_busy(False)
+
+
 def _fmt_cell(col: str, val) -> str:
     """Форматирование ячеек таблицы по требованиям UI."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
