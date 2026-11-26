@@ -297,6 +297,18 @@ def reload_data(sender=None, app_data=None):
             numbers=numbers or None,
             date=date or None,
         )
+
+        # --- очистка Filtr_Freq: |значение| > 10000 -> NaN ---
+        ff_col = kn_data.resolve_column(df, "Filtr_Freq")
+        if ff_col is not None and not df.empty:
+            ff = pd.to_numeric(df[ff_col], errors="coerce")
+            bad = ff.abs() > 10000
+            n_bad = int(bad.sum())
+            if n_bad:
+                df.loc[bad, ff_col] = pd.NA
+                _log(f"Filtr_Freq: обнулено {n_bad} выбросов (|x| > 10000)")
+        # -----------------------------------------------------
+
         _state["psi_df"] = df
         ctx = kn_logic.resolve_context(df)
         _state["measure_id"] = ctx.get("measure_id") or measure_id
@@ -308,7 +320,6 @@ def reload_data(sender=None, app_data=None):
         if not _state.get("all_models"):
             refresh_models()
         auto_pick_model_ui()
-        # Сразу показать данные замера в таблице (без Filtr_Freq)
         _state["result_df"] = df.copy() if df is not None else pd.DataFrame()
         _fill_result_table(_state["result_df"], show_pred=False)
     except Exception as e:
