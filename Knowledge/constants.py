@@ -73,7 +73,7 @@ COLUMN_ALIASES = {
 # Колонки, которые показываем в таблице результатов
 TABLE_COLUMNS = (
     "Number", "F", "R", "Q", "C0", "Cq",
-    "Nominal", "Filtr_Freq_pred",
+    "Nominal", "Filtr_Freq", "Filtr_Freq_pred",
 )
 
 DEFAULT_MODELS_SUBDIR = "models_sklearn"

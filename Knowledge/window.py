@@ -427,8 +427,6 @@ def do_print(sender=None, app_data=None):
     except Exception as e:
         _log(f"Ошибка печати: {e}")
         traceback.print_exc()
-
-
 def _fmt_cell(col: str, val) -> str:
     """Форматирование ячеек таблицы по требованиям UI."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -458,45 +456,81 @@ def _fmt_cell(col: str, val) -> str:
         return str(val) if val is not None else ""
 
 
+
 def _fill_result_table(df: pd.DataFrame, show_pred: bool = False):
     if not dpg.does_item_exist(RESULT_TABLE):
         return
-    children = dpg.get_item_children(RESULT_TABLE, slot=1) or []
-    for ch in children:
-        try:
-            dpg.delete_item(ch)
-        except Exception:
-            pass
+
+    # Удаляем и строки (slot=1), и колонки (slot=0)
+    for slot in (1, 0):
+        children = dpg.get_item_children(RESULT_TABLE, slot=slot) or []
+        for ch in children:
+            try:
+                dpg.delete_item(ch)
+            except Exception:
+                pass
 
     if df is None or df.empty:
         return
 
-    # Number, F, R, Q, C0, Cq, Nominal + всегда Filtr_Freq_pred после предсказания
-    # колонку Filtr_Freq в таблицу не показываем
+    only_missing = True
+    if dpg.does_item_exist(ONLY_MISSING_CHECK):
+        only_missing = bool(dpg.get_value(ONLY_MISSING_CHECK))
+
+    # базовые колонки
     show_cols = [c for c in TABLE_COLUMNS if c in df.columns]
     if "Number" not in show_cols:
         n_col = kn_data.resolve_column(df, "Number")
         if n_col is not None and n_col not in show_cols:
             show_cols = [n_col] + show_cols
 
-    # Filtr_Freq_pred показываем всегда, если колонка есть (независимо от Filtr_Freq и галочки)
-    if "Filtr_Freq_pred" in df.columns and "Filtr_Freq_pred" not in show_cols:
-        show_cols.append("Filtr_Freq_pred")
-    if not show_pred:
-        # при простой загрузке pred ещё нет — не резервируем пустую колонку
+    # Filtr_Freq_pred — только когда есть предсказание
+    if show_pred and "Filtr_Freq_pred" in df.columns:
+        if "Filtr_Freq_pred" not in show_cols:
+            show_cols.append("Filtr_Freq_pred")
+    else:
         show_cols = [c for c in show_cols if c != "Filtr_Freq_pred"]
 
-    # убрать Filtr_Freq из отображения на всякий случай
-    show_cols = [c for c in show_cols if str(c).lower() not in ("filtr_freq",)]
+    # Filtr_Freq — только когда галочка СНЯТА
+    ff_col = kn_data.resolve_column(df, "Filtr_Freq")
+    if only_missing:
+        show_cols = [c for c in show_cols if c != "Filtr_Freq" and c != ff_col]
+    else:
+        if ff_col is not None and ff_col not in show_cols:
+            if "Filtr_Freq_pred" in show_cols:
+                idx = show_cols.index("Filtr_Freq_pred")
+                show_cols.insert(idx, ff_col)
+            else:
+                show_cols.append(ff_col)
 
     if not show_cols:
-        show_cols = [c for c in df.columns if str(c).lower() not in ("filtr_freq",)][:12]
+        show_cols = list(df.columns)[:12]
 
+    # 1) пересоздаём колонки под актуальный набор
+    for c in show_cols:
+        dpg.add_table_column(label=str(c), parent=RESULT_TABLE)
+
+    # 2) заполняем строки — строго по числу колонок
     view = df[show_cols].head(500)
     for _, row in view.iterrows():
         with dpg.table_row(parent=RESULT_TABLE):
             for c in show_cols:
                 dpg.add_text(_fmt_cell(c, row[c]))
+
+
+
+def on_only_missing_changed(sender=None, app_data=None):
+    """Перерисовать таблицу при переключении галочки."""
+    df = _state.get("result_df")
+    if df is None or df.empty:
+        df = _state.get("psi_df")
+    if df is None or df.empty:
+        return
+    show_pred = "Filtr_Freq_pred" in df.columns and \
+                bool(pd.to_numeric(df.get("Filtr_Freq_pred"), errors="coerce").notna().any())
+    _fill_result_table(df, show_pred=show_pred)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +612,7 @@ def create_knowledge_window():
                     label="Только без Filtr_Freq",
                     tag=ONLY_MISSING_CHECK,
                     default_value=True,
+                    callback=on_only_missing_changed,
                 )
                 dpg.add_button(label="Предсказать Filtr_Freq", tag=PREDICT_BTN, width=-1, callback=do_predict)
                 dpg.add_button(label="Сохранить в БД", tag=SAVE_DB_BTN, width=-1, callback=do_save_db)
