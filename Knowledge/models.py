@@ -792,8 +792,22 @@ def group_model_types(all_models: Sequence[ModelSpec]) -> Dict[str, List[ModelSp
 
 
 def run_prediction(model: ModelSpec, df: pd.DataFrame) -> pd.DataFrame:
+    n = len(df)
+    print(
+        f"[Knowledge/models] run_prediction: id={model.db_id} "
+        f"type={model.model_type!r} backend={model.backend!r} rows={n}",
+        flush=True,
+    )
     out = df.copy()
     pred = model.predict(out)
+    try:
+        n_ok = int(np.isfinite(np.asarray(pred, dtype=float)).sum())
+    except Exception:
+        n_ok = 0
+    print(
+        f"[Knowledge/models] run_prediction done: predicted {n_ok}/{n}",
+        flush=True,
+    )
     out["Filtr_Freq_pred"] = pred
     if TARGET_COL not in out.columns:
         out[TARGET_COL] = pred

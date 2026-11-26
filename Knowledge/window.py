@@ -32,6 +32,8 @@ from .constants import (
     ONLY_MISSING_CHECK,
     PREDICT_BTN,
     PRINT_BTN,
+    PROGRESS_BAR,
+    PROGRESS_TEXT,
     RELOAD_BTN,
     RESULT_CONTAINER,
     RESULT_TABLE,
@@ -69,6 +71,46 @@ def _log(msg: str) -> None:
             dpg.set_value(STATUS_TAG, str(msg)[:240])
     except Exception:
         pass
+
+
+def _set_progress(frac: float, text: str = "") -> None:
+    """0..1 + подпись; split_frame чтобы UI обновился до конца расчёта."""
+    frac = max(0.0, min(1.0, float(frac)))
+    try:
+        if dpg.does_item_exist(PROGRESS_BAR):
+            dpg.set_value(PROGRESS_BAR, frac)
+            dpg.configure_item(PROGRESS_BAR, overlay=f"{int(frac * 100)}%")
+        if text and dpg.does_item_exist(PROGRESS_TEXT):
+            dpg.set_value(PROGRESS_TEXT, text)
+        if text:
+            _log(text)
+        # дать Dear PyGui отрисовать кадр (иначе прогресс виден только после return)
+        try:
+            dpg.split_frame()
+        except Exception:
+            pass
+    except Exception:
+        if text:
+            _log(text)
+
+
+def _set_busy(busy: bool) -> None:
+    """Блокировка кнопок на время расчёта."""
+    for tag in (PREDICT_BTN, SAVE_DB_BTN, EXPORT_BTN, PRINT_BTN, RELOAD_BTN):
+        try:
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, enabled=not busy)
+        except Exception:
+            pass
+    if not busy:
+        try:
+            if dpg.does_item_exist(PROGRESS_BAR):
+                dpg.set_value(PROGRESS_BAR, 0.0)
+                dpg.configure_item(PROGRESS_BAR, overlay="")
+            if dpg.does_item_exist(PROGRESS_TEXT):
+                dpg.set_value(PROGRESS_TEXT, "")
+        except Exception:
+            pass
 
 
 def _set_combo(tag: str, items: list, value: str = "") -> None:
@@ -352,7 +394,25 @@ def do_predict(sender=None, app_data=None):
                     return
             # если колонки Filtr_Freq нет — предсказываем по всем строкам
 
+        n_rows = len(work)
+        mname = getattr(model, "name", "") or getattr(model, "model_type", "model")
+        _set_busy(True)
+        _set_progress(
+            0.05,
+            f"Идёт расчёт… модель «{mname}», строк: {n_rows} "
+            f"(type={getattr(model, 'model_type', '')})",
+        )
+        _set_progress(0.25, f"Загрузка весов модели id={getattr(model, 'db_id', None)}…")
+        try:
+            # прогрев load() отдельно — видно в логе, если долго тянется blob
+            model.load()
+        except Exception:
+            # load повторится внутри predict; здесь только индикация
+            pass
+        _set_progress(0.55, f"Предсказание Filtr_Freq по {n_rows} строкам…")
+
         result = kn_logic.predict_for_measure(work, model)
+        _set_progress(0.85, "Обновление таблицы результатов…")
         if only_missing and len(result) < len(df):
             full = df.copy()
             if "Filtr_Freq_pred" not in full.columns:
@@ -365,13 +425,16 @@ def do_predict(sender=None, app_data=None):
         _state["result_df"] = result
         _fill_result_table(result, show_pred=True)
         n_ok = int(pd.to_numeric(result.get("Filtr_Freq_pred"), errors="coerce").notna().sum())
-        _log(
-            f"Предсказание: {n_ok}/{len(result)}  "
-            f"type={model.model_type}  P(|err|<50Hz)={_fmt_frac50(model)}"
+        _set_progress(
+            1.0,
+            f"Готово: {n_ok}/{len(result)}  type={model.model_type}  "
+            f"P(|err|<50Hz)={_fmt_frac50(model)}",
         )
     except Exception as e:
         _log(f"Ошибка предсказания: {e}")
         traceback.print_exc()
+    finally:
+        _set_busy(False)
 
 
 def do_save_db(sender=None, app_data=None):
@@ -626,6 +689,8 @@ def create_knowledge_window():
                     callback=on_only_missing_changed,
                 )
                 dpg.add_button(label="Предсказать Filtr_Freq", tag=PREDICT_BTN, width=-1, callback=do_predict)
+                dpg.add_progress_bar(tag=PROGRESS_BAR, default_value=0.0, width=-1, overlay="")
+                dpg.add_text("", tag=PROGRESS_TEXT, wrap=280)
                 dpg.add_button(label="Сохранить в БД", tag=SAVE_DB_BTN, width=-1, callback=do_save_db)
                 dpg.add_button(label="Печать протокола", tag=PRINT_BTN, width=-1, callback=do_print)
                 dpg.add_button(label="Экспорт CSV", tag=EXPORT_BTN, width=-1, callback=do_export)

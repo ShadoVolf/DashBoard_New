@@ -31,6 +31,8 @@ SAVE_DB_BTN = "kn_save_db_btn"
 EXPORT_BTN = "kn_export_btn"
 RELOAD_BTN = "kn_reload_btn"
 ONLY_MISSING_CHECK = "kn_only_missing_check"
+PROGRESS_BAR = "kn_progress_bar"
+PROGRESS_TEXT = "kn_progress_text"
 
 ALL_MSK = "- все МСК -"
 SPC_RK731 = "РК731"
