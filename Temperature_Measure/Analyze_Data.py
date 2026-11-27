@@ -17,7 +17,9 @@ def load_measure_file_data(file_inf: str):
     сохраняет их в переменную measure_file в виде словаря в классе MEASURE_DATA
     :param file_inf:
     """
-    engine = create_engine(str(get_connection_string()))
+    # Новый файл — сбрасываем кэш справочников (на случай обновления БД)
+    clear_spec_cache()
+    engine = get_engine()
     file_inf_arrray = file_inf.split()  # Разбиваем строку на слова
     file_id = str(file_inf_arrray[0])  # Идентификатор файла
     file_name = str(file_inf_arrray[1])  # Имя файла
@@ -923,6 +925,161 @@ SCORE_TEMP_EXACT = 50.0
 SCORE_TEMP_SUBSET = 20.0
 
 
+# -----------------------------------------------------------------------------
+# Кэш справочников + общий engine (ускорение автоподбора)
+# -----------------------------------------------------------------------------
+_engine = None
+
+# Сколько строк отсева печатать на одну причину (полный dump — только DEBUG)
+SPEC_LOG_REJECT_SAMPLES = 5
+
+
+def get_engine():
+    """Singleton SQLAlchemy engine на процесс."""
+    global _engine
+    if _engine is None:
+        _engine = create_engine(
+            str(get_connection_string()),
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
+    return _engine
+
+
+class SpecRefCache:
+    """
+    Кэш справочников на сессию файла.
+    Загрузка ленивая, один SQL на таблицу; invalidate() при смене файла.
+    """
+    __slots__ = (
+        'nomeklatura_rk', 'nomeklatura_rk_psi', 'spc_special',
+        'spec_profiles',  # name -> (profile_name, temps_list, temps_str)
+        '_loaded',
+    )
+
+    def __init__(self):
+        self.nomeklatura_rk = None
+        self.nomeklatura_rk_psi = None
+        self.spc_special = None
+        self.spec_profiles = {}
+        self._loaded = set()
+
+    def clear(self):
+        self.nomeklatura_rk = None
+        self.nomeklatura_rk_psi = None
+        self.spc_special = None
+        self.spec_profiles = {}
+        self._loaded.clear()
+        print('[SpecRefCache] очищен')
+
+    def ensure_nomeklatura_rk(self) -> pd.DataFrame:
+        if 'nomeklatura_rk' in self._loaded and self.nomeklatura_rk is not None:
+            return self.nomeklatura_rk
+        engine = get_engine()
+        sql = (
+            "SELECT DISTINCT `частота`, `Cn(pF)`, `наименование`, `номенклатура` "
+            "FROM `nomeklatura_rk` ORDER BY `наименование`"
+        )
+        df = pd.read_sql_query(sql, engine)
+        df = df.dropna().loc[df['частота'] != 0].copy()
+        df['частота'] = df['частота'] * 1000  # кГц/МГц в таблице → Гц
+        self.nomeklatura_rk = df
+        self._loaded.add('nomeklatura_rk')
+        print(f'[SpecRefCache] nomeklatura_rk: {len(df)} строк')
+        return df
+
+    def ensure_nomeklatura_rk_psi(self) -> pd.DataFrame:
+        if 'nomeklatura_rk_psi' in self._loaded and self.nomeklatura_rk_psi is not None:
+            return self.nomeklatura_rk_psi
+        engine = get_engine()
+        sql = (
+            "SELECT `NomenklaturaID`, `SpcID`, `SpcName` "
+            "FROM `nomeklatura_rk_psi` ORDER BY `SpcName`"
+        )
+        try:
+            df = pd.read_sql_query(sql, engine)
+        except Exception:
+            # fallback если имена колонок отличаются
+            df = pd.read_sql_query("SELECT * FROM `nomeklatura_rk_psi` ORDER BY `SpcName`", engine)
+        self.nomeklatura_rk_psi = df
+        self._loaded.add('nomeklatura_rk_psi')
+        print(f'[SpecRefCache] nomeklatura_rk_psi: {len(df)} строк')
+        return df
+
+    def ensure_spc_special(self) -> pd.DataFrame:
+        if 'spc_special' in self._loaded and self.spc_special is not None:
+            return self.spc_special
+        engine = get_engine()
+        df = pd.read_sql_query("SELECT * FROM `spc_special`", engine)
+        self.spc_special = df
+        self._loaded.add('spc_special')
+        print(f'[SpecRefCache] spc_special: {len(df)} строк')
+        return df
+
+    def ensure_spec_profiles(self, names) -> dict:
+        """
+        Подгружает temperatureprofile для списка имён спецификаций.
+        Уже известные имена не перечитываются.
+        """
+        names = [n for n in names if n]
+        missing = [n for n in names if n not in self.spec_profiles]
+        if not missing:
+            return self.spec_profiles
+
+        engine = get_engine()
+        placeholders = ','.join(['%s'] * len(missing))
+        sql = f"""
+            SELECT s.`Name`, s.`Profile`, tp.`Temperatures`
+            FROM `specification` s
+            LEFT JOIN `temperatureprofile` tp ON s.`Profile` = tp.`Name`
+            WHERE s.`Name` IN ({placeholders})
+        """
+        try:
+            df = pd.read_sql(sql, engine, params=tuple(missing))
+        except Exception as e:
+            print(f'[SpecRefCache] spec_profiles error: {e}')
+            for n in missing:
+                self.spec_profiles[n] = (None, [], None)
+            return self.spec_profiles
+
+        found = set()
+        for _, r in df.iterrows():
+            tstr = r['Temperatures']
+            try:
+                pt = list(map(float, str(tstr).split())) if pd.notna(tstr) and tstr else []
+            except (ValueError, AttributeError):
+                pt = []
+            self.spec_profiles[r['Name']] = (r.get('Profile'), pt, tstr)
+            found.add(r['Name'])
+        for n in missing:
+            if n not in found:
+                self.spec_profiles[n] = (None, [], None)
+        print(f'[SpecRefCache] spec_profiles: +{len(missing)} имён '
+              f'(всего {len(self.spec_profiles)})')
+        return self.spec_profiles
+
+
+_spec_cache = SpecRefCache()
+
+
+def get_spec_cache() -> SpecRefCache:
+    return _spec_cache
+
+
+def clear_spec_cache() -> None:
+    """Сбросить кэш (вызывать при смене/перезагрузке файла)."""
+    _spec_cache.clear()
+
+
+def preload_spec_refs() -> None:
+    """Прогрев всех справочников одним проходом (опционально)."""
+    c = _spec_cache
+    c.ensure_nomeklatura_rk()
+    c.ensure_nomeklatura_rk_psi()
+    c.ensure_spc_special()
+
+
+
 def get_ppm_threshold() -> float:
     """Текущий порог совпадения номинала, ppm."""
     import os
@@ -1083,7 +1240,11 @@ def _log_block(title: str) -> None:
 
 def log_nomenclature_selection(target_hz, cl_metod, fl_value, ppm_threshold,
                                accepted, rejected) -> None:
-    """Подробный лог этапа подбора по номиналу."""
+    """Лог этапа подбора по номиналу (отсев — сжатый: счётчики + N примеров)."""
+    import os
+    debug = os.environ.get('DEBUG_SPEC_SELECTION', '').strip() in ('1', 'true', 'yes')
+    samples = len(rejected) if debug else SPEC_LOG_REJECT_SAMPLES
+
     _log_block('АВТОПОДБОР: этап 1 — номинал (частота + ёмкость)')
     print(f'  Target_Hz      : {target_hz}')
     print(f'  CL_Metod       : {cl_metod}')
@@ -1104,20 +1265,19 @@ def log_nomenclature_selection(target_hz, cl_metod, fl_value, ppm_threshold,
         print('  ОТОБРАНЫ: (пусто)')
     print('-' * 72)
     if rejected:
-        print('  ОТСЕЯНЫ:')
-        # Группируем по причине для читаемости
+        print('  ОТСЕЯНЫ (сжатый лог, DEBUG_SPEC_SELECTION=1 — полный):')
         by_reason = {}
         for r in rejected:
             by_reason.setdefault(r.get('reason', '?'), []).append(r)
         for reason, items in by_reason.items():
             print(f'    ▸ {reason}  ({len(items)} шт.)')
-            for r in items[:20]:
+            for r in items[:samples]:
                 print(
                     f'        Δ={r["ppm"]:8.3f} ppm  f={r["частота"]}  '
                     f'Cn={r["Cn(pF)"]}  {r["наименование"]}  (id={r["номенклатура"]})'
                 )
-            if len(items) > 20:
-                print(f'        ... ещё {len(items) - 20}')
+            if len(items) > samples:
+                print(f'        ... ещё {len(items) - samples}')
     else:
         print('  ОТСЕЯНЫ: (нет)')
     print('=' * 72)
@@ -1239,18 +1399,18 @@ def find_closest_specs(row, df_nom: pd.DataFrame):
 
 # Получает список мульти спецификаций для данного температурного интервала
 def get_multy_spec(row):
+    """Multi-spec из кэша spc_special (без повторного SQL)."""
     result = []
     temp_list = row['Temp_List']
-    engine = create_engine(str(get_connection_string()))
-    sql = "Select * from spc_special"
-    spc_df = pd.read_sql(sql, engine)
+    spc_df = get_spec_cache().ensure_spc_special()
     try:
         str_list1 = [str(int(float(x))) for x in temp_list]
     except (TypeError, ValueError):
         str_list1 = [str(x) for x in temp_list]
-    for index, spc_ in spc_df.iterrows():
-        db_temps = spc_['Temps'].split(" ")
-        if sorted(str_list1) == sorted(db_temps):
+    key = tuple(sorted(str_list1))
+    for _, spc_ in spc_df.iterrows():
+        db_temps = str(spc_['Temps']).split()
+        if tuple(sorted(db_temps)) == key:
             result.append(spc_['Multy_Spc_Name'])
     if result:
         print(f'  [multi-spec] для temp={str_list1} найдены: {result}')
@@ -1260,28 +1420,11 @@ def get_multy_spec(row):
 # Проверяет соответствие температурного интервала спецификации и измерительного файла
 def test_temp_interval_points(data, spc_list):
     """
-    Фильтрует список имён спецификаций по совпадению температурного профиля.
-    Сохраняет относительный порядок входного списка (уже отранжированного).
-    Логирует принятые и отсеянные с причиной.
+    Фильтрует имена спецификаций по температурному профилю.
+    Профили читаются из SpecRefCache (SQL только для ещё не кэшированных имён).
+    Порядок входного списка сохраняется.
     """
     if not spc_list:
-        return []
-
-    engine = create_engine(str(get_connection_string()))
-
-    placeholders = ','.join(['%s'] * len(spc_list))
-    spc_query = f"""
-        SELECT s.`Name`, s.`Profile`, tp.`Temperatures`
-        FROM `specification` s
-        LEFT JOIN `temperatureprofile` tp
-        ON s.`Profile` = tp.`Name`
-        WHERE s.`Name` IN ({placeholders})
-    """
-
-    try:
-        spc_df = pd.read_sql(spc_query, engine, params=tuple(spc_list))
-    except Exception as e:
-        print(f"Database error in test_temp_interval_points: {e}")
         return []
 
     file_temps_raw = data['Temp_List'] if hasattr(data, '__getitem__') else []
@@ -1293,26 +1436,21 @@ def test_temp_interval_points(data, spc_list):
     except Exception:
         file_temps = list(file_temps_raw) if file_temps_raw is not None else []
 
-    # name -> (profile_str, temps_list)
-    info = {}
-    if not spc_df.empty:
-        for _, r in spc_df.iterrows():
-            tstr = r['Temperatures']
-            try:
-                pt = list(map(float, str(tstr).split())) if tstr else []
-            except (ValueError, AttributeError):
-                pt = []
-            info[r['Name']] = (tstr, pt, r.get('Profile'))
+    profiles = get_spec_cache().ensure_spec_profiles(spc_list)
 
-    kept = []       # (name, match_kind, profile_str)
-    dropped = []    # (name, reason, profile_str)
+    kept = []
+    dropped = []
     kept_names = []
 
     for name in spc_list:
-        if name not in info:
+        if name not in profiles:
             dropped.append((name, 'нет в БД specification/profile', None))
             continue
-        tstr, pt, profile = info[name]
+        profile_name, pt, tstr = profiles[name]
+        # пустая запись = имя запрошено, но в specification не найдено
+        if profile_name is None and not pt and tstr is None:
+            dropped.append((name, 'нет в БД specification/profile', None))
+            continue
         match = classify_temp_match(file_temps, pt)
         if match in ('exact', 'subset'):
             kept.append((name, match, tstr))
@@ -1320,7 +1458,7 @@ def test_temp_interval_points(data, spc_list):
         else:
             dropped.append((
                 name,
-                f'профиль не совпадает с файлом (file={sorted(file_temps)}, profile={pt})',
+                f'профиль не совпадает (file={sorted(file_temps)}, profile={pt})',
                 tstr
             ))
 
@@ -1357,47 +1495,37 @@ def build_ranked_spc_combo_list(row) -> list:
 
 def get_psi_specification(spc_id):
     """
-    Подбирает спецификации ПСИ для списка ID номенклатур.
-    Возвращает SpcID, SpcName, NomenklaturaID (для сохранения порядка score).
+    Спецификации ПСИ для ID номенклатур — фильтр по кэшу (без повторного SQL).
     """
-    sql = "select * from `nomeklatura_rk_psi` order by `SpcName`"
-    engine = create_engine(str(get_connection_string()))
-    df_nom_psi = pd.read_sql_query(sql, engine)
-    cols = [c for c in ('SpcID', 'SpcName', 'NomenklaturaID') if c in df_nom_psi.columns]
-    df_nom_psi_filtr = df_nom_psi[df_nom_psi['NomenklaturaID'].isin(spc_id)][cols]
-    return df_nom_psi_filtr
+    if not spc_id:
+        return pd.DataFrame(columns=['SpcID', 'SpcName', 'NomenklaturaID'])
+    df = get_spec_cache().ensure_nomeklatura_rk_psi()
+    cols = [c for c in ('SpcID', 'SpcName', 'NomenklaturaID') if c in df.columns]
+    id_set = set(spc_id)
+    return df[df['NomenklaturaID'].isin(id_set)][cols].copy()
 
 
 def get_nominal(df_data: pd.DataFrame, machine_type: str):
     """
-    Метод получает номинальную частоту изделий из базы спецификаций если ближайшего номинала не найдено
-    берется частота изделий с нагрузкой или без округленная до Гц
-    :param machine_type:  Тип установки Transat/KH7700/W2200
-    :param df_data:
-    :return:
+    Номинал и списки спецификаций по слотам.
+    Справочник nomeklatura_rk берётся из SpecRefCache (1 SQL на сессию).
     """
     if not df_data.empty:
-        engine = create_engine(str(get_connection_string()))
-        sql = ("select distinct `частота`, `Cn(pF)`, `наименование`, `номенклатура` from `nomeklatura_rk` order by "
-               "`наименование`")
-        df = pd.read_sql_query(sql, engine)  # Запращиваем данные частот из таблицы nomeklatura_rk
-        df_main = df.dropna().loc[df['частота'] != 0]  # Очистка
-        # Переводим номинальную частоту в Гц
-        df_main['частота'] = df_main['частота'] * 1000
-        # Определяем целевую частоту для каждой строки result_df
+        df_main = get_spec_cache().ensure_nomeklatura_rk()
+        # прогрев psi заранее — find_closest_specs не будет ходить в БД по слотам
+        get_spec_cache().ensure_nomeklatura_rk_psi()
+
         df_data = set_target_freq(df_data, machine_type)
-        # Применяем функцию к каждой строке result_df
-        df_data[['Номинал', 'Spec_list', 'Specs_ID', 'SpcID', 'SpcName']] = df_data.apply(find_closest_specs, axis=1,
-                                                                                          df_nom=df_main)
-        # Формируем итоговый датафрейм
-        output_df = df_data[['Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position', 'Specs_ID', 'SpcID',
-                             'SpcName', 'CL', 'CL_Metod', 'CL_Value', 'SETUPNUM']]
+        df_data[['Номинал', 'Spec_list', 'Specs_ID', 'SpcID', 'SpcName']] = df_data.apply(
+            find_closest_specs, axis=1, df_nom=df_main
+        )
+        output_df = df_data[['Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
+                             'Specs_ID', 'SpcID', 'SpcName', 'CL', 'CL_Metod', 'CL_Value', 'SETUPNUM']]
     else:
         columns = [
             'Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
             'Specs_ID', 'SpcID', 'SpcName', 'CL', 'CL_Metod', 'CL_Value', 'SETUPNUM'
         ]
-
         output_df = pd.DataFrame(columns=columns)
     print('get nominal')
     print(output_df)
