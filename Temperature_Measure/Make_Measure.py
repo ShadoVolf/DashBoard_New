@@ -2037,4 +2037,17 @@ def prepare_print(data, data_status):
             on='Positions',
             how='left'
         )
+    # В data_status Status хранится как bool (True/False). На экране он
+    # мапится в «Годен»/«Брак» (см. Measure_Table_Window). Для PDF нужно
+    # то же самое — иначе в колонке «Статус» печатается True/False.
+    # Маппим только bool/0/1, чтобы повторный вызов (таблица на экране)
+    # не превращал уже строки «Годен»/«Брак» в NaN.
+    if 'Status' in data.columns:
+        def _to_status_label(v):
+            if v is True or v == 1:
+                return 'Годен'
+            if v is False or v == 0:
+                return 'Брак'
+            return v
+        data['Status'] = data['Status'].map(_to_status_label)
     return data, rename_dict
