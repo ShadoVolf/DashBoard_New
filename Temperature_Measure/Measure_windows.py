@@ -15,7 +15,8 @@ from Statistik.Operations import get_msk
 from Temperature_Measure import Report
 from Temperature_Measure.Analyze_Data import (load_measure_file_data,
     get_file_inf_KH7700, get_file_inf_TTS100, get_file_inf_W2200,
-    test_temp_interval_points, get_multy_spec, get_file_inf_TCH2200)
+    test_temp_interval_points, get_multy_spec, get_file_inf_TCH2200,
+    build_ranked_spc_combo_list)
 from Temperature_Measure.Control_RK import load_control_rk
 from Temperature_Measure.File_Select import (get_machine_types_list,
     get_files_types_list)
@@ -445,12 +446,9 @@ def get_file_inf(sender, data, dpg):
                     dpg.add_text(str(row['Temp']) + ' Шаг ' + str(row['Temp_Step']))
                 dpg.add_text(row['CL_Metod'])
                 dpg.add_text(row['CL_Value'])
-                spc_list = row.at['SpcName']
-                spc_list = test_temp_interval_points(row, spc_list)
-                spc_list.extend(get_multy_spec(row))
-                spc_list.sort()
-                if spc_list is None or len(spc_list) == 0:
-                    spc_list = ['Нет']
+                # Ранжированный список: score номинала → temp-фильтр → multi-spec
+                # default = лучший по score (первый), без sort() по имени
+                spc_list = build_ranked_spc_combo_list(row)
                 dpg.add_combo(spc_list, user_data=dpg,
                               tag='spc_' + str(count) + 'select', width=270,
                               default_value=spc_list[0])

@@ -907,61 +907,332 @@ def analyse_data_W2200(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machin
     return nom
 
 
+# =============================================================================
+# Автоподбор спецификаций: порог ppm, score, подробный лог отбора/отсева
+# =============================================================================
+
+# Порог совпадения номинала по частоте (ppm). Можно переопределить через
+# set_ppm_threshold() или переменную окружения SPEC_PPM_THRESHOLD.
+PPM_THRESHOLD_DEFAULT = 100.0
+_ppm_threshold = PPM_THRESHOLD_DEFAULT
+
+# Веса score (чем больше — тем выше приоритет в combo)
+SCORE_BASE = 1000.0
+SCORE_CAPACITY_MATCH = 30.0
+SCORE_TEMP_EXACT = 50.0
+SCORE_TEMP_SUBSET = 20.0
+
+
+def get_ppm_threshold() -> float:
+    """Текущий порог совпадения номинала, ppm."""
+    import os
+    env = os.environ.get('SPEC_PPM_THRESHOLD')
+    if env is not None and str(env).strip() != '':
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    return float(_ppm_threshold)
+
+
+def set_ppm_threshold(value: float) -> None:
+    """Задать порог ppm на время сессии (для тестов и настройки)."""
+    global _ppm_threshold
+    _ppm_threshold = float(value)
+
+
+def compute_freq_diff_ppm(freq_hz: float, target_hz: float) -> float:
+    """Абсолютная разница частот в ppm."""
+    if target_hz is None or target_hz == 0 or (isinstance(target_hz, float) and np.isnan(target_hz)):
+        return float('inf')
+    return float(np.abs((freq_hz - target_hz) / target_hz * 1e6))
+
+
+def capacity_matches(cl_metod, fl_value, cn_pf) -> tuple:
+    """
+    Проверка соответствия нагрузочной ёмкости номенклатуры режиму измерения.
+    Возвращает (ok: bool, reason: str|None).
+    reason заполнен только при отсеве.
+    """
+    if cl_metod != 'PHYSICAL':
+        return True, None
+    try:
+        fl = float(fl_value) if fl_value is not None and not (isinstance(fl_value, float) and np.isnan(fl_value)) else 0.0
+    except (TypeError, ValueError):
+        fl = 0.0
+    try:
+        cn = float(cn_pf) if cn_pf is not None and not (isinstance(cn_pf, float) and np.isnan(cn_pf)) else 0.0
+    except (TypeError, ValueError):
+        cn = 0.0
+
+    if fl > 0:
+        if cn > 0:
+            return True, None
+        return False, f'PHYSICAL + FL>0, но Cn(pF)={cn} (нужен Cn>0)'
+    # FL == 0 → серия без нагрузки
+    if cn == 0:
+        return True, None
+    return False, f'PHYSICAL + FL==0, но Cn(pF)={cn} (нужен Cn==0)'
+
+
+def score_nomenclature_candidate(ppm: float, capacity_ok: bool = True) -> float:
+    """
+    Score номенклатуры на этапе подбора по частоте.
+    База: SCORE_BASE - ppm; бонус за совпадение ёмкости.
+    """
+    score = SCORE_BASE - float(ppm)
+    if capacity_ok:
+        score += SCORE_CAPACITY_MATCH
+    return score
+
+
+def score_with_temp_match(base_score: float, temp_match: str) -> float:
+    """Добавляет бонус за качество совпадения температурного профиля."""
+    if temp_match == 'exact':
+        return base_score + SCORE_TEMP_EXACT
+    if temp_match == 'subset':
+        return base_score + SCORE_TEMP_SUBSET
+    return base_score
+
+
+def classify_temp_match(file_temps, profile_temps) -> str:
+    """
+    'exact' | 'subset' | 'none'
+    file_temps / profile_temps — iterable чисел.
+    """
+    try:
+        ft = set(float(x) for x in file_temps)
+        pt = set(float(x) for x in profile_temps)
+    except (TypeError, ValueError):
+        return 'none'
+    if not pt:
+        return 'none'
+    if ft == pt:
+        return 'exact'
+    if pt.issubset(ft):
+        return 'subset'
+    return 'none'
+
+
+def filter_and_rank_nomenclature(df_nom: pd.DataFrame, target_hz: float,
+                                 cl_metod, fl_value,
+                                 ppm_threshold: float = None) -> tuple:
+    """
+    Чистая логика этапа 1: отбор номенклатур по ppm и ёмкости + ранжирование.
+
+    Возвращает (accepted, rejected), где каждый элемент — dict:
+      accepted: наименование, номенклатура, частота, Cn, ppm, score, capacity_ok
+      rejected: те же поля + reason
+    """
+    if ppm_threshold is None:
+        ppm_threshold = get_ppm_threshold()
+
+    work = df_nom.copy()
+    if 'F_diff_ppm' not in work.columns:
+        work['F_diff_ppm'] = work['частота'].apply(
+            lambda f: compute_freq_diff_ppm(f, target_hz)
+        )
+
+    accepted = []
+    rejected = []
+
+    for _, r in work.iterrows():
+        ppm = float(r['F_diff_ppm'])
+        name = r.get('наименование', '')
+        nom_id = r.get('номенклатура', '')
+        freq = r.get('частота')
+        cn = r.get('Cn(pF)', 0)
+
+        entry = {
+            'наименование': name,
+            'номенклатура': nom_id,
+            'частота': freq,
+            'Cn(pF)': cn,
+            'ppm': ppm,
+        }
+
+        if ppm > ppm_threshold:
+            entry['reason'] = (
+                f'Δ{ppm:.3f} ppm > порог {ppm_threshold:g} ppm'
+            )
+            entry['score'] = None
+            rejected.append(entry)
+            continue
+
+        ok, reason = capacity_matches(cl_metod, fl_value, cn)
+        if not ok:
+            entry['reason'] = reason
+            entry['score'] = None
+            rejected.append(entry)
+            continue
+
+        entry['capacity_ok'] = True
+        entry['score'] = score_nomenclature_candidate(ppm, capacity_ok=True)
+        accepted.append(entry)
+
+    accepted.sort(key=lambda x: (-x['score'], x['ppm'], str(x['наименование'])))
+    return accepted, rejected
+
+
+def _log_block(title: str) -> None:
+    line = '=' * 72
+    print(line)
+    print(f'  {title}')
+    print(line)
+
+
+def log_nomenclature_selection(target_hz, cl_metod, fl_value, ppm_threshold,
+                               accepted, rejected) -> None:
+    """Подробный лог этапа подбора по номиналу."""
+    _log_block('АВТОПОДБОР: этап 1 — номинал (частота + ёмкость)')
+    print(f'  Target_Hz      : {target_hz}')
+    print(f'  CL_Metod       : {cl_metod}')
+    print(f'  FL             : {fl_value}')
+    print(f'  Порог ppm      : {ppm_threshold:g}')
+    print(f'  Кандидатов OK  : {len(accepted)}')
+    print(f'  Отсеяно        : {len(rejected)}')
+    print('-' * 72)
+    if accepted:
+        print('  ОТОБРАНЫ (по убыванию score):')
+        for i, a in enumerate(accepted, 1):
+            print(
+                f'    [{i:02d}] score={a["score"]:8.2f}  Δ={a["ppm"]:8.3f} ppm  '
+                f'f={a["частота"]}  Cn={a["Cn(pF)"]}  '
+                f'{a["наименование"]}  (id={a["номенклатура"]})'
+            )
+    else:
+        print('  ОТОБРАНЫ: (пусто)')
+    print('-' * 72)
+    if rejected:
+        print('  ОТСЕЯНЫ:')
+        # Группируем по причине для читаемости
+        by_reason = {}
+        for r in rejected:
+            by_reason.setdefault(r.get('reason', '?'), []).append(r)
+        for reason, items in by_reason.items():
+            print(f'    ▸ {reason}  ({len(items)} шт.)')
+            for r in items[:20]:
+                print(
+                    f'        Δ={r["ppm"]:8.3f} ppm  f={r["частота"]}  '
+                    f'Cn={r["Cn(pF)"]}  {r["наименование"]}  (id={r["номенклатура"]})'
+                )
+            if len(items) > 20:
+                print(f'        ... ещё {len(items) - 20}')
+    else:
+        print('  ОТСЕЯНЫ: (нет)')
+    print('=' * 72)
+
+
+def log_temp_filter(file_temps, kept, dropped) -> None:
+    """Лог этапа фильтрации по температурному профилю."""
+    _log_block('АВТОПОДБОР: этап 2 — температурный профиль')
+    print(f'  Температуры файла: {sorted(file_temps) if file_temps is not None else "—"}')
+    print(f'  Прошли фильтр    : {len(kept)}')
+    print(f'  Отсеяно          : {len(dropped)}')
+    print('-' * 72)
+    if kept:
+        print('  ОТОБРАНЫ:')
+        for name, match_kind, profile in kept:
+            print(f'    ✓ [{match_kind:6}] {name}  profile={profile}')
+    else:
+        print('  ОТОБРАНЫ: (пусто)')
+    print('-' * 72)
+    if dropped:
+        print('  ОТСЕЯНЫ:')
+        for name, reason, profile in dropped:
+            print(f'    ✗ {name}  — {reason}  profile={profile}')
+    else:
+        print('  ОТСЕЯНЫ: (нет)')
+    print('=' * 72)
+
+
+def log_final_spc_list(spc_list, default_value, multi_added=None) -> None:
+    """Лог итогового списка для combo."""
+    _log_block('АВТОПОДБОР: итог — список для выбора (combo)')
+    if multi_added:
+        print(f'  Multi-spec добавлены: {multi_added}')
+    if not spc_list or spc_list == ['Нет']:
+        print('  Список пуст → «Нет»')
+    else:
+        for i, name in enumerate(spc_list, 1):
+            mark = ' ← default' if name == default_value else ''
+            print(f'    [{i:02d}] {name}{mark}')
+    print('=' * 72)
+
+
 # Функция для поиска ближайших спецификаций
 def find_closest_specs(row, df_nom: pd.DataFrame):
     """
-    Метод находит ближайший номинал для заданных изделий и создает для них список спецификаций
-    :param row:
-    :param df_nom:
-    :return:
+    Находит номинал и связанные спецификации ПСИ с ранжированием по score.
+
+    Этап 1 (этот метод):
+      - все номенклатуры с Δppm ≤ порога (get_ppm_threshold), не только min;
+      - фильтр по ёмкости для PHYSICAL;
+      - сортировка по score = (1000 - ppm) + бонус за ёмкость;
+      - подробный лог принятых и отсеянных.
+
+    Возвращает Series: [Номинал, Spec_list, Specs_ID, SpcID, SpcName]
     """
     target = row['Target_Hz']
-    nominal_freq = 0
+    cl_metod = row['CL_Metod'] if 'CL_Metod' in row.index else None
+    fl_value = row['FL'] if 'FL' in row.index else 0
+    ppm_threshold = get_ppm_threshold()
+
+    work = df_nom.copy()
+    work['F_diff_ppm'] = work['частота'].apply(
+        lambda f: compute_freq_diff_ppm(f, target)
+    )
+
+    accepted, rejected = filter_and_rank_nomenclature(
+        work, target, cl_metod, fl_value, ppm_threshold=ppm_threshold
+    )
+    log_nomenclature_selection(
+        target, cl_metod, fl_value, ppm_threshold, accepted, rejected
+    )
+
     specs = []
     specs_id = []
     spc_id_list = []
     spc_name_list = []
-    # Вычисляем разницу в ppm (частей на миллион)
-    df_nom['F_diff_ppm'] = np.abs((df_nom['частота'] - target) / target * 1e6)
-    print("find_closest")
 
-    # Находим минимальную разницу
-    min_diff_ppm = df_nom['F_diff_ppm'].min()
-    df_spc_id = pd.DataFrame()
-    # Если минимальная разница > 100 ppm, берем FL_Hz (если > 0), иначе Fs_Hz
-    print('Row', row)
-    print('Target', target)
-    print('Min', min_diff_ppm)
-    if min_diff_ppm > 100:
-        nominal_freq = target
-        nominal_freq = round(nominal_freq)  # Округляем до Гц
-        specs = []  # Нет подходящих спецификаций
-        specs_id = []  # Нет подходящих спецификаций
-        print('Номинал не найден')
-    else:
+    if not accepted:
+        nominal_freq = round(float(target)) if target is not None else 0
+        print(f'  → Номинал не найден в пределах {ppm_threshold:g} ppm, '
+              f'используем Target_Hz={nominal_freq}')
+        return pd.Series([nominal_freq, specs, specs_id, spc_id_list, spc_name_list])
 
-        # Фильтруем все спецификации с минимальной разницей
-        candidates = df_nom[df_nom['F_diff_ppm'] == min_diff_ppm]
-        print('Find_closest', 'Candidates', candidates)
-        # Фильтруем список спецификаций по наличию емкости
-        if row['CL_Metod'] == 'PHYSICAL':  # Если метод не EQREACT то фильтруем по нагрузочной емкости
-            if row['FL'] > 0:
-                candidates = candidates[candidates['Cn(pF)'] > 0]
-            else:
-                candidates = candidates[candidates['Cn(pF)'] == 0]
-        if not candidates.empty:
-            nominal_freq = round(candidates['частота'].iloc[0])  # Округляем до Гц
-            specs = candidates['наименование'].tolist()  # Список спецификаций
-            specs_id = candidates['номенклатура'].tolist()  # Список спецификаций ID
-            df_spc_id = get_psi_specification(specs_id)
+    # Номинал — частота лучшего (первого) кандидата
+    nominal_freq = round(float(accepted[0]['частота']))
+    specs = [a['наименование'] for a in accepted]
+    specs_id = [a['номенклатура'] for a in accepted]
 
-            if not df_spc_id.empty:
-                spc_id_list = df_spc_id['SpcID'].tolist()
-                spc_name_list = df_spc_id['SpcName'].tolist()
-
+    df_spc_id = get_psi_specification(specs_id)
+    if not df_spc_id.empty:
+        # Порядок номенклатур (лучший score раньше) → связанные SpcName без дублей.
+        seen = set()
+        ordered_names = []
+        ordered_ids = []
+        if 'NomenklaturaID' in df_spc_id.columns:
+            for nid in specs_id:
+                sub = df_spc_id[df_spc_id['NomenklaturaID'] == nid]
+                for _, sr in sub.iterrows():
+                    nm = sr['SpcName']
+                    if nm not in seen:
+                        seen.add(nm)
+                        ordered_names.append(nm)
+                        ordered_ids.append(sr['SpcID'])
         else:
-            nominal_freq = target
-            nominal_freq = round(nominal_freq)  # Округляем до Гц
+            for _, sr in df_spc_id.iterrows():
+                nm = sr['SpcName']
+                if nm not in seen:
+                    seen.add(nm)
+                    ordered_names.append(nm)
+                    ordered_ids.append(sr['SpcID'])
+        spc_name_list = ordered_names
+        spc_id_list = ordered_ids
+
+    print(f'  → Номинал={nominal_freq} Гц, номенклатур={len(specs)}, '
+          f'спецификаций ПСИ={len(spc_name_list)}: {spc_name_list}')
 
     return pd.Series([nominal_freq, specs, specs_id, spc_id_list, spc_name_list])
 
@@ -969,79 +1240,131 @@ def find_closest_specs(row, df_nom: pd.DataFrame):
 # Получает список мульти спецификаций для данного температурного интервала
 def get_multy_spec(row):
     result = []
-    # Получаем текущий списка температур
     temp_list = row['Temp_List']
     engine = create_engine(str(get_connection_string()))
     sql = "Select * from spc_special"
-    # Получаем список возможных спецификаций
     spc_df = pd.read_sql(sql, engine)
-    str_list1 = [str(int(x)) for x in temp_list]
+    try:
+        str_list1 = [str(int(float(x))) for x in temp_list]
+    except (TypeError, ValueError):
+        str_list1 = [str(x) for x in temp_list]
     for index, spc_ in spc_df.iterrows():
-        db_temps = spc_['Temps'].split(" ")  # список температур
+        db_temps = spc_['Temps'].split(" ")
         if sorted(str_list1) == sorted(db_temps):
             result.append(spc_['Multy_Spc_Name'])
+    if result:
+        print(f'  [multi-spec] для temp={str_list1} найдены: {result}')
     return result
 
 
 # Проверяет соответствие температурного интервала спецификации и измерительного файла
 def test_temp_interval_points(data, spc_list):
+    """
+    Фильтрует список имён спецификаций по совпадению температурного профиля.
+    Сохраняет относительный порядок входного списка (уже отранжированного).
+    Логирует принятые и отсеянные с причиной.
+    """
     if not spc_list:
         return []
 
     engine = create_engine(str(get_connection_string()))
 
-    # Формируем плейсхолдеры для IN-условия
     placeholders = ','.join(['%s'] * len(spc_list))
     spc_query = f"""
         SELECT s.`Name`, s.`Profile`, tp.`Temperatures`
         FROM `specification` s
-        LEFT JOIN `temperatureprofile` tp 
+        LEFT JOIN `temperatureprofile` tp
         ON s.`Profile` = tp.`Name`
         WHERE s.`Name` IN ({placeholders})
     """
 
     try:
-        # Преобразуем список в кортеж для параметров
         spc_df = pd.read_sql(spc_query, engine, params=tuple(spc_list))
     except Exception as e:
-        print(f"Database error: {e}")
+        print(f"Database error in test_temp_interval_points: {e}")
         return []
 
-    if spc_df.empty:
-        return []
+    file_temps_raw = data['Temp_List'] if hasattr(data, '__getitem__') else []
+    try:
+        if isinstance(file_temps_raw, (list, tuple, set, np.ndarray)):
+            file_temps = [float(x) for x in file_temps_raw]
+        else:
+            file_temps = list(file_temps_raw)
+    except Exception:
+        file_temps = list(file_temps_raw) if file_temps_raw is not None else []
 
-    data_temps = set(data['Temp_List'])
-    data_len = len(data['Temp_List'])
+    # name -> (profile_str, temps_list)
+    info = {}
+    if not spc_df.empty:
+        for _, r in spc_df.iterrows():
+            tstr = r['Temperatures']
+            try:
+                pt = list(map(float, str(tstr).split())) if tstr else []
+            except (ValueError, AttributeError):
+                pt = []
+            info[r['Name']] = (tstr, pt, r.get('Profile'))
 
-    def check_temps(temp_str):
-        if not temp_str:
-            return False
-        try:
-            db_temps = list(map(float, temp_str.split()))
-            return (
-                    set(db_temps) == data_temps and
-                    len(db_temps) == data_len
-            ) or (
-                    set(db_temps).issubset(data_temps) and
-                    data_len >= len(db_temps))
-        except (ValueError, AttributeError):
-            return False
+    kept = []       # (name, match_kind, profile_str)
+    dropped = []    # (name, reason, profile_str)
+    kept_names = []
 
-    spc_df['Temps_test'] = spc_df['Temperatures'].apply(check_temps)
+    for name in spc_list:
+        if name not in info:
+            dropped.append((name, 'нет в БД specification/profile', None))
+            continue
+        tstr, pt, profile = info[name]
+        match = classify_temp_match(file_temps, pt)
+        if match in ('exact', 'subset'):
+            kept.append((name, match, tstr))
+            kept_names.append(name)
+        else:
+            dropped.append((
+                name,
+                f'профиль не совпадает с файлом (file={sorted(file_temps)}, profile={pt})',
+                tstr
+            ))
 
-    return spc_df[spc_df['Temps_test']]['Name'].tolist()
+    log_temp_filter(file_temps, kept, dropped)
+    return kept_names
+
+
+def build_ranked_spc_combo_list(row) -> list:
+    """
+    Собирает итоговый упорядоченный список спецификаций для combo слота:
+      1) SpcName из этапа номинала (уже по score)
+      2) фильтр по температуре (порядок сохраняется)
+      3) multi-spec в конец
+    Пишет итоговый лог. Первый элемент — default.
+    """
+    spc_list = row.at['SpcName'] if hasattr(row, 'at') else row.get('SpcName', [])
+    if spc_list is None:
+        spc_list = []
+    if isinstance(spc_list, np.ndarray):
+        spc_list = spc_list.tolist()
+    if not isinstance(spc_list, list):
+        spc_list = list(spc_list) if spc_list is not None else []
+
+    filtered = test_temp_interval_points(row, spc_list)
+    multi = get_multy_spec(row)
+    multi_new = [m for m in multi if m not in filtered]
+    result = list(filtered) + multi_new
+    if not result:
+        result = ['Нет']
+    default = result[0]
+    log_final_spc_list(result, default, multi_added=multi_new or None)
+    return result
 
 
 def get_psi_specification(spc_id):
     """
-    Метод подбирает доступные варианты спецификаций для списка номенклатур основываясь на таблицк nomeklatura_psi_rk
-    :param spc_id: Список ИД номенклатур
-    :return:
+    Подбирает спецификации ПСИ для списка ID номенклатур.
+    Возвращает SpcID, SpcName, NomenklaturaID (для сохранения порядка score).
     """
-    sql = "select * from `nomeklatura_rk_psi` order by `SpcName`"  # Получаем данные на связь спецификаций
+    sql = "select * from `nomeklatura_rk_psi` order by `SpcName`"
     engine = create_engine(str(get_connection_string()))
     df_nom_psi = pd.read_sql_query(sql, engine)
-    df_nom_psi_filtr = df_nom_psi[df_nom_psi['NomenklaturaID'].isin(spc_id)][['SpcID', 'SpcName']]
+    cols = [c for c in ('SpcID', 'SpcName', 'NomenklaturaID') if c in df_nom_psi.columns]
+    df_nom_psi_filtr = df_nom_psi[df_nom_psi['NomenklaturaID'].isin(spc_id)][cols]
     return df_nom_psi_filtr
 
 
