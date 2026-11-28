@@ -9,7 +9,7 @@ from packaging import version
 
 from Options import parse_connection_string
 
-version_ = '1.9.4'
+version_ = '1.9.5'
 update_date = '25.11.2026'
 
 

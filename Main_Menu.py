@@ -27,6 +27,20 @@ except ImportError as _e:
     print(f"[Knowledge] module not available: {_e}")
     create_knowledge_window = None
 
+
+
+def _open_settings(sender=None, app_data=None, user_data=None):
+    """Открыть окно настроек (Файл → Настройки)."""
+    try:
+        import dearpygui.dearpygui as dpg_mod
+        dpg_ctx = user_data if user_data is not None else dpg_mod
+        from Options import create_settings_window
+        create_settings_window(dpg_ctx)
+    except Exception as e:
+        print(f'[Settings] open error: {e}')
+
+
+
 # Создание главного меню
 def create_main_menu(dpg):
     # Защита от повторного создания
@@ -35,6 +49,12 @@ def create_main_menu(dpg):
 
     with dpg.viewport_menu_bar(tag='MenuBar'):
         with dpg.menu(label="Файл"):
+            dpg.add_menu_item(
+                label="Настройки",
+                callback=_open_settings,
+                tag='App_Settings_Menu',
+                user_data=dpg,
+            )
             dpg.add_separator()
             dpg.add_menu_item(label="Выход", callback=dpg.stop_dearpygui)
 

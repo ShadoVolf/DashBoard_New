@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine
 
-from Options import get_connection_string
+from Options import get_connection_string, is_fast_spec_search_enabled
 from datetime import datetime
 from tabulate import tabulate
 
@@ -1321,7 +1321,7 @@ def log_final_spc_list(spc_list, default_value, multi_added=None) -> None:
 
 
 # Функция для поиска ближайших спецификаций
-def find_closest_specs(row, df_nom: pd.DataFrame):
+def find_closest_specs_fast(row, df_nom: pd.DataFrame):
     """
     Находит номинал и связанные спецификации ПСИ с ранжированием по score.
 
@@ -1366,7 +1366,7 @@ def find_closest_specs(row, df_nom: pd.DataFrame):
     specs = [a['наименование'] for a in accepted]
     specs_id = [a['номенклатура'] for a in accepted]
 
-    df_spc_id = get_psi_specification(specs_id)
+    df_spc_id = get_psi_specification_fast(specs_id)
     if not df_spc_id.empty:
         # Порядок номенклатур (лучший score раньше) → связанные SpcName без дублей.
         seen = set()
@@ -1398,7 +1398,7 @@ def find_closest_specs(row, df_nom: pd.DataFrame):
 
 
 # Получает список мульти спецификаций для данного температурного интервала
-def get_multy_spec(row):
+def get_multy_spec_fast(row):
     """Multi-spec из кэша spc_special (без повторного SQL)."""
     result = []
     temp_list = row['Temp_List']
@@ -1418,7 +1418,7 @@ def get_multy_spec(row):
 
 
 # Проверяет соответствие температурного интервала спецификации и измерительного файла
-def test_temp_interval_points(data, spc_list):
+def test_temp_interval_points_fast(data, spc_list):
     """
     Фильтрует имена спецификаций по температурному профилю.
     Профили читаются из SpecRefCache (SQL только для ещё не кэшированных имён).
@@ -1482,8 +1482,8 @@ def build_ranked_spc_combo_list(row) -> list:
     if not isinstance(spc_list, list):
         spc_list = list(spc_list) if spc_list is not None else []
 
-    filtered = test_temp_interval_points(row, spc_list)
-    multi = get_multy_spec(row)
+    filtered = test_temp_interval_points_fast(row, spc_list)
+    multi = get_multy_spec_fast(row)
     multi_new = [m for m in multi if m not in filtered]
     result = list(filtered) + multi_new
     if not result:
@@ -1493,7 +1493,7 @@ def build_ranked_spc_combo_list(row) -> list:
     return result
 
 
-def get_psi_specification(spc_id):
+def get_psi_specification_fast(spc_id):
     """
     Спецификации ПСИ для ID номенклатур — фильтр по кэшу (без повторного SQL).
     """
@@ -1505,9 +1505,9 @@ def get_psi_specification(spc_id):
     return df[df['NomenklaturaID'].isin(id_set)][cols].copy()
 
 
-def get_nominal(df_data: pd.DataFrame, machine_type: str):
+def get_nominal_fast(df_data: pd.DataFrame, machine_type: str):
     """
-    Номинал и списки спецификаций по слотам.
+    Номинал и списки спецификаций по слотам (быстрый режим).
     Справочник nomeklatura_rk берётся из SpecRefCache (1 SQL на сессию).
     """
     if not df_data.empty:
@@ -1517,7 +1517,7 @@ def get_nominal(df_data: pd.DataFrame, machine_type: str):
 
         df_data = set_target_freq(df_data, machine_type)
         df_data[['Номинал', 'Spec_list', 'Specs_ID', 'SpcID', 'SpcName']] = df_data.apply(
-            find_closest_specs, axis=1, df_nom=df_main
+            find_closest_specs_fast, axis=1, df_nom=df_main
         )
         output_df = df_data[['Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
                              'Specs_ID', 'SpcID', 'SpcName', 'CL', 'CL_Metod', 'CL_Value', 'SETUPNUM']]
@@ -1530,6 +1530,232 @@ def get_nominal(df_data: pd.DataFrame, machine_type: str):
     print('get nominal')
     print(output_df)
     return output_df
+
+
+# =============================================================================
+# Классический (медленный) режим + маршрутизация по настройке
+# =============================================================================
+
+def find_closest_specs_legacy(row, df_nom: pd.DataFrame):
+    """
+    Классический подбор: только min ppm, порог 100, без ranking по score.
+    """
+    target = row['Target_Hz']
+    nominal_freq = 0
+    specs = []
+    specs_id = []
+    spc_id_list = []
+    spc_name_list = []
+
+    work = df_nom.copy()
+    work['F_diff_ppm'] = np.abs((work['частота'] - target) / target * 1e6)
+    print('find_closest (legacy)')
+    min_diff_ppm = work['F_diff_ppm'].min()
+    print('Row', row)
+    print('Target', target)
+    print('Min', min_diff_ppm)
+
+    if min_diff_ppm > 100:
+        nominal_freq = round(float(target))
+        print('Номинал не найден')
+        return pd.Series([nominal_freq, specs, specs_id, spc_id_list, spc_name_list])
+
+    candidates = work[work['F_diff_ppm'] == min_diff_ppm]
+    print('Find_closest', 'Candidates', candidates)
+    if row.get('CL_Metod') == 'PHYSICAL' or (hasattr(row, 'index') and 'CL_Metod' in row.index and row['CL_Metod'] == 'PHYSICAL'):
+        fl = row['FL'] if 'FL' in (row.index if hasattr(row, 'index') else row) else 0
+        try:
+            fl = float(fl)
+        except Exception:
+            fl = 0
+        if fl > 0:
+            candidates = candidates[candidates['Cn(pF)'] > 0]
+        else:
+            candidates = candidates[candidates['Cn(pF)'] == 0]
+
+    if not candidates.empty:
+        nominal_freq = round(float(candidates['частота'].iloc[0]))
+        specs = candidates['наименование'].tolist()
+        specs_id = candidates['номенклатура'].tolist()
+        df_spc_id = get_psi_specification_legacy(specs_id)
+        if not df_spc_id.empty:
+            spc_id_list = df_spc_id['SpcID'].tolist()
+            spc_name_list = df_spc_id['SpcName'].tolist()
+    else:
+        nominal_freq = round(float(target))
+
+    return pd.Series([nominal_freq, specs, specs_id, spc_id_list, spc_name_list])
+
+
+def get_psi_specification_legacy(spc_id):
+    """Полный SQL nomeklatura_rk_psi на каждый вызов."""
+    if not spc_id:
+        return pd.DataFrame(columns=['SpcID', 'SpcName', 'NomenklaturaID'])
+    engine = create_engine(str(get_connection_string()))
+    try:
+        sql = (
+            "SELECT `NomenklaturaID`, `SpcID`, `SpcName` "
+            "FROM `nomeklatura_rk_psi` ORDER BY `SpcName`"
+        )
+        df = pd.read_sql_query(sql, engine)
+    except Exception:
+        df = pd.read_sql_query(
+            "SELECT * FROM `nomeklatura_rk_psi` ORDER BY `SpcName`", engine
+        )
+    cols = [c for c in ('SpcID', 'SpcName', 'NomenklaturaID') if c in df.columns]
+    return df[df['NomenklaturaID'].isin(spc_id)][cols].copy()
+
+
+def get_multy_spec_legacy(row):
+    result = []
+    temp_list = row['Temp_List']
+    engine = create_engine(str(get_connection_string()))
+    spc_df = pd.read_sql("Select * from spc_special", engine)
+    try:
+        str_list1 = [str(int(float(x))) for x in temp_list]
+    except (TypeError, ValueError):
+        str_list1 = [str(x) for x in temp_list]
+    for _, spc_ in spc_df.iterrows():
+        db_temps = str(spc_['Temps']).split()
+        if sorted(str_list1) == sorted(db_temps):
+            result.append(spc_['Multy_Spc_Name'])
+    return result
+
+
+def test_temp_interval_points_legacy(data, spc_list):
+    if not spc_list:
+        return []
+    engine = create_engine(str(get_connection_string()))
+    placeholders = ','.join(['%s'] * len(spc_list))
+    spc_query = f"""
+        SELECT s.`Name`, s.`Profile`, tp.`Temperatures`
+        FROM `specification` s
+        LEFT JOIN `temperatureprofile` tp ON s.`Profile` = tp.`Name`
+        WHERE s.`Name` IN ({placeholders})
+    """
+    try:
+        spc_df = pd.read_sql(spc_query, engine, params=tuple(spc_list))
+    except Exception as e:
+        print(f"Database error in test_temp_interval_points_legacy: {e}")
+        return []
+
+    file_temps_raw = data['Temp_List'] if hasattr(data, '__getitem__') else []
+    try:
+        if isinstance(file_temps_raw, (list, tuple, set, np.ndarray)):
+            file_temps = set(float(x) for x in file_temps_raw)
+        else:
+            file_temps = set(file_temps_raw)
+    except Exception:
+        file_temps = set(file_temps_raw) if file_temps_raw is not None else set()
+    data_len = len(file_temps)
+
+    def check_temps(temp_str):
+        if not temp_str:
+            return False
+        try:
+            db_temps = list(map(float, str(temp_str).split()))
+            return (
+                (set(db_temps) == file_temps and len(db_temps) == data_len)
+                or (set(db_temps).issubset(file_temps) and data_len >= len(db_temps))
+            )
+        except (ValueError, AttributeError):
+            return False
+
+    if spc_df.empty:
+        return []
+    spc_df = spc_df.copy()
+    spc_df['Temps_test'] = spc_df['Temperatures'].apply(check_temps)
+    return spc_df[spc_df['Temps_test']]['Name'].tolist()
+
+
+def get_nominal_legacy(df_data: pd.DataFrame, machine_type: str):
+    """Классический get_nominal: SQL nomeklatura_rk каждый раз, legacy find_closest."""
+    if not df_data.empty:
+        engine = create_engine(str(get_connection_string()))
+        sql = (
+            "select distinct `частота`, `Cn(pF)`, `наименование`, `номенклатура` "
+            "from `nomeklatura_rk` order by `наименование`"
+        )
+        df = pd.read_sql_query(sql, engine)
+        df_main = df.dropna().loc[df['частота'] != 0].copy()
+        df_main['частота'] = df_main['частота'] * 1000
+        df_data = set_target_freq(df_data, machine_type)
+        df_data[['Номинал', 'Spec_list', 'Specs_ID', 'SpcID', 'SpcName']] = df_data.apply(
+            find_closest_specs_legacy, axis=1, df_nom=df_main
+        )
+        output_df = df_data[[
+            'Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
+            'Specs_ID', 'SpcID', 'SpcName', 'CL', 'CL_Metod', 'CL_Value', 'SETUPNUM'
+        ]]
+    else:
+        columns = [
+            'Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
+            'Specs_ID', 'SpcID', 'SpcName', 'CL', 'CL_Metod', 'CL_Value', 'SETUPNUM'
+        ]
+        output_df = pd.DataFrame(columns=columns)
+    print('get nominal (legacy)')
+    print(output_df)
+    return output_df
+
+
+def find_closest_specs(row, df_nom: pd.DataFrame):
+    if is_fast_spec_search_enabled():
+        return find_closest_specs_fast(row, df_nom)
+    return find_closest_specs_legacy(row, df_nom)
+
+
+def get_psi_specification(spc_id):
+    if is_fast_spec_search_enabled():
+        return get_psi_specification_fast(spc_id)
+    return get_psi_specification_legacy(spc_id)
+
+
+def get_multy_spec(row):
+    if is_fast_spec_search_enabled():
+        return get_multy_spec_fast(row)
+    return get_multy_spec_legacy(row)
+
+
+def test_temp_interval_points(data, spc_list):
+    if is_fast_spec_search_enabled():
+        return test_temp_interval_points_fast(data, spc_list)
+    return test_temp_interval_points_legacy(data, spc_list)
+
+
+def get_nominal(df_data: pd.DataFrame, machine_type: str):
+    if is_fast_spec_search_enabled():
+        print('[SpecSearch] режим: быстрый')
+        return get_nominal_fast(df_data, machine_type)
+    print('[SpecSearch] режим: классический')
+    return get_nominal_legacy(df_data, machine_type)
+
+
+def build_spc_combo_list(row) -> list:
+    """
+    Список для combo: быстрый (ranking) или классический (temp + multi + sort по имени).
+    """
+    if is_fast_spec_search_enabled():
+        return build_ranked_spc_combo_list(row)
+
+    spc_list = row.at['SpcName'] if hasattr(row, 'at') else row.get('SpcName', [])
+    if spc_list is None:
+        spc_list = []
+    if isinstance(spc_list, np.ndarray):
+        spc_list = spc_list.tolist()
+    if not isinstance(spc_list, list):
+        spc_list = list(spc_list) if spc_list is not None else []
+
+    filtered = test_temp_interval_points_legacy(row, spc_list)
+    multi = get_multy_spec_legacy(row)
+    for m in multi:
+        if m not in filtered:
+            filtered.append(m)
+    filtered.sort()
+    if not filtered:
+        filtered = ['Нет']
+    print(f'[SpecSearch] legacy combo default={filtered[0]!r}, n={len(filtered)}')
+    return filtered
+
 
 
 def create_ranges(sorted_list):
