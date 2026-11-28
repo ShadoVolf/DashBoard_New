@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine
 
-from Options import get_connection_string, is_fast_spec_search_enabled
+from Options import get_connection_string, is_fast_spec_search_enabled, is_ai_spec_enabled
 from datetime import datetime
 from tabulate import tabulate
 
@@ -70,13 +70,22 @@ def get_file_inf_KH7700(file_id: str, Archive):
     :param file_id:
     """
     engine = create_engine(str(get_connection_string()))
+    # SELECT * — полный набор колонок (как Make_Measure.get_file_data / new_data_compile).
+    # FS/FL обязательны; R/C0/C1/Q подхватятся в get_avg_data_tts100_kh7700, если есть в таблице.
     if Archive == 0:
-        sql = ("Select  `ID`, `FileName`, `FileSize`, `File_ID`, `XTALROW`, `Temp`, "
-               "`FS`, `FL` from `kh7700` where `File_ID` = '" + file_id + "' order by `ID`")
+        sql = ("SELECT * FROM `kh7700` WHERE `File_ID` = '" + file_id + "' ORDER BY `ID`")
     else:
-        sql = ("Select  `ID`, `FileName`, `FileSize`, `File_ID`, `XTALROW`, `Temp`, "
-               "`FS`, `FL` from `kh7700_archive` where `File_ID` = '" + file_id + "' order by `ID`")
+        sql = ("SELECT * FROM `kh7700_archive` WHERE `File_ID` = '" + file_id + "' ORDER BY `ID`")
     df = pd.read_sql_query(sql, engine)  # Запращиваем данные файла
+    # Нормализация имён колонок (регистр) для единого пайплайна
+    if not df.empty:
+        colmap = {c: c for c in df.columns}
+        lower = {c.lower(): c for c in df.columns}
+        for want in ('XTALROW', 'Temp', 'FS', 'FL', 'R', 'C0', 'C1', 'Q', 'L', 'RR'):
+            if want not in df.columns and want.lower() in lower:
+                df.rename(columns={lower[want.lower()]: want}, inplace=True)
+        if 'RR' in df.columns and 'R' not in df.columns:
+            df.rename(columns={'RR': 'R'}, inplace=True)
     if not df.empty:
         # Получение уникальных значений из колонки Temp
         unique_temps = df['Temp'].unique().tolist()
@@ -251,18 +260,22 @@ def get_file_inf_TTS100(file_id: str, archive):
     """
     df_data = []
     engine = create_engine(str(get_connection_string()))
+    # SELECT * — полный набор (как Make_Measure.get_file_data); F0_MHZ/FL_MHZ обязательны,
+    # R/C0/C1/Q подхватятся в get_avg_data_tts100_kh7700, если есть в таблице.
     if archive == 0:
-        sql = ("Select  `SETUPNUM`, `RINGID`, `RINGPOS`, `SETPOINT`, `F0_MHZ`, "
-               "`FL_MHZ`, `CLSTATUS`,`TCL_PF`,`ACL_PF`, `CHAMBER`, `FileName`, `Size`, "
-               "`File_ID`  from `transat` where `File_ID` = '"
-               + file_id + "' order by `ID`")
+        sql = ("SELECT * FROM `transat` WHERE `File_ID` = '" + file_id + "' ORDER BY `ID`")
     else:
-        sql = ("Select  `SETUPNUM`, `RINGID`, `RINGPOS`, `SETPOINT`, `F0_MHZ`, "
-               "`FL_MHZ`, `CLSTATUS`,`TCL_PF`,`ACL_PF` , `CHAMBER`, `FileName`, `Size`, `File_ID` "
-               " from `tts100_archive` where "
-               "`File_ID` = '" + file_id + "' order by `ID`")
+        sql = ("SELECT * FROM `tts100_archive` WHERE `File_ID` = '" + file_id + "' ORDER BY `ID`")
     df = pd.read_sql_query(sql, engine)  # Запращиваем данные файла
     if not df.empty:
+        # Единые имена колонок (регистр)
+        lower = {c.lower(): c for c in df.columns}
+        for want in ('SETUPNUM', 'RINGID', 'RINGPOS', 'SETPOINT', 'F0_MHZ', 'FL_MHZ',
+                     'R', 'C0', 'C1', 'Q', 'L', 'RR'):
+            if want not in df.columns and want.lower() in lower:
+                df.rename(columns={lower[want.lower()]: want}, inplace=True)
+        if 'RR' in df.columns and 'R' not in df.columns:
+            df.rename(columns={'RR': 'R'}, inplace=True)
         # Получение уникальных значений из колонки Temp
         unique_temps = df['SETPOINT'].unique().tolist()
         temp_str, temp_step = analyse_temp(unique_temps)
@@ -289,14 +302,13 @@ def get_file_inf_TTS100(file_id: str, archive):
 def get_file_inf_W2200(file_id: str, archive):
     df_data = []
     engine = create_engine(str(get_connection_string()))
+    # SELECT * — полный crystal data (параметры резонатора, если колонки есть)
     if archive == 0:
-        sql = ("Select  `nSetupFileIndex`, `strCrystalID`, `fSetTemperature`, "
-               " `Name`, `Size`, `File_ID`, `fFrequencyPPM`  from `crystal data` where `File_ID` = '"
-               + file_id + "' order by `strCrystalID`")
+        sql = ("SELECT * FROM `crystal data` WHERE `File_ID` = '"
+               + file_id + "' ORDER BY `strCrystalID`")
     else:
-        sql = ("Select  `nSetupFileIndex`, `strCrystalID`, `fSetTemperature`, "
-               " `Name`, `Size`, `File_ID`, `fFrequencyPPM`  from `crystal data_archive` where `File_ID` = '"
-               + file_id + "' order by `strCrystalID`")
+        sql = ("SELECT * FROM `crystal data_archive` WHERE `File_ID` = '"
+               + file_id + "' ORDER BY `strCrystalID`")
     df = pd.read_sql_query(sql, engine)  # Запращиваем данные файла
     if not df.empty:
         # Получение уникальных значений из колонки Temp
@@ -403,76 +415,130 @@ def analyse_positions_kh7700(unique_xtalrows):
 
 
 def analyse_data_test(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machine_type: str):
-    """Обрабатывает данные, добавляя номинальные значения."""
+    """
+    Единый путь подготовки Configuration для KH7700 и Transat (TTS100):
+      сырые данные установки
+        → get_avg_data_tts100_kh7700  (средние на Selected_Temp, единые имена FS/FL/R/C0/C1/Q)
+        → get_nominal                 (подбор спецификаций; AI-колонки сохраняются)
+    Результат — одинаковый формат строк для всех установок.
+    """
     result_df = get_avg_data_tts100_kh7700(df_main, df_intervals, machine_type)
-    # Добавление номиналов (логика функции get_nominal не показана)
     nom = get_nominal(result_df, machine_type)
     return nom
 
 
+def _resolve_col(df: pd.DataFrame, *candidates) -> str | None:
+    """Первое существующее имя колонки из candidates (с учётом регистра)."""
+    lower = {c.lower(): c for c in df.columns}
+    for name in candidates:
+        if name in df.columns:
+            return name
+        if name.lower() in lower:
+            return lower[name.lower()]
+    return None
+
+
 def get_avg_data_tts100_kh7700(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machine_type: str,
                                file_id='') -> pd.DataFrame:
-    """Основная функция с исправленной обработкой температур"""
+    """
+    Единая подготовка средних параметров для KH7700 и Transat (TTS100).
+
+    На выходе одинаковый набор колонок (как у Configuration после get_nominal):
+      SETUPNUM, FS, FL, R?, C0?, C1?, Q?, L?,
+      CL, CL_Metod, CL_Value, Position_str, Position, Selected_Temp
+
+    Усреднение только на Selected_Temp (25°C или середина диапазона) —
+    той же температуре, что используется для номинала.
+    """
     global filtered
     machine_config = {
         'KH7700': {
             'position_col': 'XTALROW',
-            'fs_col': 'FS',
-            'fl_col': 'FL',
+            'fs_candidates': ('FS', 'Fs', 'fs'),
+            'fl_candidates': ('FL', 'Fl', 'fl'),
             'temp_col': 'Temp',
-            'filter_cond': lambda df: df['FS'] != 0
+            'filter_cond': lambda df, fs: df[fs] != 0 if fs else df.index == df.index
         },
         'Transat': {
             'position_col': 'position',
-            'fs_col': 'F0_MHZ',
-            'fl_col': 'FL_MHZ',
-            'temp_col': 'SETPOINT',  # Исправлено: SETPOINT вместо SETPOINT
-            'filter_cond': lambda df, sn: (df['F0_MHZ'] != 0) & (df['SETUPNUM'] == sn)
+            'fs_candidates': ('F0_MHZ', 'FS', 'Fs'),
+            'fl_candidates': ('FL_MHZ', 'FL', 'Fl'),
+            'temp_col': 'SETPOINT',
+            'filter_cond': lambda df, fs, sn: (
+                (df[fs] != 0) & (df['SETUPNUM'] == sn) if fs else (df['SETUPNUM'] == sn)
+            ),
         }
     }
 
     results = []
     config = machine_config.get(machine_type, {})
+    if not config:
+        return pd.DataFrame()
+
+    pos_col = _resolve_col(df_main, config['position_col']) or config['position_col']
+    temp_col = _resolve_col(df_main, config['temp_col']) or config['temp_col']
+    fs_col = _resolve_col(df_main, *config['fs_candidates'])
+    fl_col = _resolve_col(df_main, *config['fl_candidates'])
 
     for _, row in df_intervals.iterrows():
-        # Фильтрация основных данных
-        position_filter = df_main[config['position_col']].isin(row['Position'])
+        position_filter = df_main[pos_col].isin(row['Position'])
 
-        # Тип-специфичная фильтрация
         if machine_type == 'KH7700':
-            filtered = df_main[position_filter & config['filter_cond'](df_main)]
+            extra = config['filter_cond'](df_main, fs_col)
+            filtered = df_main[position_filter & extra]
         elif machine_type == 'Transat':
             setupnum = row['SETUPNUM']
-            filtered = df_main[position_filter & config['filter_cond'](df_main, setupnum)]
+            extra = config['filter_cond'](df_main, fs_col, setupnum)
+            filtered = df_main[position_filter & extra]
+        else:
+            filtered = df_main[position_filter]
 
         if filtered.empty:
             continue
 
-        # Получение температур с обработкой NaN
-        temps = filtered[config['temp_col']].dropna().values
-        target_temp = get_target_temp(temps)
-
+        temps = filtered[temp_col].dropna().values
+        target_temp = get_target_temp(np.asarray(temps, dtype=float))
         if target_temp is None:
-            continue  # Пропускаем интервалы без валидных температур
+            continue
 
-        # Фильтрация по целевой температуре
-        temp_filtered = filtered[filtered[config['temp_col']] == target_temp]
-
+        temp_filtered = filtered[filtered[temp_col] == target_temp]
+        if temp_filtered.empty:
+            temp_filtered = filtered[
+                np.isclose(filtered[temp_col].astype(float), float(target_temp), atol=0.51)
+            ]
         if temp_filtered.empty:
             continue
 
-        # Усреднение и сохранение результатов
-        results.append({
+        # --- единый формат строки ---
+        item = {
             'SETUPNUM': row.get('SETUPNUM', 0),
-            'FS': temp_filtered[config['fs_col']].mean(),
-            'FL': temp_filtered[config['fl_col']].mean(),
+            'FS': float(temp_filtered[fs_col].mean()) if fs_col else 0.0,
+            'FL': float(temp_filtered[fl_col].mean()) if fl_col else 0.0,
             'CL': get_cl_status(temp_filtered, machine_type)[0],
             'CL_Metod': get_cl_status(temp_filtered, machine_type)[1],
             'CL_Value': get_cl_status(temp_filtered, machine_type)[2],
             'Position_str': row['Position_str'],
             'Position': row['Position'],
-            'Selected_Temp': target_temp
-        })
+            'Selected_Temp': target_temp,
+        }
+
+        # Доп. параметры резонатора в единых именах (если колонки есть в файле)
+        param_aliases = {
+            'R': ('R', 'RR', 'Rs', 'Resistance'),
+            'C0': ('C0', 'C0_PF', 'C0_pF'),
+            'C1': ('C1', 'Cq', 'C1_fF'),
+            'Q': ('Q', 'Qfactor'),
+            'L': ('L', 'Ls'),
+        }
+        for out_name, cands in param_aliases.items():
+            src = _resolve_col(temp_filtered, *cands)
+            if src is not None:
+                try:
+                    item[out_name] = float(temp_filtered[src].mean())
+                except (TypeError, ValueError):
+                    pass
+
+        results.append(item)
 
     return pd.DataFrame(results)
 
@@ -502,12 +568,26 @@ def get_avg_data(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machine_type
                 ]
             if filtered.empty:
                 continue
-            # Усредняем Fs и FL
-            avg_data = filtered[['FS', 'FL']].mean().to_dict()
+            temps = filtered['Temp'].dropna().unique()
+            target_temp = get_target_temp(np.asarray(temps, dtype=float))
+            if target_temp is not None:
+                temp_filtered = filtered[filtered['Temp'] == target_temp]
+                if temp_filtered.empty:
+                    temp_filtered = filtered[
+                        np.isclose(filtered['Temp'].astype(float), float(target_temp), atol=0.51)
+                    ]
+                if temp_filtered.empty:
+                    temp_filtered = filtered
+            else:
+                temp_filtered = filtered
+            param_cols = [c for c in ('FS', 'FL', 'R', 'C0', 'C1', 'Q', 'L')
+                          if c in temp_filtered.columns]
+            avg_data = temp_filtered[param_cols].mean(numeric_only=True).to_dict()
             avg_data['Position_str'] = row['Position_str']
-            avg_data['Temps'] = filtered['Temp'].tolist()
+            avg_data['Temps'] = list(temps)
+            avg_data['Selected_Temp'] = target_temp
             avg_data['Position'] = row['Position']
-            clstatus, cl_metod, cl_value = get_cl_status(df_main=filtered, machine_type='KH7700')
+            clstatus, cl_metod, cl_value = get_cl_status(df_main=temp_filtered, machine_type='KH7700')
             avg_data['CL'] = clstatus
             avg_data['CL_Metod'] = cl_metod
             avg_data['CL_Value'] = cl_value
@@ -518,7 +598,6 @@ def get_avg_data(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machine_type
 
     elif machine_type == 'Transat':
         for _, row in df_intervals.iterrows():
-            # Выбираем позиции интервала и фильтруем данные
             filtered = df_main[
                 df_main['position'].isin(row['Position']) &
                 (df_main['F0_MHZ'] != 0) &
@@ -526,12 +605,32 @@ def get_avg_data(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machine_type
                 ]
             if filtered.empty:
                 continue
-            # Усредняем Fs и FL
-            avg_data = filtered[['F0_MHZ', 'FL_MHZ']].mean().to_dict()
+            temps = filtered['SETPOINT'].dropna().unique()
+            target_temp = get_target_temp(np.asarray(temps, dtype=float))
+            if target_temp is not None:
+                temp_filtered = filtered[filtered['SETPOINT'] == target_temp]
+                if temp_filtered.empty:
+                    temp_filtered = filtered[
+                        np.isclose(filtered['SETPOINT'].astype(float), float(target_temp), atol=0.51)
+                    ]
+                if temp_filtered.empty:
+                    temp_filtered = filtered
+            else:
+                temp_filtered = filtered
+            param_cols = [c for c in ('F0_MHZ', 'FL_MHZ', 'R', 'C0', 'C1', 'Q', 'L', 'RR')
+                          if c in temp_filtered.columns]
+            avg_data = temp_filtered[param_cols].mean(numeric_only=True).to_dict()
+            if 'F0_MHZ' in avg_data:
+                avg_data['FS'] = avg_data.pop('F0_MHZ')
+            if 'FL_MHZ' in avg_data:
+                avg_data['FL'] = avg_data.pop('FL_MHZ')
+            if 'RR' in avg_data and 'R' not in avg_data:
+                avg_data['R'] = avg_data.pop('RR')
             avg_data['Position_str'] = row['Position_str']
-            avg_data['Temps'] = filtered['SETPOINT'].tolist()
+            avg_data['Temps'] = list(temps)
+            avg_data['Selected_Temp'] = target_temp
             avg_data['Position'] = row['Position']
-            clstatus, cl_metod, cl_value = get_cl_status(df_main=filtered, machine_type='Transat')
+            clstatus, cl_metod, cl_value = get_cl_status(df_main=temp_filtered, machine_type='Transat')
             avg_data['CL'] = clstatus
             avg_data['CL_Metod'] = cl_metod
             avg_data['CL_Value'] = cl_value
@@ -598,38 +697,70 @@ def get_avg_data(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machine_type
             (merged_all['fFrequencyPPM'] != 1e30) &
             (merged_all['fSetTemperature'] == target_temp)
             ]
-        # Группировка и агрегация только по SETUPNUM
-        grouped = filtered.groupby('SETUPNUM').agg({
-            'fFrequencyPPM': 'mean',  # Усреднение FS
-            'fValue1': 'mean',  # Усреднение FL
-            'strLoadType': 'first',  # Первый тип нагрузки
+        # Группировка и агрегация только по SETUPNUM (на target_temp уже отфильтровано)
+        agg_spec = {
+            'fFrequencyPPM': 'mean',  # FS
+            'fValue1': 'mean',        # FL
+            'strLoadType': 'first',
             'fSetTemperature': lambda x: list(x.unique()),
-            'fReferenceFrequency': 'first'  # Первый номинал
-        }).reset_index()
-        # Добавление Position и Position_str из setup_positions
+            'fReferenceFrequency': 'first',
+        }
+        # Параметры резонатора — если есть в crystal data / merge
+        param_src = {
+            'R': ('R', 'RR', 'fResistance', 'Resistance', 'Rs'),
+            'C0': ('C0', 'fC0', 'C0_pF'),
+            'C1': ('C1', 'Cq', 'fC1'),
+            'Q': ('Q', 'fQ', 'Qfactor'),
+            'L': ('L', 'fL', 'Ls'),
+        }
+        resolved = {}
+        lower_cols = {c.lower(): c for c in filtered.columns}
+        for out_name, cands in param_src.items():
+            for cand in cands:
+                if cand in filtered.columns:
+                    resolved[out_name] = cand
+                    break
+                if cand.lower() in lower_cols:
+                    resolved[out_name] = lower_cols[cand.lower()]
+                    break
+            if out_name in resolved:
+                # numeric mean
+                filtered[resolved[out_name]] = pd.to_numeric(
+                    filtered[resolved[out_name]], errors='coerce'
+                )
+                agg_spec[resolved[out_name]] = 'mean'
+
+        grouped = filtered.groupby('SETUPNUM').agg(agg_spec).reset_index()
         output_df = pd.merge(
             grouped,
             df_intervals[['SETUPNUM', 'Position', 'Position_str']],
             on='SETUPNUM',
             how='left'
         )
-        # Переименование колонок
-        output_df.rename(columns={
+        rename_cols = {
             'fFrequencyPPM': 'FS',
             'fValue1': 'FL',
             'fSetTemperature': 'Temps',
-            'fReferenceFrequency': 'Target_Hz'
-        }, inplace=True)
-        # Добавление колонок
+            'fReferenceFrequency': 'Target_Hz',
+        }
+        for out_name, src in resolved.items():
+            if src in output_df.columns:
+                rename_cols[src] = out_name
+        output_df.rename(columns=rename_cols, inplace=True)
+
         output_df['CL_Metod'] = output_df.apply(determine_cl_metod, axis=1)
         output_df['CL_Value'] = 0
         output_df['CL'] = output_df['CL_Metod'].ne('SERIES').astype(int)
+        output_df['Selected_Temp'] = target_temp
 
-        # Формирование финального датафрейма
-        result_df = output_df[[
+        keep = [
             'SETUPNUM', 'FS', 'FL', 'CL_Metod', 'CL_Value', 'CL',
-            'Position', 'Position_str', 'Temps', 'Target_Hz'
-        ]]
+            'Position', 'Position_str', 'Temps', 'Target_Hz', 'Selected_Temp',
+        ]
+        for c in ('R', 'C0', 'C1', 'Q', 'L'):
+            if c in output_df.columns:
+                keep.append(c)
+        result_df = output_df[keep]
 
     # ========== НОВАЯ ВЕТКА ДЛЯ ТЧХ2200 ==========
     elif machine_type == 'ТЧХ2200':
@@ -659,19 +790,35 @@ def get_avg_data(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machine_type
             if filtered.empty:
                 continue
 
-            # Усредняем необходимые параметры
-            avg_data = filtered[['Fs', 'Fl', 'R', 'C0', 'C1', 'Q', 'L']].mean().to_dict()
+            # Температуры партии → целевая (25°C или середина диапазона)
+            temps = filtered['Temp'].dropna().unique()
+            target_temp = get_target_temp(np.asarray(temps, dtype=float))
+            if target_temp is None:
+                continue
+
+            # Параметры для AI/номинала — только на той же температуре, что и номинал
+            temp_filtered = filtered[filtered['Temp'] == target_temp]
+            if temp_filtered.empty:
+                # допуск на float-сравнение
+                temp_filtered = filtered[
+                    np.isclose(filtered['Temp'].astype(float), float(target_temp), atol=0.51)
+                ]
+            if temp_filtered.empty:
+                continue
+
+            param_cols = [c for c in ('Fs', 'Fl', 'R', 'C0', 'C1', 'Q', 'L')
+                          if c in temp_filtered.columns]
+            avg_data = temp_filtered[param_cols].mean(numeric_only=True).to_dict()
             avg_data['Position_str'] = row['Position_str']
             avg_data['Position'] = row['Position']  # список позиций без ведущих нулей
             avg_data['SETUPNUM'] = row['SETUPNUM']
-            avg_data['Temps'] = filtered['Temp'].unique().tolist()
-            target_temp = get_target_temp(np.array(avg_data['Temps']))
+            avg_data['Temps'] = list(temps)
             avg_data['Selected_Temp'] = target_temp
-            avg_data['Mode'] = filtered['Mode'].iloc[0] if 'Mode' in filtered.columns else 0
-            avg_data['PL'] = filtered['PL'].iloc[0] if 'PL' in filtered.columns else 0
-            ref_cl = filtered['ReferenceCL'].iloc[0] if 'ReferenceCL' in filtered.columns else 0
+            avg_data['Mode'] = temp_filtered['Mode'].iloc[0] if 'Mode' in temp_filtered.columns else 0
+            avg_data['PL'] = temp_filtered['PL'].iloc[0] if 'PL' in temp_filtered.columns else 0
+            ref_cl = temp_filtered['ReferenceCL'].iloc[0] if 'ReferenceCL' in temp_filtered.columns else 0
             avg_data['ReferenceCL'] = ref_cl
-            clstatus, cl_metod, cl_value = get_cl_status(filtered, machine_type, avg_data)
+            clstatus, cl_metod, cl_value = get_cl_status(temp_filtered, machine_type, avg_data)
             avg_data['CL'] = clstatus
             avg_data['CL_Metod'] = cl_metod
             avg_data['CL_Value'] = cl_value
@@ -856,7 +1003,7 @@ def analyse_data(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machine_type
         elif machine_type == 'Transat':
             fs = 'F0_MHZ'
             fl = 'FL_MHZ'
-        final_data.append({
+        item = {
             'Position_str': row['Position_str'],
             'FS': row[fs],
             'FL': row[fl],
@@ -866,7 +1013,12 @@ def analyse_data(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machine_type
             'CL_Metod': row['CL_Metod'],
             'CL_Value': row['CL_Value'],
             'SETUPNUM': row['SETUPNUM'],
-        })
+        }
+        # Параметры резонатора (если уже усреднены в get_avg_data) — для AI-подбора
+        for col in ('R', 'C0', 'C1', 'Q', 'L'):
+            if col in row.index and pd.notna(row[col]):
+                item[col] = row[col]
+        final_data.append(item)
     final_df = pd.DataFrame(final_data)
     nom = get_nominal(final_df, machine_type)  # Добавляем номинальные частоты
     return nom
@@ -892,7 +1044,7 @@ def analyse_data_W2200(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machin
     for _, row in result_df.iterrows():
         temps_list = row['Temps']
         target_temp = get_target_temp_w2200(temps_list)
-        final_data.append({
+        item = {
             'Position_str': row['Position_str'],
             'FS': row[fs],
             'FL': row[fl],
@@ -903,7 +1055,11 @@ def analyse_data_W2200(df_main: pd.DataFrame, df_intervals: pd.DataFrame, machin
             'CL_Value': row['CL_Value'],
             'SETUPNUM': row['SETUPNUM'],
             'Target_Hz': row['Target_Hz']
-        })
+        }
+        for col in ('R', 'C0', 'C1', 'Q', 'L'):
+            if col in row.index and pd.notna(row[col]):
+                item[col] = row[col]
+        final_data.append(item)
     final_df = pd.DataFrame(final_data)
     nom = get_nominal(final_df, machine_type)  # Добавляем номинальные частоты
     return nom
@@ -1466,6 +1622,188 @@ def test_temp_interval_points_fast(data, spc_list):
     return kept_names
 
 
+
+def _ai_get_psidata_map() -> dict:
+    """Field → Parameter из psidata_map_table (кэш на сессию)."""
+    cache = getattr(_ai_get_psidata_map, '_cache', None)
+    if cache is not None:
+        return cache
+    mapping = {}
+    try:
+        eng = create_engine(str(get_connection_string()), pool_pre_ping=True)
+        df = pd.read_sql('SELECT `Field`, `Parameter` FROM `psidata_map_table`', eng)
+        mapping = dict(zip(df['Field'].astype(str), df['Parameter'].astype(str)))
+        print(f'[SpcAI] psidata_map_table: {len(mapping)} записей', flush=True)
+    except Exception as e:
+        print(f'[SpcAI] psidata_map_table недоступна: {e}', flush=True)
+    _ai_get_psidata_map._cache = mapping
+    return mapping
+
+
+def _ai_to_float(v):
+    try:
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ai_sample_from_row(row) -> dict:
+    """
+    Собрать признаки для AI-модели из строки слота.
+
+    Источник: усреднённые на Selected_Temp значения из get_avg_data
+    (FS/FL/R/C0/C1/Q) + Nominal/Target_Hz.
+
+    Единицы приводятся к виду psidata (как convert_units_ в Make_Measure):
+      C0: Ф → пФ (*1e12), если значение похоже на СИ
+      C1→Cq: Ф → фФ (*1e15)
+      Q:  /1000, если Q очень большое
+      F:  из FS; если >1e5 — Гц→МГц (/1e6), иначе как есть
+    Имена колонок можно уточнить через psidata_map_table.
+    """
+    sample = {}
+    try:
+        if hasattr(row, 'get'):
+            def getter(k, default=None):
+                try:
+                    return row.get(k, default)
+                except Exception:
+                    return default
+            def has(k):
+                try:
+                    return k in row
+                except Exception:
+                    return False
+        else:
+            def getter(k, default=None):
+                try:
+                    return row[k] if k in row.index else default
+                except Exception:
+                    return default
+            def has(k):
+                try:
+                    return k in row.index
+                except Exception:
+                    return False
+
+        # --- Nominal ---
+        for src in ('Номинал', 'Nominal', 'Target_Hz'):
+            if has(src) or getter(src) is not None:
+                v = _ai_to_float(getter(src))
+                if v is not None:
+                    # Номинал в модели — строковый код около МГц (напр. 58.941176)
+                    if v > 1000:  # похоже на Гц
+                        sample['Nominal'] = round(v / 1e6, 6)
+                    else:
+                        sample['Nominal'] = v
+                    break
+
+        # --- F из FS / FL / F ---
+        f_raw = None
+        for src in ('F', 'FS', 'Fs', 'FL', 'Fl'):
+            if has(src):
+                f_raw = _ai_to_float(getter(src))
+                if f_raw is not None:
+                    break
+        if f_raw is not None:
+            # CL_Metod SERIES → FS, иначе FL предпочтительнее уже учтено Target_Hz
+            sample['F'] = f_raw / 1e6 if f_raw > 1e5 else f_raw
+
+        # --- R ---
+        for src in ('R', 'RR', 'Rs'):
+            if has(src):
+                rv = _ai_to_float(getter(src))
+                if rv is not None:
+                    sample['R'] = rv
+                    break
+
+        # --- C0 ---
+        if has('C0'):
+            c0 = _ai_to_float(getter('C0'))
+            if c0 is not None:
+                # СИ-фарады обычно < 1e-6; в psidata — пФ порядка 0.1..10
+                sample['C0'] = c0 * 1e12 if abs(c0) < 1e-6 else c0
+
+        # --- Cq из C1 / Cq ---
+        cq = None
+        for src in ('Cq', 'C1'):
+            if has(src):
+                cq = _ai_to_float(getter(src))
+                if cq is not None:
+                    break
+        if cq is not None:
+            # СИ → фФ (*1e15); иначе уже в рабочих единицах
+            sample['Cq'] = cq * 1e15 if abs(cq) < 1e-9 else cq
+
+        # --- Q ---
+        if has('Q'):
+            qv = _ai_to_float(getter('Q'))
+            if qv is not None:
+                sample['Q'] = qv * 1e-3 if qv > 1000 else qv
+
+        # Уточнение имён через psidata_map (Field→Parameter), если в row
+        # есть «сырые» Field-имена, которых нет в стандартном наборе.
+        try:
+            pmap = _ai_get_psidata_map()
+            inv = {}
+            for field, param in pmap.items():
+                inv.setdefault(str(param), []).append(str(field))
+            for param in ('F', 'R', 'C0', 'Cq', 'Q', 'C1'):
+                if param in sample:
+                    continue
+                for field in inv.get(param, []):
+                    if has(field):
+                        vv = _ai_to_float(getter(field))
+                        if vv is not None:
+                            key = 'Cq' if param in ('Cq', 'C1') else param
+                            sample[key] = vv
+                            break
+        except Exception:
+            pass
+
+        if sample:
+            print(f'[SpcAI] sample features: {sample}', flush=True)
+    except Exception as e:
+        print(f'[SpcAI] _ai_sample_from_row: {e}', flush=True)
+    return sample
+
+
+def _apply_ai_to_spc_list(result: list, row) -> list:
+    """Если AI включён — переупорядочить список кандидатов."""
+    if not is_ai_spec_enabled():
+        return result
+    try:
+        from Temperature_Measure.Models.predict_spc_model import (
+            rank_spc_list_with_ai, predict_spc, get_model,
+        )
+        if get_model() is None:
+            return result
+        sample = _ai_sample_from_row(row)
+        # Если признаков мало — всё равно попробуем (Nominal)
+        if not sample:
+            return result
+        ranked = rank_spc_list_with_ai(result, sample=sample, top_k=5)
+        # Режим «только AI»: если fast выключен и классика дала мало —
+        # дополнительно подмешаем top предсказания, даже если их не было в кандидатах
+        if not is_fast_spec_search_enabled():
+            best, top = predict_spc(sample, top_k=3)
+            extra = []
+            for name, _p in top:
+                if name not in ranked and name not in extra:
+                    extra.append(name)
+            if best and best not in ranked and best not in extra:
+                extra.insert(0, best)
+            if extra:
+                ranked = extra + ranked
+                print(f'[SpcAI] добавлены AI-кандидаты вне фильтра: {extra}', flush=True)
+        return ranked if ranked else result
+    except Exception as e:
+        print(f'[SpcAI] _apply_ai_to_spc_list: {e}', flush=True)
+        return result
+
+
 def build_ranked_spc_combo_list(row) -> list:
     """
     Собирает итоговый упорядоченный список спецификаций для combo слота:
@@ -1488,6 +1826,7 @@ def build_ranked_spc_combo_list(row) -> list:
     result = list(filtered) + multi_new
     if not result:
         result = ['Нет']
+    result = _apply_ai_to_spc_list(result, row)
     default = result[0]
     log_final_spc_list(result, default, multi_added=multi_new or None)
     return result
@@ -1519,8 +1858,15 @@ def get_nominal_fast(df_data: pd.DataFrame, machine_type: str):
         df_data[['Номинал', 'Spec_list', 'Specs_ID', 'SpcID', 'SpcName']] = df_data.apply(
             find_closest_specs_fast, axis=1, df_nom=df_main
         )
-        output_df = df_data[['Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
-                             'Specs_ID', 'SpcID', 'SpcName', 'CL', 'CL_Metod', 'CL_Value', 'SETUPNUM']]
+        base_cols = [
+            'Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
+            'Specs_ID', 'SpcID', 'SpcName', 'CL', 'CL_Metod', 'CL_Value', 'SETUPNUM'
+        ]
+        # Сохраняем измеренные параметры для AI (на Selected_Temp)
+        extra = [c for c in (
+            'FS', 'FL', 'Target_Hz', 'R', 'C0', 'C1', 'Q', 'L', 'Fs', 'Fl'
+        ) if c in df_data.columns]
+        output_df = df_data[base_cols + extra].copy()
     else:
         columns = [
             'Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
@@ -1683,10 +2029,14 @@ def get_nominal_legacy(df_data: pd.DataFrame, machine_type: str):
         df_data[['Номинал', 'Spec_list', 'Specs_ID', 'SpcID', 'SpcName']] = df_data.apply(
             find_closest_specs_legacy, axis=1, df_nom=df_main
         )
-        output_df = df_data[[
+        base_cols = [
             'Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
             'Specs_ID', 'SpcID', 'SpcName', 'CL', 'CL_Metod', 'CL_Value', 'SETUPNUM'
-        ]]
+        ]
+        extra = [c for c in (
+            'FS', 'FL', 'Target_Hz', 'R', 'C0', 'C1', 'Q', 'L', 'Fs', 'Fl'
+        ) if c in df_data.columns]
+        output_df = df_data[base_cols + extra].copy()
     else:
         columns = [
             'Position_str', 'Номинал', 'Spec_list', 'Selected_Temp', 'Position',
@@ -1753,6 +2103,7 @@ def build_spc_combo_list(row) -> list:
     filtered.sort()
     if not filtered:
         filtered = ['Нет']
+    filtered = _apply_ai_to_spc_list(filtered, row)
     print(f'[SpecSearch] legacy combo default={filtered[0]!r}, n={len(filtered)}')
     return filtered
 

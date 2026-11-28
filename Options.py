@@ -174,6 +174,9 @@ _DEFAULT_APP_SETTINGS = {
     # True  — быстрый поиск (кэш справочников, score, все кандидаты ≤ ppm)
     # False — классический (SQL на каждый слот, только min ppm, sort по имени)
     'fast_spec_search': True,
+    # True  — использовать sklearn-модель (AI) при подборе спецификаций.
+    # Работает самостоятельно и совместно с быстрым/классическим режимом.
+    'use_ai_spec': False,
 }
 
 _app_settings_cache = None
@@ -277,6 +280,25 @@ def set_fast_spec_search(enabled: bool) -> bool:
     return save_app_settings(data)
 
 
+def is_ai_spec_enabled() -> bool:
+    """True = использовать sklearn-модель при подборе спецификаций."""
+    return bool(load_app_settings().get('use_ai_spec', False))
+
+
+def set_ai_spec_enabled(enabled: bool) -> bool:
+    data = load_app_settings()
+    data['use_ai_spec'] = bool(enabled)
+    ok = save_app_settings(data)
+    if ok and enabled:
+        # прогрев модели / загрузка из БД или файлов
+        try:
+            from Temperature_Measure.Models.predict_spc_model import get_model
+            get_model(force_reload=True)
+        except Exception as e:
+            print(f'[Settings] AI model preload: {e}')
+    return ok
+
+
 def create_settings_window(dpg):
     """Окно «Настройки» (меню Файл → Настройки)."""
     tag = 'app_settings_window'
@@ -285,10 +307,13 @@ def create_settings_window(dpg):
 
     settings = load_app_settings(force=True)
     fast = bool(settings.get('fast_spec_search', True))
+    use_ai = bool(settings.get('use_ai_spec', False))
 
     def _on_save(sender, app_data, user_data):
         val = dpg.get_value('settings_fast_spec_search')
         set_fast_spec_search(bool(val))
+        ai_val = dpg.get_value('settings_use_ai_spec')
+        set_ai_spec_enabled(bool(ai_val))
         # сброс кэша справочников — следующий поиск подхватит режим
         try:
             from Temperature_Measure.Analyze_Data import clear_spec_cache
@@ -296,7 +321,8 @@ def create_settings_window(dpg):
         except Exception:
             pass
         mode = 'быстрый' if val else 'классический'
-        print(f'[Settings] режим поиска спецификаций: {mode}')
+        ai_mode = 'вкл' if ai_val else 'выкл'
+        print(f'[Settings] режим поиска спецификаций: {mode}; AI: {ai_mode}')
         if dpg.does_item_exist(tag):
             dpg.delete_item(tag)
 
@@ -304,11 +330,22 @@ def create_settings_window(dpg):
         if dpg.does_item_exist(tag):
             dpg.delete_item(tag)
 
+    def _on_save_model_db(sender, app_data, user_data):
+        try:
+            from Temperature_Measure.Models.predict_spc_model import (
+                save_model_to_db, ensure_db_table,
+            )
+            ensure_db_table()
+            ok = save_model_to_db(name='spc_model', note='from settings UI')
+            print(f'[Settings] сохранение модели в БД: {"OK" if ok else "FAIL"}')
+        except Exception as e:
+            print(f'[Settings] save model to DB: {e}')
+
     with dpg.window(
         label='Настройки',
         tag=tag,
-        width=480,
-        height=220,
+        width=520,
+        height=340,
         modal=False,
         no_collapse=True,
     ):
@@ -322,14 +359,32 @@ def create_settings_window(dpg):
         dpg.add_text(
             'Вкл. - кэш справочников, ranking по score, все кандидаты < ppm.\n'
             'Выкл. - классический режим (SQL на каждый слот, только min ppm).',
-            wrap=440,
+            wrap=480,
+        )
+        dpg.add_spacer(height=8)
+        dpg.add_checkbox(
+            label='Использовать AI',
+            tag='settings_use_ai_spec',
+            default_value=use_ai,
+        )
+        dpg.add_text(
+            'Вкл. - sklearn-модель (Models/spc_model) участвует в подборе:\n'
+            'переупорядочивает кандидатов и может работать одна / вместе\n'
+            'с быстрым или классическим режимом.',
+            wrap=480,
+        )
+        dpg.add_spacer(height=6)
+        dpg.add_button(
+            label='Сохранить модель AI в БД',
+            width=220,
+            callback=_on_save_model_db,
         )
         dpg.add_spacer(height=12)
         with dpg.group(horizontal=True):
             dpg.add_button(label='Сохранить', width=120, callback=_on_save)
             dpg.add_button(label='Отмена', width=120, callback=_on_cancel)
         dpg.add_spacer(height=6)
-        dpg.add_text(f'Файл: {get_app_settings_path()}', wrap=440)
+        dpg.add_text(f'Файл: {get_app_settings_path()}', wrap=480)
 
     try:
         center_window(dpg, tag)
